@@ -91,9 +91,12 @@ fi
 # storage.conf -- that's what let two concurrent podman jobs from the same user corrupt each
 # other's state on the same node (the original reason this whole repo asked for a full node
 # per podman job; see ADMIN-NOTES.md). --storage-opt additionalimagestore points back at the
-# shared graphroot as a READ-ONLY layer source, so this doesn't cost a re-pull -- confirmed
-# live: two concurrent invocations with distinct --root/--runroot both saw the already-pulled
-# image instantly via `podman images` and ran to completion with no collision. Keyed on
+# shared graphroot as a READ-ONLY layer source, so this doesn't cost a re-pull for another job
+# landing on the SAME node -- confirmed live: two concurrent invocations with distinct
+# --root/--runroot both saw the already-pulled image instantly via `podman images` and ran to
+# completion with no collision. (If storage.conf's graphroot is under /scratch, per the
+# README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
+# lands on a different node still pays a fresh pull regardless of this mechanism.) Keyed on
 # $LSB_JOBID so concurrent LSF jobs never collide; falls back to $$-$RANDOM outside LSF.
 SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
 JOBTAG="${LSB_JOBID:-$$-$RANDOM}"

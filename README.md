@@ -92,7 +92,12 @@ its user namespace at all, and you'll never get as far as the storage setup belo
 
 **One-time setup, before your first podman job ever** — point podman's image/container
 storage at `/scratch/$USER` instead of its default (`~/.local/share/containers`, i.e. your
-**home directory**, which fills small HPC home quotas fast with GB-sized images):
+**home directory**). This way you're using transient scratch storage local to the compute
+node, which is cleaned up regularly — instead of filling your home directory with GB-sized
+images. The trade-off: that cache is local to whichever node a job actually lands on and gets
+swept periodically, so a job on a different node, or one that lands after a cleanup sweep,
+pays a fresh multi-GB pull rather than reusing an earlier one. If you'd rather keep a durable,
+cross-node image cache instead, point `graphroot`/`runroot` below at a path under `$HOME`.
 ```bash
 mkdir -p ~/.config/containers /scratch/$USER/podman-run /scratch/$USER/podman-storage
 cat > ~/.config/containers/storage.conf << 'EOF'

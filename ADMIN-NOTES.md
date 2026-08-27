@@ -326,15 +326,19 @@ something the wrapper's invocation can override per-call.
 `$LSB_JOBID` (falling back to `$$-$RANDOM` outside LSF), instead of sharing the one from
 `storage.conf`. That per-job root/runroot is what corrupted under concurrent access —
 isolating it removes the collision risk entirely, without needing exclusive-host or
-whole-node reservation at all. It doesn't cost a re-pull per job: `--storage-opt
-additionalimagestore=<shared graphroot>` points the per-job store at the shared one from
-`storage.conf` as a **read-only** layer source, so the multi-GB image itself stays shared and
-cached — only each job's own writable container-layer state (locks, per-container metadata)
-is isolated.
+whole-node reservation at all. It doesn't cost a re-pull for another job landing on the *same*
+node: `--storage-opt additionalimagestore=<shared graphroot>` points the per-job store at the
+shared one from `storage.conf` as a **read-only** layer source, so the multi-GB image stays
+cached there — only each job's own writable container-layer state (locks, per-container
+metadata) is isolated. This benefit is node-scoped, not cluster-scoped: `storage.conf`'s
+`graphroot`/`runroot` point at `/scratch/$USER`, which per the README's one-time setup is
+transient, node-local scratch, cleaned up on its own regular cycle — not an NFS-shared cache
+other nodes can see. A job landing on a different node, or one that lands after a cleanup
+sweep, still pays a fresh multi-GB pull regardless of this mechanism.
 
-Verified live, two concurrent `podman-run.sh` invocations, no `-x`/whole-node reservation:
-both completed successfully with no storage errors, and each saw the already-pulled image
-instantly via the additional store rather than re-pulling it.
+Verified live, two concurrent `podman-run.sh` invocations pinned to the same node, no
+`-x`/whole-node reservation: both completed successfully with no storage errors, and each saw
+the already-pulled image instantly via the additional store rather than re-pulling it.
 
 **Why this wasn't the design from the start**: it was identified as the correct fix early on
 (confirmed working via a manual `podman --root ... --runroot ... info` check) but not built
