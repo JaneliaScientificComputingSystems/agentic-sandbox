@@ -98,8 +98,14 @@ images. The trade-off: that cache is local to whichever node a job actually land
 swept periodically, so a job on a different node, or one that lands after a cleanup sweep,
 pays a fresh multi-GB pull rather than reusing an earlier one. If you'd rather keep a durable,
 cross-node image cache instead, point `graphroot`/`runroot` below at a path under `$HOME`.
+
+This step is genuinely one-time-ever, even though `/scratch` itself is node-local, not
+NFS-shared: only `storage.conf` (in `$HOME`, which *is* shared) needs creating once. You don't
+need to `mkdir` the `podman-run`/`podman-storage` paths yourself — confirmed live on a node
+that had never run podman before: podman creates them itself, silently, the first time it
+runs on any given node.
 ```bash
-mkdir -p ~/.config/containers /scratch/$USER/podman-run /scratch/$USER/podman-storage
+mkdir -p ~/.config/containers
 cat > ~/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
