@@ -121,11 +121,13 @@ warning that it's filling your home directory instead. Do this once, ever, per a
 `podman-run.sh` gives each invocation its own isolated podman storage, keyed on `$LSB_JOBID` —
 concurrent podman jobs from the same user can safely share a GPU node, no whole-node
 reservation needed. Just request the GPU(s) your task actually needs, the normal way for
-whatever queue you're using:
+whatever queue you're using. `bsub -gpu` requires an explicit GPU-enabled queue (`-q`) — it
+won't infer one — so the examples below use `gpu_l4`; see the cluster's own documentation for
+the full list of GPU queues and which one actually fits your task.
 
 **Interactive job:**
 ```bash
-bsub -gpu "num=1" -Is /bin/bash
+bsub -q gpu_l4 -gpu "num=1" -Is /bin/bash
 cd agentic-sandbox/scripts
 
 ./podman-run.sh --gpu --scratch --opencode --allow litellm.int.janelia.org -- \
@@ -144,7 +146,7 @@ Same as the bwrap examples: anything here that isn't a REPL can just as well be 
 non-interactive `bsub` instead of run at your interactive prompt — same GPU request, same
 command, just `-o out.log` instead of `-Is`:
 ```bash
-bsub -gpu "num=1" -o out.log '
+bsub -q gpu_l4 -gpu "num=1" -o out.log '
   cd agentic-sandbox/scripts && ./podman-run.sh --gpu --scratch --opencode \
     --allow litellm.int.janelia.org -- \
     opencode run "who am I speaking to?" --model litellm/kimi-k3
