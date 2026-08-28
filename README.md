@@ -74,7 +74,8 @@ sandboxing policy is about — see [Mode A / Mode B](#the-three-operating-modes)
 
 (opencode+Kimi K3 and Claude Code+Anthropic are the two harnesses this repo documents and has
 tested — any other harness follows the same pattern: figure out where it keeps its
-config/state, `--rw`/`--ro` it in, `--allow` whatever it needs to reach.)
+config/state, then use `--rw`/`--ro` to grant access to those files in the sandbox,
+Finally, use `--allow` to grant access to URIs that will be needed by the model.)
 
 ## Try it now — Podman (GPU)
 
@@ -94,7 +95,7 @@ account, and that's not something you can set up yourself — reach out to the H
 if you haven't run rootless podman on this cluster before. Without it, podman can't create
 its user namespace at all, and you'll never get as far as the storage setup below.
 
-**One-time setup, before your first podman job ever** — point podman's image/container
+**⚠️ One-time setup, before your first podman job ever** — point podman's image/container
 storage at `/scratch/$USER` instead of its default (`~/.local/share/containers`, i.e. your
 **home directory**). This way you're using transient scratch storage local to the compute
 node, which is cleaned up regularly — instead of filling your home directory with GB-sized
@@ -173,8 +174,8 @@ works exactly the same as the bwrap examples above; just swap `sandbox-run.sh` f
 
 ## Contents
 
-- [Try it now — bwrap](#try-it-now--bwrap)
-- [Try it now — Podman (GPU)](#try-it-now--podman-gpu)
+- [Try it now — bwrap](#try-it-now--bwrap) (above)
+- [Try it now — Podman (GPU)](#try-it-now--podman-gpu) (above)
 - [Why bwrap, why Podman](#why-bwrap-why-podman)
 - [Cloning this repo](#cloning-this-repo)
 - [Filesystem access](#filesystem-access)
