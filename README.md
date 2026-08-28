@@ -1,11 +1,15 @@
 # agentic-sandbox
 
 Sandboxing for unsupervised agentic loops on Janelia HPC. Two backends:
-**Bubblewrap (`bwrap`)** for the common case (no GPU needed), **Podman** when a task needs
-GPU access (bwrap can't do GPU passthrough — see below). Built in response to internal
-guidance requiring that any agentic loop running without a human reviewing each step have its
-file, device, and network access restricted to the minimum the task needs, and that
-agent-generated code never run with a user's full permissions.
+
+**Bubblewrap (`bwrap`)** for the common case (no GPU needed),
+
+**Podman** when a task needs GPU access (bwrap can't do GPU passthrough — see below).
+
+These have been built in response to internal guidance requiring that any agentic loop
+running without a human reviewing each step have its file, device, and network access
+restricted to the minimum the task needs, and that agent-generated code never run with
+a user's full permissions.
 
 Everything in this doc has been tested live on Janelia's LSF cluster, as the real user
 account, not root. For the full engineering investigation behind every design choice and
