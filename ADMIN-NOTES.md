@@ -290,8 +290,10 @@ bind-mounted.
 
 - **First attempt**: `--userns=keep-id` (podman's built-in mechanism for mapping the
   container back to your real host UID). Failed: `chowning container workdir: potentially
-  insufficient UIDs or GIDs available in user namespace` — `/etc/subuid`/`/etc/subgid` ranges
-  aren't configured for this to work here.
+  insufficient UIDs or GIDs available in user namespace` — the account running this hadn't
+  been provisioned a `/etc/subuid`/`/etc/subgid` range yet (confirmed on a live node: these
+  ranges exist and work fine here, but are granted per-account by HPC on request, not
+  cluster-wide or self-service).
 - **Second attempt**: `--user $(id -u):$(id -g)` plus `-e HOME=$HOME` (no namespace
   remapping). Failed differently: exit 126 (permission denied) — the CLIs were installed as
   root during the image build, and files created that way aren't readable/executable by a

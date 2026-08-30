@@ -91,9 +91,10 @@ different CUDA/framework base, etc.); the sandboxing (`-v`/`--allow`/`--gpu`) wo
 regardless of what's inside.
 
 **⚠️ Before any of this: rootless podman needs a `/etc/subuid`/`/etc/subgid` range for your
-account, and that's not something you can set up yourself — reach out to the HPC team first**
-if you haven't run rootless podman on this cluster before. Without it, podman can't create
-its user namespace at all, and you'll never get as far as the storage setup below.
+account. These ranges are provisioned per-user by the HPC team, not self-service and not
+granted by default — reach out to them first** if you haven't run rootless podman on this
+cluster before. Without a range for your account, podman can't create its user namespace at
+all, and you'll never get as far as the storage setup below.
 
 **⚠️ One-time setup, before your first podman job ever** — point podman's image/container
 storage at `/scratch/$USER` instead of its default (`~/.local/share/containers`, i.e. your
