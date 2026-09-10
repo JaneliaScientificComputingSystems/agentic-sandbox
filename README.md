@@ -501,6 +501,16 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   bwrap where you're still "you." `scripts/podman-run.sh`'s `--claude`/`--opencode` shorthands
   mount your real config to `/root/...` (where the container's actual user looks), not to
   `$HOME/...`.
+- **`--keep-id`**: run as your real uid/gid instead of root (`--userns=keep-id --user
+  "$(id -u):$(id -g)"`), so files land on the real filesystem with your normal ownership.
+  When set, `--claude`/`--opencode` correctly switch to mounting at your real `$HOME/...`
+  instead of `/root/...`. **Requires a `/etc/subuid`/`/etc/subgid` range *wider than your
+  account's real GID*, not just any range** — confirmed live 2026-09-10: `keep-id`'s default
+  identity-mapping needs your own uid and gid to each individually fit within the granted
+  range's width, and AD/LDAP GIDs here commonly exceed a standard 65536-wide grant (e.g. a
+  real gid of 93102 needs a range ≥ 93103 wide, not merely "a 65536-wide range somewhere").
+  Fails with `potentially insufficient UIDs or GIDs available in user namespace` if your
+  range isn't wide enough — ask HPC for a range wider than your real GID if you hit this.
 - **No credential masking, unlike `sandbox-run.sh`** — **never `--rw`/`--ro` a path that is or
   contains your real `$HOME`.** `sandbox-run.sh` masks `.ssh`/`.aws`/`.git-credentials`/etc.
   even when `$HOME` is bound (see [Filesystem access](#filesystem-access)); `podman-run.sh`
@@ -570,6 +580,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
   --claude        Shorthand for RW binds on Claude Code's credential/session dirs
   --opencode      Shorthand for RW binds on opencode's four XDG state dirs
   --gpu           (podman-run.sh only) --device nvidia.com/gpu=all
+  --keep-id       (podman-run.sh only) run as your real uid/gid instead of root -- see
+                  "GPU / device access" below for the subuid/subgid range width it requires
   --image NAME    (podman-run.sh only) any OCI image; defaults to the example GHCR image,
                   but that's just a convenient starting point -- use your own here
   -h, --help      Show help

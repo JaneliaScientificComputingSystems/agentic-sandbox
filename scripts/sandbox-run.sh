@@ -54,10 +54,23 @@ while [[ $# -gt 0 ]]; do
     --rw) RW_BINDS+=("$2"); shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --scratch) RW_BINDS+=("/scratch/$USER"); shift ;;
-    --claude) RW_BINDS+=("$HOME/.claude" "$HOME/.claude.json"); shift ;;
+    --claude)
+      RW_BINDS+=("$HOME/.claude" "$HOME/.claude.json")
+      # The CLI's own install location, not just its credential/session state -- without
+      # this, `claude` itself isn't reachable inside the sandbox now that $HOME isn't bound
+      # by default (confirmed live: "exec: claude: not found" otherwise). The native
+      # installer's standard layout: ~/.local/bin/claude is a symlink into
+      # ~/.local/share/claude/versions/<version>; bind both ends read-only since the CLI
+      # binary itself shouldn't need to be writable.
+      RO_BINDS+=("$HOME/.local/bin/claude" "$HOME/.local/share/claude")
+      shift ;;
     --opencode)
       RW_BINDS+=("$HOME/.config/opencode" "$HOME/.local/share/opencode" \
                  "$HOME/.local/state/opencode" "$HOME/.cache/opencode")
+      # Same reasoning as --claude above: opencode's own installer puts the actual binary
+      # under ~/.opencode/bin/opencode, separate from its four XDG state dirs above.
+      # Read-only, same rationale.
+      RO_BINDS+=("$HOME/.opencode")
       shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;

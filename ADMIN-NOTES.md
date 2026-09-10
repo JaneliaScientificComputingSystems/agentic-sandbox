@@ -350,6 +350,73 @@ bind-mounted.
   looks), instead of to `$HOME/...`. Podman volume source and destination paths don't have to
   match, unlike bwrap's convention of using identical paths throughout this repo.
 
+### --userns=keep-id, revisited — full evidence and the actual root cause
+
+The original identity/HOME saga above (2026-08) concluded `--userns=keep-id` failed because
+the account testing it "hadn't been provisioned a `/etc/subuid`/`/etc/subgid` range yet."
+2026-09-10: revisited now that ranges are confirmed provisioned (`cericg:100000:65536`) --
+`--userns=keep-id --user "$(id -u):$(id -g)"` **still fails**, same error class:
+```
+Error: chowning container ... workdir to container root: potentially insufficient UIDs or
+GIDs available in user namespace (requested 28976:93102 for ...): Check /etc/subuid and
+/etc/subgid if configured locally and run "podman system migrate"
+```
+`28976:93102` is `cericg`'s real uid:gid exactly -- so this is a different, more specific
+failure than "no range at all."
+
+**Isolated which value is actually the problem**, using `--userns=keep-id:uid=X,gid=Y` to
+test uid and gid independently:
+
+| Test | uid | gid | Result |
+|---|---|---|---|
+| A | 1000 (small) | 93102 (real) | **fails** |
+| B | 28976 (real) | 1000 (small) | **works** |
+| C | 65535 (range edge) | 1000 (small) | **works** |
+
+Confirms: `cericg`'s real **uid** (28976) is not the problem at all -- it works even at
+values right up to the edge of the granted range. The real **gid** (93102) is the entire
+cause.
+
+**Found the exact boundary** by sweeping gid values with a fixed small uid:
+
+| gid | Result |
+|---|---|
+| 65534 | works |
+| 65535 | works |
+| **65536** | **works** |
+| **65537** | **fails** |
+| 90000 | fails |
+| 93102 (real) | fails |
+
+The threshold is exactly the width of the granted subgid range (65536, from
+`cericg:100000:65536`). `--userns=keep-id`'s default identity-mapping needs the target
+uid/gid to be `≤` the granted range's width -- not just "a range exists," and not related to
+where the range is positioned. `cericg`'s real gid (93102) exceeds it by 27566.
+
+**Root cause, fully confirmed**: AD/LDAP here assigns primary GIDs (93102 for `cericg`) well
+above the traditional 16-bit container UID/GID space (0-65535) that `keep-id`'s default
+mapping needs to identity-map your own uid/gid into. The uid side is fine (28976 < 65536);
+the gid side isn't. A wider grant (width > real gid, e.g. 131072/"128k", requested
+2026-09-10) should resolve it -- not independently re-verified after the widening as of this
+writing.
+
+**Cross-check worth doing before trusting `janelia-mojo-sandbox`'s `--keep-id` instructor
+mode as a working example**: `kittisopikulm`'s real gid (93099) is nearly identical to
+`cericg`'s (93102) and also exceeds their granted subgid width (`558752:65536`, still 65536
+wide despite being positioned differently). Never independently tested under that account --
+only read their README's claim that instructor mode works. Given how precisely this
+boundary reproduces, their `--keep-id` usage is more likely subject to the identical failure
+than to be a working counterexample.
+
+**Implementation**: added `--keep-id` to `podman-run.sh` (`--userns=keep-id --user
+"$(id -u):$(id -g)" -e HOME=$HOME`). `--claude`/`--opencode`'s mount *destination* now
+depends on `--keep-id`'s final state, decided once after the full argument parse (not at the
+point each flag is seen) so flag order never matters -- verified live: `--claude --keep-id`
+and `--keep-id --claude` produce identical results. Verified live before the range widening:
+the flag is wired correctly and produces exactly the expected (still-failing-for-now) chown
+error; default (`--claude`/`--opencode` without `--keep-id`) unaffected, still mounts to
+`/root/...` as before; plain no-flags run still runs as root as before (regression checks).
+
 ### The credential-masking attempt that didn't work — full evidence
 
 `sandbox-run.sh` masks known credential paths inside `$HOME` (empty `--tmpfs` over

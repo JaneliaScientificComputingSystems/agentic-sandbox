@@ -24,6 +24,17 @@
 #   --scratch       Shorthand for --rw /scratch/$USER
 #   --claude        Shorthand for RW binds on ~/.claude and ~/.claude.json
 #   --opencode      Shorthand for RW binds on opencode's XDG dirs
+#   --keep-id       Run as your real uid/gid instead of root (--userns=keep-id --user
+#                    "$(id -u):$(id -g)"), so files land on the real filesystem with your
+#                    normal ownership instead of root-mapped-through-the-user-namespace.
+#                    REQUIRES a /etc/subuid/etc/subgid range wider than your account's real
+#                    GID (not just "any range") -- confirmed live 2026-09-10: keep-id's
+#                    default identity-mapping needs your own uid AND gid to individually fit
+#                    within the granted range's width, and AD/LDAP GIDs here commonly exceed
+#                    a standard 65536-wide grant (e.g. cericg's real gid 93102 > 65536).
+#                    Fails with "potentially insufficient UIDs or GIDs available in user
+#                    namespace" if your range isn't wide enough -- ask HPC for a wider one
+#                    (width > your real gid, not just "a range") if you hit this.
 #   -h, --help      Show help
 #
 # Unlike sandbox-run.sh, $HOME is NOT bound by default here -- use --rw/--ro if you need your
@@ -47,8 +58,11 @@ IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
 ALLOW_HOSTS=()
 GPU=0
+KEEP_ID=0
+WANT_CLAUDE=0
+WANT_OPENCODE=0
 
-usage() { sed -n '2,32p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,46p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,27 +71,44 @@ while [[ $# -gt 0 ]]; do
     --rw) VOLUMES+=("-v" "$2:$2:rw"); shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
+    --keep-id) KEEP_ID=1; shift ;;
     --scratch) VOLUMES+=("-v" "/scratch/$USER:/scratch/$USER:rw"); shift ;;
-    --claude)
-      # Mounted to /root/... (the container's actual $HOME as root, its default
-      # user), NOT $HOME/... -- unlike bwrap, a container doesn't run as you by
-      # default, and forcing identity via --userns=keep-id/--user hit real
-      # subuid/subgid and file-permission problems here. Podman volume src/dst
-      # don't have to match, so just aim at where root actually looks.
-      VOLUMES+=("-v" "$HOME/.claude:/root/.claude:rw" "-v" "$HOME/.claude.json:/root/.claude.json:rw")
-      shift ;;
-    --opencode)
-      VOLUMES+=("-v" "$HOME/.config/opencode:/root/.config/opencode:rw"
-                "-v" "$HOME/.local/share/opencode:/root/.local/share/opencode:rw"
-                "-v" "$HOME/.local/state/opencode:/root/.local/state/opencode:rw"
-                "-v" "$HOME/.cache/opencode:/root/.cache/opencode:rw")
-      shift ;;
+    --claude) WANT_CLAUDE=1; shift ;;
+    --opencode) WANT_OPENCODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 CMD=("$@")
+
+# --claude/--opencode's mount DESTINATION depends on --keep-id, decided here (after the full
+# parse) rather than at the point each flag was seen, so flag order never matters. Default
+# (no --keep-id): container runs as root, $HOME=/root -- mount to /root/... where root
+# actually looks; forcing identity via --user without namespace remapping hit real
+# subuid/subgid and file-permission problems (see ADMIN-NOTES.md's "identity/HOME saga").
+# --keep-id: container runs as your real uid, $HOME=$HOME (set via -e HOME below) -- mount to
+# the real $HOME/... path instead, same convention as bwrap.
+if [[ $WANT_CLAUDE -eq 1 ]]; then
+  if [[ $KEEP_ID -eq 1 ]]; then
+    VOLUMES+=("-v" "$HOME/.claude:$HOME/.claude:rw" "-v" "$HOME/.claude.json:$HOME/.claude.json:rw")
+  else
+    VOLUMES+=("-v" "$HOME/.claude:/root/.claude:rw" "-v" "$HOME/.claude.json:/root/.claude.json:rw")
+  fi
+fi
+if [[ $WANT_OPENCODE -eq 1 ]]; then
+  if [[ $KEEP_ID -eq 1 ]]; then
+    VOLUMES+=("-v" "$HOME/.config/opencode:$HOME/.config/opencode:rw"
+              "-v" "$HOME/.local/share/opencode:$HOME/.local/share/opencode:rw"
+              "-v" "$HOME/.local/state/opencode:$HOME/.local/state/opencode:rw"
+              "-v" "$HOME/.cache/opencode:$HOME/.cache/opencode:rw")
+  else
+    VOLUMES+=("-v" "$HOME/.config/opencode:/root/.config/opencode:rw"
+              "-v" "$HOME/.local/share/opencode:/root/.local/share/opencode:rw"
+              "-v" "$HOME/.local/state/opencode:/root/.local/state/opencode:rw"
+              "-v" "$HOME/.cache/opencode:/root/.cache/opencode:rw")
+  fi
+fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
@@ -141,6 +172,9 @@ else
   PODMAN_ARGS+=(-i)
 fi
 [[ $GPU -eq 1 ]] && PODMAN_ARGS+=(--device nvidia.com/gpu=all)
+if [[ $KEEP_ID -eq 1 ]]; then
+  PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
+fi
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
 
 # NOTE: an earlier version of this script attempted to mask credential paths under $HOME
