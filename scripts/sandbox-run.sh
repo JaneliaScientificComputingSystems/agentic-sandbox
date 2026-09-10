@@ -77,18 +77,26 @@ BWRAP_ARGS=(
 # Bind order matters in bwrap: these run AFTER the $HOME bind above, so they
 # override it for just these paths. Directories get an empty tmpfs overlay
 # (agent sees an empty dir, not the real one); single files get bound over
-# with /dev/null. Only masks paths that actually exist -- $HOME is already
-# read-only bound above, so bwrap can't create a new mountpoint for a path
-# that doesn't exist yet (confirmed live: --tmpfs on a nonexistent ~/.azure
-# failed with "Can't mkdir: Read-only file system"), and there's nothing to
-# protect at a path the user doesn't have anyway.
+# with a freshly created empty regular file -- NOT /dev/null: confirmed live
+# that binding the /dev/null device node onto a non-/dev path fails with
+# "Permission denied" (bwrap applies nodev to binds outside its own --dev
+# tree, which neuters the device semantics /dev/null needs). Only masks
+# paths that actually exist -- $HOME is already read-only bound above, so
+# bwrap can't create a new mountpoint for a path that doesn't exist yet
+# (confirmed live: --tmpfs on a nonexistent ~/.azure failed with "Can't
+# mkdir: Read-only file system"), and there's nothing to protect at a path
+# the user doesn't have anyway.
 SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker)
 SENSITIVE_HOME_FILES=(.git-credentials .npmrc .pypirc .netrc .env .env.local)
 for d in "${SENSITIVE_HOME_DIRS[@]}"; do
   [[ -d "$HOME/$d" ]] && BWRAP_ARGS+=(--tmpfs "$HOME/$d")
 done
+EMPTY_MASK_FILE=""
 for f in "${SENSITIVE_HOME_FILES[@]}"; do
-  [[ -f "$HOME/$f" ]] && BWRAP_ARGS+=(--ro-bind /dev/null "$HOME/$f")
+  if [[ -f "$HOME/$f" ]]; then
+    [[ -z "$EMPTY_MASK_FILE" ]] && EMPTY_MASK_FILE="$(mktemp /tmp/sandbox-empty.XXXXXX)"
+    BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$HOME/$f")
+  fi
 done
 # SSSD's NSS socket -- lets whoami/id/getent resolve UID->username on
 # AD/LDAP-joined hosts. Doesn't affect actual permission enforcement (that's
@@ -105,6 +113,7 @@ PROXY_SOCK=""
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$PROXY_SOCK" && -e "$PROXY_SOCK" ]] && rm -f "$PROXY_SOCK"
+  [[ -n "$EMPTY_MASK_FILE" && -e "$EMPTY_MASK_FILE" ]] && rm -f "$EMPTY_MASK_FILE"
 }
 trap cleanup EXIT
 
