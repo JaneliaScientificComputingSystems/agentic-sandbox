@@ -49,7 +49,7 @@ bwrap \
 `--dev /dev` gives a fresh, minimal `/dev`, not a bind of the host's — confirmed GPU devices
 are absent unless explicitly `--dev-bind`ed (moot now that GPU work goes through Podman).
 
-### The $HOME-to-$PWD default change (2026-09-10), and why
+### The $HOME-to-$PWD default change, and why
 
 `sandbox-run.sh` used to always read-only-bind all of `$HOME`, with a denylist of known
 credential paths masked on top (see the credential-masking section above). Prompted by the
@@ -272,7 +272,7 @@ Result: a normal conversational refusal from the model itself (*"I can't help wi
 hard limit for me regardless of how the request is packaged"*) — no exception, no
 `GuardrailRaisedException`, no HTTP 400.
 
-## GPU / device access — the full debugging story
+## GPU / device access — evidence
 
 **Confirmed, root-caused, tested live on a real GPU allocation (`gpu_l4` LSF queue).**
 
@@ -325,7 +325,7 @@ Fix: regenerate it (`nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`, nee
 after any driver upgrade. Confirmed: regenerating fixed it — `nvidia-smi -L` returned a real
 GPU UUID afterward.
 
-### The identity/HOME saga
+### Identity and $HOME under podman
 
 Unlike bwrap (where you're still "you" inside the sandbox), a podman container runs as
 **root** by default, with `$HOME=/root` — so `claude`/`opencode` looked for their config at
@@ -349,9 +349,9 @@ bind-mounted.
 
 ### --userns=keep-id, revisited — full evidence and the actual root cause
 
-The saga above (2026-08) concluded `--userns=keep-id` failed for lack of a subuid/subgid
-range. 2026-09-10, revisited with ranges confirmed provisioned (`cericg:100000:65536`) — it
-**still fails**, same error class, but now with `cericg`'s exact real uid:gid in the message:
+The section above concluded `--userns=keep-id` failed for lack of a subuid/subgid range.
+Revisited with ranges confirmed provisioned (`cericg:100000:65536`) — it **still fails**,
+same error class, but now with `cericg`'s exact real uid:gid in the message:
 ```
 Error: chowning container ... workdir to container root: potentially insufficient UIDs or
 GIDs available in user namespace (requested 28976:93102 for ...): Check /etc/subuid and
@@ -377,7 +377,7 @@ width, regardless of where the range is positioned. AD/LDAP here assigns primary
 (93102 for `cericg`) well above the traditional 16-bit container UID/GID space (0-65535)
 this mapping needs to fit into; `cericg`'s exceeds it by 27566.
 
-**Resolved**: HPC widened all granted ranges to 131072 ("128k") on 2026-09-10
+**Resolved**: HPC widened all granted ranges to 131072 ("128k")
 (`cericg:100000:131072`, confirmed deployed live). Retested: `--userns=keep-id --user
 "$(id -u):$(id -g)"` succeeds — real uid/gid, no chown error.
 
@@ -386,8 +386,8 @@ this mapping needs to fit into; `cericg`'s exceeds it by 27566.
 installed under `/root` by their native installers (`/root/.local/bin/claude`,
 `/root/.opencode/bin/opencode`, symlinked from `/usr/local/bin/`), and `/root` is `0700` by
 default — blocks traversal for a non-root process regardless of the target files' own
-permissions. Different failure mode from the original 2026-08 "second attempt" (`exit 126`,
-individual file permission denial) but the same root idea. Fixed in `podman/Dockerfile`:
+permissions. Different failure mode from the "second attempt" above (`exit 126`, individual
+file permission denial) but the same root idea. Fixed in `podman/Dockerfile`:
 `chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode` — deliberately targeted
 (traversal on `/root` itself, read+execute on just the two install trees), not a blanket
 loosening.
@@ -429,9 +429,9 @@ once after the full argument parse so flag order never matters — verified: `--
 `sandbox-run.sh` masks credential paths inside `$HOME` (empty `--tmpfs` over `.ssh`/`.aws`/
 etc., an empty file bound over `.git-credentials`/`.npmrc`/etc.) by appending the mask after
 the base bind, so the later mount shadows the earlier one — real Linux mount-stacking,
-verified working (see "Filesystem access — evidence" above). 2026-09-10: tried the identical
-approach in `podman-run.sh`, since `--rw "$HOME"` otherwise exposes the same credentials
-with zero protection.
+verified working (see "Filesystem access — evidence" above). Tried the identical approach in
+`podman-run.sh`, since `--rw "$HOME"` otherwise exposes the same credentials with zero
+protection.
 
 **Confirmed broken, not just untested.** Live session, `--rw "$HOME"` plus a `--tmpfs` mask
 on `$HOME/.ssh` appended after it (same ordering strategy as the working bwrap fix):
@@ -612,9 +612,9 @@ live via the GitHub API that the package exists after push (`podman push` report
 manifest to image destination`, the standard success line). The GHCR copy is the exact same
 image pushed straight from the verified build, not a separately-built artifact.
 
-Made public alongside the repo (2026-08-26) so `podman pull` needs no `podman login` first.
+Made public alongside the repo so `podman pull` needs no `podman login` first.
 
-**`podman/Dockerfile`** (now the default, 2026-09-10 — renamed from `Dockerfile.lite`; the
+**`podman/Dockerfile`** (now the default, renamed from `Dockerfile.lite`; the
 above became `Dockerfile.pytorch`): bare `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` (same
 CUDA version as the PyTorch image's toolkit) plus Node.js, Claude Code, and opencode, no ML
 framework stack. Built and verified live via a real LSF GPU job as an ordinary user (not
