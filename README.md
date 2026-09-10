@@ -502,15 +502,23 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   mount your real config to `/root/...` (where the container's actual user looks), not to
   `$HOME/...`.
 - **`--keep-id`**: run as your real uid/gid instead of root (`--userns=keep-id --user
-  "$(id -u):$(id -g)"`), so files land on the real filesystem with your normal ownership.
-  When set, `--claude`/`--opencode` correctly switch to mounting at your real `$HOME/...`
-  instead of `/root/...`. **Requires a `/etc/subuid`/`/etc/subgid` range *wider than your
-  account's real GID*, not just any range** — confirmed live 2026-09-10: `keep-id`'s default
-  identity-mapping needs your own uid and gid to each individually fit within the granted
-  range's width, and AD/LDAP GIDs here commonly exceed a standard 65536-wide grant (e.g. a
-  real gid of 93102 needs a range ≥ 93103 wide, not merely "a 65536-wide range somewhere").
-  Fails with `potentially insufficient UIDs or GIDs available in user namespace` if your
-  range isn't wide enough — ask HPC for a range wider than your real GID if you hit this.
+  "$(id -u):$(id -g)"`), so files land on the real filesystem with your normal ownership
+  instead of a namespace-mapped subordinate UID. When set, `--claude`/`--opencode` correctly
+  switch to mounting at your real `$HOME/...` instead of `/root/...`. **Requires a
+  `/etc/subuid`/`/etc/subgid` range *wider than your account's real GID*, not just any
+  range** — confirmed live 2026-09-10: `keep-id`'s default identity-mapping needs your own
+  uid and gid to each individually fit within the granted range's width, and AD/LDAP GIDs
+  here commonly exceed a standard 65536-wide grant. Fails with `potentially insufficient
+  UIDs or GIDs available in user namespace` if your range isn't wide enough — ask HPC for a
+  range wider than your real GID if you hit this (a 131072-wide range resolved it here).
+  Verified live end-to-end against the published GHCR image: real uid/gid, real `$HOME`,
+  `claude`/`opencode` both run, and files written from inside the sandbox land with real
+  ownership (`cericg:scicompsys`, not a subordinate mapped UID). Getting `claude`/`opencode`
+  to actually run under `--keep-id` also required a small image fix — `/root` is `0700` by
+  default, which blocks a non-root process from traversing into it at all, and both CLIs are
+  installed there by the native installers; the image now opens read+traverse on `/root`
+  and the two install trees specifically (`chmod o+rx /root && chmod -R o+rX /root/.local
+  /root/.opencode`), not a blanket loosening of `/root`.
 - **No credential masking, unlike `sandbox-run.sh`** — **never `--rw`/`--ro` a path that is or
   contains your real `$HOME`.** `sandbox-run.sh` masks `.ssh`/`.aws`/`.git-credentials`/etc.
   even when `$HOME` is bound (see [Filesystem access](#filesystem-access)); `podman-run.sh`

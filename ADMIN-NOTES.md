@@ -396,17 +396,43 @@ where the range is positioned. `cericg`'s real gid (93102) exceeds it by 27566.
 **Root cause, fully confirmed**: AD/LDAP here assigns primary GIDs (93102 for `cericg`) well
 above the traditional 16-bit container UID/GID space (0-65535) that `keep-id`'s default
 mapping needs to identity-map your own uid/gid into. The uid side is fine (28976 < 65536);
-the gid side isn't. A wider grant (width > real gid, e.g. 131072/"128k", requested
-2026-09-10) should resolve it -- not independently re-verified after the widening as of this
-writing.
+the gid side isn't.
 
-**Cross-check worth doing before trusting `janelia-mojo-sandbox`'s `--keep-id` instructor
-mode as a working example**: `kittisopikulm`'s real gid (93099) is nearly identical to
-`cericg`'s (93102) and also exceeds their granted subgid width (`558752:65536`, still 65536
-wide despite being positioned differently). Never independently tested under that account --
-only read their README's claim that instructor mode works. Given how precisely this
-boundary reproduces, their `--keep-id` usage is more likely subject to the identical failure
-than to be a working counterexample.
+**Resolved.** HPC widened all granted subuid/subgid ranges to 131072 ("128k") on 2026-09-10
+(`cericg:100000:131072`, confirmed deployed on a live compute node's `/etc/subuid`). Retested
+immediately: `--userns=keep-id --user "$(id -u):$(id -g)"` succeeds -- `whoami`/`id` report
+the real uid/gid, no chown error.
+
+**One more real issue surfaced once identity worked**: `claude`/`opencode` then failed with
+`Permission denied` (not "not found" -- confirmed via the exact error by invoking each CLI's
+full path directly). Root cause: both are installed by their native installers under `/root`
+(`/root/.local/bin/claude`, `/root/.opencode/bin/opencode`, symlinked from
+`/usr/local/bin/`), and `/root` is `0700` by default -- blocks traversal into it entirely for
+a non-root process, regardless of the target files' own permissions. This is a genuinely
+different failure mode from the original 2026-08 "second attempt" (`exit 126`, files
+unreadable by a different UID) -- same root idea (root-owned install, non-root process) but
+manifesting as directory traversal denial rather than individual file permission denial.
+Fixed in `podman/Dockerfile`: `chmod o+rx /root && chmod -R o+rX /root/.local
+/root/.opencode` -- deliberately targeted (traversal on `/root` itself, read+execute on only
+the two install trees these symlinks point into), not a blanket `chmod -R o+rX /root` that
+would open everything else that might end up there.
+
+**Verified live end-to-end, against the actual published GHCR image** (rebuilt and
+re-pushed with the `/root` fix, not just tested locally): `whoami` → `cericg`, `$HOME` → the
+real home directory, `claude --version` → `2.1.267`, `opencode --version` → `1.18.30`, and a
+file written from inside the sandbox to a `--rw`-mounted host directory landed as
+`-rw-r--r-- 1 cericg scicompsys` -- real ownership, not a subordinate namespace-mapped UID.
+`podman-run.sh --keep-id` closes the "podman runs as root" gap from the original Anthropic
+Docker-config comparison.
+
+**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: at the time this was first
+investigated, `kittisopikulm`'s real gid (93099, nearly identical to `cericg`'s 93102) also
+exceeded their granted subgid width (`558752:65536`), so their `--keep-id` instructor mode
+was suspected to be subject to the identical failure -- never independently verified, only
+inferred from the README's claim that it works. Moot now: the 2026-09-10 widening covered
+`kittisopikulm` too (`1017504:131072`, confirmed on a live node), comfortably exceeding
+their real gid. Still worth someone testing their instructor mode live post-widening to
+confirm, rather than continuing to take the README's claim on faith either way.
 
 **Implementation**: added `--keep-id` to `podman-run.sh` (`--userns=keep-id --user
 "$(id -u):$(id -g)" -e HOME=$HOME`). `--claude`/`--opencode`'s mount *destination* now

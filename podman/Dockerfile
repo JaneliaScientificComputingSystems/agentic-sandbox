@@ -27,4 +27,13 @@ RUN curl -fsSL https://claude.ai/install.sh | bash && \
 RUN curl -fsSL https://opencode.ai/install | bash && \
     ln -s /root/.opencode/bin/opencode /usr/local/bin/opencode
 
+# /root is mode 700 by default -- blocks traversal into it entirely for a non-root process,
+# which is exactly what `podman-run.sh --keep-id` runs as. Confirmed live: with --keep-id,
+# /usr/local/bin/claude (a symlink into /root/.local/bin/claude) and opencode's equivalent
+# both fail with "Permission denied", not because the target files themselves are
+# unreadable, but because /root itself can't be traversed by a different uid at all.
+# Deliberately targeted, not a blanket `chmod -R o+rX /root`: only opens traversal on /root
+# itself plus read+execute on the two install trees these symlinks actually point into.
+RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
+
 WORKDIR /work
