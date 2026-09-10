@@ -352,20 +352,17 @@ bind-mounted.
 
 ### --userns=keep-id, revisited — full evidence and the actual root cause
 
-The original identity/HOME saga above (2026-08) concluded `--userns=keep-id` failed because
-the account testing it "hadn't been provisioned a `/etc/subuid`/`/etc/subgid` range yet."
-2026-09-10: revisited now that ranges are confirmed provisioned (`cericg:100000:65536`) --
-`--userns=keep-id --user "$(id -u):$(id -g)"` **still fails**, same error class:
+The saga above (2026-08) concluded `--userns=keep-id` failed for lack of a subuid/subgid
+range. 2026-09-10, revisited with ranges confirmed provisioned (`cericg:100000:65536`) — it
+**still fails**, same error class, but now with `cericg`'s exact real uid:gid in the message:
 ```
 Error: chowning container ... workdir to container root: potentially insufficient UIDs or
 GIDs available in user namespace (requested 28976:93102 for ...): Check /etc/subuid and
 /etc/subgid if configured locally and run "podman system migrate"
 ```
-`28976:93102` is `cericg`'s real uid:gid exactly -- so this is a different, more specific
-failure than "no range at all."
 
-**Isolated which value is actually the problem**, using `--userns=keep-id:uid=X,gid=Y` to
-test uid and gid independently:
+**Isolated which value is the problem**, using `--userns=keep-id:uid=X,gid=Y` to test uid
+and gid independently:
 
 | Test | uid | gid | Result |
 |---|---|---|---|
@@ -373,155 +370,117 @@ test uid and gid independently:
 | B | 28976 (real) | 1000 (small) | **works** |
 | C | 65535 (range edge) | 1000 (small) | **works** |
 
-Confirms: `cericg`'s real **uid** (28976) is not the problem at all -- it works even at
-values right up to the edge of the granted range. The real **gid** (93102) is the entire
-cause.
+`cericg`'s real **uid** isn't the problem — it works right up to the range edge. The real
+**gid** (93102) is the entire cause.
 
-**Found the exact boundary** by sweeping gid values with a fixed small uid:
+**Exact boundary**, sweeping gid values with a fixed small uid: 65534/65535/**65536** all
+work, **65537**/90000/93102 all fail. The threshold is precisely the width of the granted
+subgid range (65536) — `keep-id`'s identity-mapping needs the target gid `≤` the range
+width, regardless of where the range is positioned. AD/LDAP here assigns primary GIDs
+(93102 for `cericg`) well above the traditional 16-bit container UID/GID space (0-65535)
+this mapping needs to fit into; `cericg`'s exceeds it by 27566.
 
-| gid | Result |
-|---|---|
-| 65534 | works |
-| 65535 | works |
-| **65536** | **works** |
-| **65537** | **fails** |
-| 90000 | fails |
-| 93102 (real) | fails |
+**Resolved**: HPC widened all granted ranges to 131072 ("128k") on 2026-09-10
+(`cericg:100000:131072`, confirmed deployed live). Retested: `--userns=keep-id --user
+"$(id -u):$(id -g)"` succeeds — real uid/gid, no chown error.
 
-The threshold is exactly the width of the granted subgid range (65536, from
-`cericg:100000:65536`). `--userns=keep-id`'s default identity-mapping needs the target
-uid/gid to be `≤` the granted range's width -- not just "a range exists," and not related to
-where the range is positioned. `cericg`'s real gid (93102) exceeds it by 27566.
+**One more issue surfaced once identity worked**: `claude`/`opencode` then failed with
+`Permission denied` (confirmed via each CLI's full path directly, not "not found"). Both are
+installed under `/root` by their native installers (`/root/.local/bin/claude`,
+`/root/.opencode/bin/opencode`, symlinked from `/usr/local/bin/`), and `/root` is `0700` by
+default — blocks traversal for a non-root process regardless of the target files' own
+permissions. Different failure mode from the original 2026-08 "second attempt" (`exit 126`,
+individual file permission denial) but the same root idea. Fixed in `podman/Dockerfile`:
+`chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode` — deliberately targeted
+(traversal on `/root` itself, read+execute on just the two install trees), not a blanket
+loosening.
 
-**Root cause, fully confirmed**: AD/LDAP here assigns primary GIDs (93102 for `cericg`) well
-above the traditional 16-bit container UID/GID space (0-65535) that `keep-id`'s default
-mapping needs to identity-map your own uid/gid into. The uid side is fine (28976 < 65536);
-the gid side isn't.
+**Verified live end-to-end against the actual published GHCR image** (rebuilt and
+re-pushed, not just tested locally): `whoami` → `cericg`, `$HOME` → the real home directory,
+`claude --version` → `2.1.267`, `opencode --version` → `1.18.30`.
 
-**Resolved.** HPC widened all granted subuid/subgid ranges to 131072 ("128k") on 2026-09-10
-(`cericg:100000:131072`, confirmed deployed on a live compute node's `/etc/subuid`). Retested
-immediately: `--userns=keep-id --user "$(id -u):$(id -g)"` succeeds -- `whoami`/`id` report
-the real uid/gid, no chown error.
+**Important correction**, found via the checked-in test suite's with/without-`--keep-id`
+matrix (`tests/test-podman.sh`): a file written to a `--rw`-mounted host directory lands
+with real ownership **even without `--keep-id`** — rootless podman's default mapping already
+writes bind-mounted files as the real invoking user; that part was never broken. What stays
+root-owned regardless of `--keep-id` is the *container's own internal storage* — confirmed
+separately, a `/tmp` file (not bind-mounted) showed `root root` in both cases.
 
-**One more real issue surfaced once identity worked**: `claude`/`opencode` then failed with
-`Permission denied` (not "not found" -- confirmed via the exact error by invoking each CLI's
-full path directly). Root cause: both are installed by their native installers under `/root`
-(`/root/.local/bin/claude`, `/root/.opencode/bin/opencode`, symlinked from
-`/usr/local/bin/`), and `/root` is `0700` by default -- blocks traversal into it entirely for
-a non-root process, regardless of the target files' own permissions. This is a genuinely
-different failure mode from the original 2026-08 "second attempt" (`exit 126`, files
-unreadable by a different UID) -- same root idea (root-owned install, non-root process) but
-manifesting as directory traversal denial rather than individual file permission denial.
-Fixed in `podman/Dockerfile`: `chmod o+rx /root && chmod -R o+rX /root/.local
-/root/.opencode` -- deliberately targeted (traversal on `/root` itself, read+execute on only
-the two install trees these symlinks point into), not a blanket `chmod -R o+rX /root` that
-would open everything else that might end up there.
+So `--keep-id`'s actual value is narrower than originally framed (that framing was borrowed
+from `janelia-mojo-sandbox`'s comment, which conflated the two): it changes the **process
+identity inside the container** (`whoami`, `$HOME` resolution) — which is what
+`--claude`/`--opencode` need to correctly mount at your real `$HOME/...` instead of
+`/root/...`. It does not fix bind-mounted file ownership, because that was never broken.
+`podman-run.sh --keep-id` still closes the "podman runs as root" gap from the Anthropic
+Docker-config comparison — just via in-container identity, not volume ownership.
 
-**Verified live end-to-end, against the actual published GHCR image** (rebuilt and
-re-pushed with the `/root` fix, not just tested locally): `whoami` → `cericg`, `$HOME` → the
-real home directory, `claude --version` → `2.1.267`, `opencode --version` → `1.18.30`.
+**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: their real gid (93099, nearly
+identical to `cericg`'s) also exceeded their pre-widening subgid range, so their `--keep-id`
+instructor mode was suspected to share this failure — never independently verified, only
+inferred from the README's claim. Moot now: the widening covered them too
+(`1017504:131072`). Still worth testing their instructor mode live to confirm, rather than
+taking the README's claim on faith either way.
 
-**Important correction, found via the checked-in test suite's with/without-`--keep-id`
-matrix (`tests/test-podman.sh`)**: a file written to a `--rw`-mounted host directory lands
-with real ownership (`-rw-r--r-- 1 cericg scicompsys`) **even without `--keep-id`** --
-confirmed by directly comparing both cases side by side. Rootless podman's default mapping
-(no `--userns` flag at all) already writes bind-mounted files as the real invoking user;
-that part was never actually broken. What *does* stay root-owned regardless of `--keep-id`
-is the *container's own internal storage* -- confirmed separately: a file written to `/tmp`
-(not bind-mounted, living in podman's own subuid-mapped storage tree) showed `root root`
-in both the `--keep-id` and non-`--keep-id` cases.
-
-So `--keep-id`'s actual, confirmed value is narrower than originally framed (that framing
-was borrowed from `janelia-mojo-sandbox`'s comment, which conflated the two): it changes the
-**process identity as seen from inside the container** (`whoami`, `$HOME` resolution) --
-which is what `--claude`/`--opencode` actually need to correctly switch their mount
-destination to your real `$HOME/...` instead of `/root/...`. It does not fix bind-mounted
-file ownership, because that was never the part that was broken. `podman-run.sh --keep-id`
-still closes the "podman runs as root" gap from the original Anthropic Docker-config
-comparison -- just via in-container identity, not volume ownership.
-
-**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: at the time this was first
-investigated, `kittisopikulm`'s real gid (93099, nearly identical to `cericg`'s 93102) also
-exceeded their granted subgid width (`558752:65536`), so their `--keep-id` instructor mode
-was suspected to be subject to the identical failure -- never independently verified, only
-inferred from the README's claim that it works. Moot now: the 2026-09-10 widening covered
-`kittisopikulm` too (`1017504:131072`, confirmed on a live node), comfortably exceeding
-their real gid. Still worth someone testing their instructor mode live post-widening to
-confirm, rather than continuing to take the README's claim on faith either way.
-
-**Implementation**: added `--keep-id` to `podman-run.sh` (`--userns=keep-id --user
-"$(id -u):$(id -g)" -e HOME=$HOME`). `--claude`/`--opencode`'s mount *destination* now
-depends on `--keep-id`'s final state, decided once after the full argument parse (not at the
-point each flag is seen) so flag order never matters -- verified live: `--claude --keep-id`
-and `--keep-id --claude` produce identical results. Verified live before the range widening:
-the flag is wired correctly and produces exactly the expected (still-failing-for-now) chown
-error; default (`--claude`/`--opencode` without `--keep-id`) unaffected, still mounts to
-`/root/...` as before; plain no-flags run still runs as root as before (regression checks).
+**Implementation**: `--userns=keep-id --user "$(id -u):$(id -g)" -e HOME=$HOME`.
+`--claude`/`--opencode`'s mount destination depends on `--keep-id`'s final state, decided
+once after the full argument parse so flag order never matters — verified: `--claude
+--keep-id` and `--keep-id --claude` produce identical results. Regression-checked: default
+(no `--keep-id`) behavior unaffected.
 
 ### The credential-masking attempt that didn't work — full evidence
 
-`sandbox-run.sh` masks known credential paths inside `$HOME` (empty `--tmpfs` over
-`.ssh`/`.aws`/etc., an empty regular file bound over `.git-credentials`/`.npmrc`/etc.),
-appended after the base `$HOME` bind so the later mount shadows the earlier one — real Linux
-mount-stacking semantics, verified working live (see "Filesystem access — evidence" above).
-2026-09-10: tried porting the identical approach to `podman-run.sh`, since `--rw "$HOME"` (to
-reach real project files) exposes the same credentials with no protection at all otherwise.
+`sandbox-run.sh` masks credential paths inside `$HOME` (empty `--tmpfs` over `.ssh`/`.aws`/
+etc., an empty file bound over `.git-credentials`/`.npmrc`/etc.) by appending the mask after
+the base bind, so the later mount shadows the earlier one — real Linux mount-stacking,
+verified working (see "Filesystem access — evidence" above). 2026-09-10: tried the identical
+approach in `podman-run.sh`, since `--rw "$HOME"` otherwise exposes the same credentials
+with zero protection.
 
-**Confirmed broken, not just untested.** Live user session, `--rw "$HOME"` plus a `--tmpfs`
-mask on `$HOME/.ssh` appended after it (identical ordering strategy to the working bwrap
-fix):
+**Confirmed broken, not just untested.** Live session, `--rw "$HOME"` plus a `--tmpfs` mask
+on `$HOME/.ssh` appended after it (same ordering strategy as the working bwrap fix):
 ```
 root@46dd0ffe1811:/work# ls -al /groups/scicompsys/home/cericg/.ssh
-total 152
 -rw------- 1 root nogroup   1675 Sep 10 14:30 id_rsa
 -rw-r--r-- 1 root nogroup    411 Sep 10 14:30 id_rsa.pub
 -rw------- 1 root nogroup 123732 Sep 10 14:30 known_hosts
 ```
-Real, live SSH keys — not masked. `df -h` inside the same container showed the `tmpfs`
-genuinely present in the mount table at `$HOME/.ssh` — the mount itself is there, but file
-access through it still resolves to the real underlying content, not the empty tmpfs.
+Real, live SSH keys — not masked. `df -h` in the same container showed the `tmpfs`
+genuinely present in the mount table at `$HOME/.ssh`, but file access through it still
+resolved to the real content underneath.
 
-**Directly confirmed via file content, not just listing**, isolating `.config/gcloud`:
+**Confirmed via file content, not just listing**, isolating `.config/gcloud`:
 ```bash
 podman run --rm -v "$HOMEDIR:$HOMEDIR:rw" --tmpfs "$HOMEDIR/.config/gcloud" "$IMG" \
   bash -c 'cat "$HOMEDIR/.config/gcloud/credentials.db"'
 ```
-Returned `SQLite format 3 ...` — the real, live credentials database, byte-identical size
-(12288) to the actual file on disk. Confirmed the real file on disk was untouched afterward
-(not that the mask corrupted it, just that it was never actually hidden).
+Returned `SQLite format 3 ...` — the real, live database, byte-identical size (12288) to the
+file on disk (untouched afterward — the mask never hid it, didn't corrupt it either).
 
-**What was ruled out:**
-- **Ordering** (does the last-listed mount win, same as bwrap): tested `--tmpfs` both before
-  and after the `-v $HOME:$HOME:rw` bind in the raw `podman run` invocation. Identical result
-  either way — real content visible regardless of argument order.
-- **Mount syntax**: tried both the `--tmpfs DEST` shorthand and the unified `--mount
-  type=tmpfs,destination=DEST` syntax. Identical result.
-- **tmpfs itself not working**: ruled out — a `--tmpfs` on a path with no overlapping `-v` at
-  all (e.g. `/tmp/masktest`, nothing else mounted there) worked correctly: a file written
-  inside it did not persist across a fresh container run, confirming tmpfs mounts function
-  normally in isolation.
+**Ruled out**: mount order (`--tmpfs` before vs. after the `-v` bind — identical result
+either way); mount syntax (`--tmpfs DEST` shorthand vs. unified `--mount
+type=tmpfs,destination=DEST` — identical); tmpfs itself not working (a `--tmpfs` with no
+overlapping `-v` at all worked correctly in isolation — a file written inside it didn't
+persist across a fresh run).
 
-**Best-available explanation** (not independently verified against podman/crun source, but
-consistent with every test result above): podman/crun likely treats a `-v` bind of a whole
-directory tree as effectively one mount covering everything beneath it, rather than applying
-each mount as an independent, sequential, overridable syscall the way bwrap does. bwrap's
-masking works specifically *because* bwrap builds the sandbox's mount namespace as a strict
-sequence of individual `mount()` calls in the single process constructing it — a later call
-at an already-covered path genuinely shadows the earlier one, standard Linux mount-stacking.
-Podman/crun's OCI runtime mount handling apparently does not preserve that same
-override-by-recency behavior for a mount nested inside an already-bound ancestor directory.
+**Best-available explanation** (not verified against podman/crun source, but consistent
+with every test above): podman/crun likely treats a `-v` bind of a whole directory tree as
+one mount covering everything beneath it, rather than applying each mount as an
+independent, sequential, overridable syscall the way bwrap does. bwrap's masking works
+specifically because it builds the sandbox's mount namespace as a strict sequence of
+individual `mount()` calls — a later call at an already-covered path genuinely shadows the
+earlier one. Podman/crun's OCI runtime handling doesn't appear to preserve that
+override-by-recency behavior for a mount nested inside an already-bound ancestor.
 
 **Decision**: removed the masking code from `podman-run.sh` entirely rather than ship it
-broken — a `--tmpfs` that shows up correctly in `df -h` while the real credentials remain
-fully readable underneath is worse than no masking at all, since it looks protected and
-isn't. `podman-run.sh` now explicitly documents (header comment, and README's Filesystem
-access / GPU sections) that `$HOME` (or any path containing it) must never be passed to
-`--rw`/`--ro` — there is no safe way to expose it partially the way bwrap can. This matches
-Anthropic's own secure-deployment guide's actual pattern, worth noting: their hardened Docker
-example doesn't mount the host's real home directory at all — the container gets its own
-fresh `--tmpfs /home/agent`, and only the specific project directory is mounted (`-v
-/path/to/code:/workspace:ro`), with an explicit warning against mounting `~/.ssh`/`~/.aws`/
-`~/.config`. They solve this by never posing the problem, not by masking around it.
+broken — a `--tmpfs` that shows correctly in `df -h` while the real credentials stay fully
+readable underneath is worse than no masking, since it looks protected and isn't.
+`podman-run.sh` now documents (header comment, README's Filesystem access / GPU sections)
+that `$HOME` (or any path containing it) must never go to `--rw`/`--ro` — there's no safe
+partial-exposure mechanism the way bwrap has. Matches Anthropic's own secure-deployment
+guide's actual pattern: their hardened Docker example never mounts the real home directory
+at all — the container gets its own fresh `--tmpfs /home/agent`, only the specific project
+directory is mounted, with an explicit warning against `~/.ssh`/`~/.aws`/`~/.config`. They
+solve this by never posing the problem, not by masking around it.
 
 ### The concurrency/storage gotcha, and prior art
 
