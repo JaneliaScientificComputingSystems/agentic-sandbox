@@ -25,6 +25,14 @@
 #   --claude        Shorthand for RW binds on ~/.claude and ~/.claude.json
 #   --opencode      Shorthand for RW binds on opencode's XDG dirs
 #   -h, --help      Show help
+#
+# Unlike sandbox-run.sh, $HOME is NOT bound by default here -- use --rw/--ro if you need your
+# real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
+# here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
+# covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
+# PODMAN_ARGS below for the full story). Never --rw/--ro a path that IS or CONTAINS $HOME --
+# .ssh/.aws/.git-credentials/etc. will be fully exposed, read-write, no exceptions. Scope
+# --rw/--ro to the specific subdirectory you actually need instead.
 set -euo pipefail
 
 # Save the real stdin before anything backgrounds `podman run` (needed below, for the
@@ -40,7 +48,7 @@ VOLUMES=()
 ALLOW_HOSTS=()
 GPU=0
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,32p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -134,6 +142,22 @@ else
 fi
 [[ $GPU -eq 1 ]] && PODMAN_ARGS+=(--device nvidia.com/gpu=all)
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
+
+# NOTE: an earlier version of this script attempted to mask credential paths under $HOME
+# here, the same way sandbox-run.sh does (an empty --tmpfs over .ssh/.aws/etc., appended
+# after $VOLUMES so it'd override an earlier --rw/--ro on $HOME). REMOVED 2026-09-10:
+# confirmed live it does NOT work -- `df -h` inside the container shows the tmpfs correctly
+# mounted at e.g. $HOME/.ssh, but the real files (id_rsa, known_hosts, credentials.db, etc.)
+# remained fully readable through it regardless, byte-identical to the real ones on disk. An
+# isolated --tmpfs with no overlapping -v (no ancestor bind covering it) worked correctly in
+# the same test, so the failure is specific to nesting a --tmpfs inside a path already
+# covered by an active -v bind of an ancestor directory -- podman/crun most likely treats a
+# -v bind of a whole directory tree as a single mount rather than applying mounts as
+# sequential, overridable syscalls the way bwrap does, so "later argument wins" (which is
+# what makes sandbox-run.sh's fix work) does not hold here. Leaving this masked-but-broken
+# would be worse than no masking at all -- it looks protected in `df -h` while the real data
+# stays fully exposed. See "Filesystem access" in README.md for the actual mitigation
+# (never --rw/--ro a path containing $HOME -- scope to the specific subdirectory you need).
 
 PROXY_PID=""
 PROXY_SOCK=""

@@ -250,6 +250,18 @@ sandboxed process sees them exist but empty, never the real contents. This only 
 that already exist for you; nothing is created. An explicit `--ro`/`--rw` (or `--claude`)
 on one of these paths still overrides the mask, same nesting-override rule as below.
 
+**This masking is bwrap-specific and works because bwrap's mounts are sequential,
+individually-overridable syscalls** — a later `--tmpfs`/`--bind` at a path genuinely shadows
+whatever an earlier one put there, real Linux mount-stacking semantics. **`podman-run.sh` has
+no equivalent, and can't be given one the same way** — confirmed live that a `--tmpfs`
+does not override a path already covered by an ancestor `-v` bind under podman, so **never
+`--rw`/`--ro` a path that is or contains `$HOME` with `podman-run.sh`**; the real
+`.ssh`/`.aws`/etc. contents stay fully readable underneath a "masked" tmpfs regardless. See
+[GPU / device access](#gpu--device-access) for the full story. Scope `--rw`/`--ro` to the
+specific subdirectory you actually need instead — same advice Anthropic's own
+secure-deployment guide gives (mount the one project directory needed, never the whole home
+directory).
+
 A common pattern — home read-only, one subdirectory read-write:
 ```bash
 bwrap \
@@ -479,6 +491,14 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   bwrap where you're still "you." `scripts/podman-run.sh`'s `--claude`/`--opencode` shorthands
   mount your real config to `/root/...` (where the container's actual user looks), not to
   `$HOME/...`.
+- **No credential masking, unlike `sandbox-run.sh`** — **never `--rw`/`--ro` a path that is or
+  contains your real `$HOME`.** `sandbox-run.sh` masks `.ssh`/`.aws`/`.git-credentials`/etc.
+  even when `$HOME` is bound (see [Filesystem access](#filesystem-access)); `podman-run.sh`
+  has no equivalent, and confirmed live it cannot be added the same way — a `--tmpfs` doesn't
+  override a path already covered by an ancestor `-v` bind, so a "masked" credential
+  directory still returns the real, fully readable files underneath. Scope `--rw`/`--ro` to
+  the specific subdirectory you actually need (e.g. your project folder), never your home
+  directory as a whole.
 
 ```bash
 # --image defaults to agentic-sandbox-lite on GHCR; pass --image localhost/agentic-sandbox-lite:latest

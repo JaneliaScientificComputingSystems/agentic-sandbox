@@ -303,6 +303,71 @@ bind-mounted.
   looks), instead of to `$HOME/...`. Podman volume source and destination paths don't have to
   match, unlike bwrap's convention of using identical paths throughout this repo.
 
+### The credential-masking attempt that didn't work — full evidence
+
+`sandbox-run.sh` masks known credential paths inside `$HOME` (empty `--tmpfs` over
+`.ssh`/`.aws`/etc., an empty regular file bound over `.git-credentials`/`.npmrc`/etc.),
+appended after the base `$HOME` bind so the later mount shadows the earlier one — real Linux
+mount-stacking semantics, verified working live (see "Filesystem access — evidence" above).
+2026-09-10: tried porting the identical approach to `podman-run.sh`, since `--rw "$HOME"` (to
+reach real project files) exposes the same credentials with no protection at all otherwise.
+
+**Confirmed broken, not just untested.** Live user session, `--rw "$HOME"` plus a `--tmpfs`
+mask on `$HOME/.ssh` appended after it (identical ordering strategy to the working bwrap
+fix):
+```
+root@46dd0ffe1811:/work# ls -al /groups/scicompsys/home/cericg/.ssh
+total 152
+-rw------- 1 root nogroup   1675 Sep 10 14:30 id_rsa
+-rw-r--r-- 1 root nogroup    411 Sep 10 14:30 id_rsa.pub
+-rw------- 1 root nogroup 123732 Sep 10 14:30 known_hosts
+```
+Real, live SSH keys — not masked. `df -h` inside the same container showed the `tmpfs`
+genuinely present in the mount table at `$HOME/.ssh` — the mount itself is there, but file
+access through it still resolves to the real underlying content, not the empty tmpfs.
+
+**Directly confirmed via file content, not just listing**, isolating `.config/gcloud`:
+```bash
+podman run --rm -v "$HOMEDIR:$HOMEDIR:rw" --tmpfs "$HOMEDIR/.config/gcloud" "$IMG" \
+  bash -c 'cat "$HOMEDIR/.config/gcloud/credentials.db"'
+```
+Returned `SQLite format 3 ...` — the real, live credentials database, byte-identical size
+(12288) to the actual file on disk. Confirmed the real file on disk was untouched afterward
+(not that the mask corrupted it, just that it was never actually hidden).
+
+**What was ruled out:**
+- **Ordering** (does the last-listed mount win, same as bwrap): tested `--tmpfs` both before
+  and after the `-v $HOME:$HOME:rw` bind in the raw `podman run` invocation. Identical result
+  either way — real content visible regardless of argument order.
+- **Mount syntax**: tried both the `--tmpfs DEST` shorthand and the unified `--mount
+  type=tmpfs,destination=DEST` syntax. Identical result.
+- **tmpfs itself not working**: ruled out — a `--tmpfs` on a path with no overlapping `-v` at
+  all (e.g. `/tmp/masktest`, nothing else mounted there) worked correctly: a file written
+  inside it did not persist across a fresh container run, confirming tmpfs mounts function
+  normally in isolation.
+
+**Best-available explanation** (not independently verified against podman/crun source, but
+consistent with every test result above): podman/crun likely treats a `-v` bind of a whole
+directory tree as effectively one mount covering everything beneath it, rather than applying
+each mount as an independent, sequential, overridable syscall the way bwrap does. bwrap's
+masking works specifically *because* bwrap builds the sandbox's mount namespace as a strict
+sequence of individual `mount()` calls in the single process constructing it — a later call
+at an already-covered path genuinely shadows the earlier one, standard Linux mount-stacking.
+Podman/crun's OCI runtime mount handling apparently does not preserve that same
+override-by-recency behavior for a mount nested inside an already-bound ancestor directory.
+
+**Decision**: removed the masking code from `podman-run.sh` entirely rather than ship it
+broken — a `--tmpfs` that shows up correctly in `df -h` while the real credentials remain
+fully readable underneath is worse than no masking at all, since it looks protected and
+isn't. `podman-run.sh` now explicitly documents (header comment, and README's Filesystem
+access / GPU sections) that `$HOME` (or any path containing it) must never be passed to
+`--rw`/`--ro` — there is no safe way to expose it partially the way bwrap can. This matches
+Anthropic's own secure-deployment guide's actual pattern, worth noting: their hardened Docker
+example doesn't mount the host's real home directory at all — the container gets its own
+fresh `--tmpfs /home/agent`, and only the specific project directory is mounted (`-v
+/path/to/code:/workspace:ro`), with an explicit warning against mounting `~/.ssh`/`~/.aws`/
+`~/.config`. They solve this by never posing the problem, not by masking around it.
+
 ### The concurrency/storage gotcha, and prior art
 
 Rootless podman keeps per-user state under fixed local paths, and if multiple podman
