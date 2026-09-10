@@ -239,6 +239,15 @@ The base every example in this doc assumes:
 ```
 The toolchain and your home directory, read-only. Everything else is *additional* to this.
 
+**`sandbox-run.sh` masks known credential paths inside `$HOME`, even though `$HOME` itself is
+read-only bound.** Read-only exposure is still enough for a prompt-injected agent to
+exfiltrate or display secret contents, so `.ssh`, `.aws`, `.azure`, `.kube`,
+`.config/gcloud`, and `.docker` come back as empty directories, and `.git-credentials`,
+`.npmrc`, `.pypirc`, `.netrc`, `.env`, and `.env.local` come back as empty files — the
+sandboxed process sees them exist but empty, never the real contents. This only masks paths
+that already exist for you; nothing is created. An explicit `--ro`/`--rw` (or `--claude`)
+on one of these paths still overrides the mask, same nesting-override rule as below.
+
 A common pattern — home read-only, one subdirectory read-write:
 ```bash
 bwrap \
@@ -511,7 +520,10 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
 ```
 
 **What's mounted by default, unconditionally**: the toolchain (`/usr /bin /lib64 /lib /sbin
-/etc`) and your home directory, both read-only; SSSD's NSS socket if present (so
+/etc`) and your home directory, both read-only (`sandbox-run.sh` additionally masks known
+credential paths inside `$HOME` — `.ssh`, `.aws`, `.git-credentials`, `.npmrc`, etc. come
+back empty even though the rest of `$HOME` is readable; see [Filesystem
+access](#filesystem-access) for the full list); SSSD's NSS socket if present (so
 `whoami`/`id` resolve real names — doesn't affect actual permission enforcement, which is
 UID-number-based regardless); network fully blocked unless you pass `--allow`.
 
