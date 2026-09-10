@@ -22,9 +22,15 @@
 #                          ~/.local/state/opencode, ~/.cache/opencode)
 #   -h, --help             Show this help
 #
-# The toolchain (/usr /bin /lib64 /lib /sbin /etc) and $HOME (read-only, unless
-# a --rw path overrides part of it) are always bound -- that's the base every
-# sandbox in this repo's docs assumes; --ro/--rw are for anything ADDITIONAL.
+# The toolchain (/usr /bin /lib64 /lib /sbin /etc) and $PWD (read-write, wherever
+# you invoke this script from) are always bound -- that's the base every sandbox
+# in this repo's docs assumes; --ro/--rw are for anything ADDITIONAL. $HOME is NOT
+# bound by default (changed 2026-09-10, was previously always read-only-bound) --
+# use --rw/--ro if a task genuinely needs files elsewhere in your home directory.
+# Known credential paths (.ssh, .aws, .git-credentials, etc.) are always masked
+# wherever they'd otherwise appear -- under $PWD, and under $HOME too if you do
+# pass --rw/--ro on it -- see the masking block below for the full list and why
+# this can't be opted out of via a generic --rw/--ro on one of those exact paths.
 #
 # Examples:
 #   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
@@ -66,38 +72,9 @@ fi
 BWRAP_ARGS=(
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib64 /lib64 --ro-bind /lib /lib
   --ro-bind /sbin /sbin --ro-bind /etc /etc
-  --ro-bind "$HOME" "$HOME"
+  --bind "$PWD" "$PWD"
   --proc /proc --dev /dev --unshare-net --unshare-pid --die-with-parent
 )
-# Mask well-known credential locations inside $HOME -- even though $HOME is
-# only read-only bound above, read access alone is enough for a
-# prompt-injected agent to exfiltrate or display secret contents (this is
-# Anthropic's own explicit warning in their secure-deployment guide, and our
-# default of binding all of $HOME was doing exactly what they warn against).
-# Bind order matters in bwrap: these run AFTER the $HOME bind above, so they
-# override it for just these paths. Directories get an empty tmpfs overlay
-# (agent sees an empty dir, not the real one); single files get bound over
-# with a freshly created empty regular file -- NOT /dev/null: confirmed live
-# that binding the /dev/null device node onto a non-/dev path fails with
-# "Permission denied" (bwrap applies nodev to binds outside its own --dev
-# tree, which neuters the device semantics /dev/null needs). Only masks
-# paths that actually exist -- $HOME is already read-only bound above, so
-# bwrap can't create a new mountpoint for a path that doesn't exist yet
-# (confirmed live: --tmpfs on a nonexistent ~/.azure failed with "Can't
-# mkdir: Read-only file system"), and there's nothing to protect at a path
-# the user doesn't have anyway.
-SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker)
-SENSITIVE_HOME_FILES=(.git-credentials .npmrc .pypirc .netrc .env .env.local)
-for d in "${SENSITIVE_HOME_DIRS[@]}"; do
-  [[ -d "$HOME/$d" ]] && BWRAP_ARGS+=(--tmpfs "$HOME/$d")
-done
-EMPTY_MASK_FILE=""
-for f in "${SENSITIVE_HOME_FILES[@]}"; do
-  if [[ -f "$HOME/$f" ]]; then
-    [[ -z "$EMPTY_MASK_FILE" ]] && EMPTY_MASK_FILE="$(mktemp /tmp/sandbox-empty.XXXXXX)"
-    BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$HOME/$f")
-  fi
-done
 # SSSD's NSS socket -- lets whoami/id/getent resolve UID->username on
 # AD/LDAP-joined hosts. Doesn't affect actual permission enforcement (that's
 # UID-number-based at the kernel level regardless), just name resolution.
@@ -107,6 +84,48 @@ if [[ -S /var/lib/sss/pipes/nss ]]; then
 fi
 for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--ro-bind "$p" "$p"); done
 for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--bind "$p" "$p"); done
+
+# Mask well-known credential locations -- applied LAST, after every --ro/--rw
+# above (including --claude/--opencode/--scratch and anything the caller
+# added), so this is the unconditional final word, not something a generic
+# --rw/--ro on one of these exact paths can quietly re-expose. Checked under
+# both $PWD (always bound above) and $HOME (only actually visible in the
+# sandbox if the caller explicitly --rw/--ro'd it or it happens to equal
+# $PWD) -- deduplicated so a path checked under both isn't masked twice.
+# Read access alone is enough for a prompt-injected agent to exfiltrate or
+# display secret contents (Anthropic's own explicit warning in their
+# secure-deployment guide). Directories get an empty tmpfs overlay (agent
+# sees an empty dir, not the real one); single files get bound over with a
+# freshly created empty regular file -- NOT /dev/null: confirmed live that
+# binding the /dev/null device node onto a non-/dev path fails with
+# "Permission denied" (bwrap applies nodev to binds outside its own --dev
+# tree, which neuters the device semantics /dev/null needs). Only masks
+# paths that actually exist on the host -- nothing to protect at a path the
+# user doesn't have, and bwrap can't create a mountpoint for one anyway if
+# its parent ended up read-only bound (confirmed live: --tmpfs on a
+# nonexistent ~/.azure under a read-only $HOME failed with "Can't mkdir:
+# Read-only file system").
+SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker)
+SENSITIVE_HOME_FILES=(.git-credentials .npmrc .pypirc .netrc .env .env.local)
+declare -A MASK_ROOTS_SEEN=()
+MASK_ROOTS=()
+for root in "$PWD" "$HOME"; do
+  [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
+  MASK_ROOTS_SEEN[$root]=1
+  MASK_ROOTS+=("$root")
+done
+EMPTY_MASK_FILE=""
+for root in "${MASK_ROOTS[@]}"; do
+  for d in "${SENSITIVE_HOME_DIRS[@]}"; do
+    [[ -d "$root/$d" ]] && BWRAP_ARGS+=(--tmpfs "$root/$d")
+  done
+  for f in "${SENSITIVE_HOME_FILES[@]}"; do
+    if [[ -f "$root/$f" ]]; then
+      [[ -z "$EMPTY_MASK_FILE" ]] && EMPTY_MASK_FILE="$(mktemp /tmp/sandbox-empty.XXXXXX)"
+      BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$root/$f")
+    fi
+  done
+done
 
 PROXY_PID=""
 PROXY_SOCK=""

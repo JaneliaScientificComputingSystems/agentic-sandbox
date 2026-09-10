@@ -52,6 +52,53 @@ bwrap \
 `--dev /dev` gives a fresh, minimal `/dev`, not a bind of the host's — confirmed GPU devices
 are absent unless explicitly `--dev-bind`ed (moot now that GPU work goes through Podman).
 
+### The $HOME-to-$PWD default change (2026-09-10), and why
+
+`sandbox-run.sh` used to always read-only-bind all of `$HOME`, with a denylist of known
+credential paths masked on top (see the credential-masking section above). Prompted by the
+same session that found podman's masking equivalent doesn't actually work (see "The
+credential-masking attempt that didn't work" below): even where masking *does* work (bwrap),
+a denylist is still a standing liability — it protects against the specific paths we thought
+to list, not whatever shows up next (a new cloud CLI's config file, `.gnupg`, a password
+manager's store, etc.). Anthropic's own secure-deployment guide's actual pattern is to never
+mount the real home directory at all, not to mount it and mask around it.
+
+**Changed default**: `sandbox-run.sh` now binds `$PWD` (read-write) instead of `$HOME`
+(read-only). `$HOME` itself is no longer bound unless the caller explicitly `--rw`/`--ro`s
+it. `--claude`/`--opencode`/`--scratch` are unaffected — they were already narrow, explicit
+opt-ins, not part of this problem.
+
+**The masking logic was kept, not removed, and now applies to both `$PWD` and `$HOME`** —
+deliberately redundant with the allowlist-style default, for one specific reason: if a
+caller's `$PWD` happens to *be* `$HOME` (e.g. running `sandbox-run.sh` from a login shell
+without `cd`-ing anywhere first), the new default binds all of it too, same exposure as the
+old default. Masking `$HOME`'s known-sensitive subpaths regardless of whether it ends up
+bound via `$PWD` coincidentally or an explicit `--rw` closes that gap. **This masking was
+also made unconditional** (moved to run after all `--ro`/`--rw` processing, instead of
+before) — the old documented behavior ("an explicit `--ro`/`--rw` on one of these paths still
+overrides the mask") was dropped, since it's exactly the kind of accidental-or-deliberate
+re-exposure this whole change is meant to close off.
+
+**Verified live** (real LSF job, ordinary user, not root):
+- `$PWD` bound read-write by default: wrote a file from inside the sandbox, confirmed it
+  landed on the real filesystem afterward.
+- `$HOME` not exposing real content by default: from a `$PWD` other than `$HOME`, `$HOME`
+  inside the sandbox contains no real files — only empty masked placeholder directories may
+  auto-vivify (`.ssh`, `.config/gcloud` show up as empty dirs purely because the mask loop
+  needs *some* directory to hang the `--tmpfs` off of; both are dot-prefixed and invisible to
+  a plain `ls` anyway). Nothing from the user's actual home directory content is visible.
+- Masking applies to `$PWD` too, not just `$HOME`: created `.git-credentials` and
+  `.aws/credentials` inside a scratch project directory, confirmed both came back
+  empty/zero-byte inside the sandbox while the real files on disk were untouched.
+- Masking is genuinely unconditional: `--rw` explicitly targeting a masked path (e.g.
+  `--rw "$WORKDIR/.git-credentials"`) still returns 0 bytes, not the real content.
+- The `$PWD == $HOME` edge case specifically: ran with no `cd` (so `$PWD` was the login
+  shell's default, `$HOME`) — the real home directory content became visible (as expected,
+  since it's genuinely what was bound), but `.ssh`/`.config/gcloud` inside it were still
+  correctly masked (empty), confirming the redundant dual-root masking closes this case.
+- `--claude`/`--opencode` shortcuts unaffected — verified still mounting their specific
+  narrow paths correctly.
+
 ## Network access — the mechanism and its evidence
 
 bwrap has no built-in IP/URL/domain filter. `--unshare-net` is all-or-nothing at the

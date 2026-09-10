@@ -215,8 +215,8 @@ works exactly the same as the bwrap examples above; just swap `sandbox-run.sh` f
 ```bash
 git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git
 cd agentic-sandbox/scripts
-# No network, your home directory read-only, one scratch dir writable -- the simplest
-# possible sandbox, for a task that needs no external access at all:
+# No network, the directory you run this from is read-write, one scratch dir writable too --
+# the simplest possible sandbox, for a task that needs no external access at all:
 ./sandbox-run.sh --scratch -- python3 my_agent_script.py
 ```
 For anything that talks to a model, see [Try it now](#try-it-now--bwrap) above.
@@ -237,18 +237,28 @@ does not exist inside the sandbox at all.
 The base every example in this doc assumes:
 ```
 --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib64 /lib64 --ro-bind /lib /lib
---ro-bind /sbin /sbin --ro-bind /etc /etc --ro-bind "$HOME" "$HOME"
+--ro-bind /sbin /sbin --ro-bind /etc /etc --bind "$PWD" "$PWD"
 ```
-The toolchain and your home directory, read-only. Everything else is *additional* to this.
+The toolchain, read-only, and **`$PWD`** (wherever you invoke `sandbox-run.sh` from),
+**read-write**. Everything else is *additional* to this.
 
-**`sandbox-run.sh` masks known credential paths inside `$HOME`, even though `$HOME` itself is
-read-only bound.** Read-only exposure is still enough for a prompt-injected agent to
-exfiltrate or display secret contents, so `.ssh`, `.aws`, `.azure`, `.kube`,
-`.config/gcloud`, and `.docker` come back as empty directories, and `.git-credentials`,
+**`$HOME` is NOT bound by default** (changed 2026-09-10 — it used to be, always, read-only).
+Binding all of `$HOME` meant every sandboxed process could read `.ssh`, `.aws`,
+`.git-credentials`, and everything else in it regardless of whether the task needed any of
+that — read-only exposure is still enough for a prompt-injected agent to exfiltrate or
+display secret contents. If a task genuinely needs files elsewhere in your home directory,
+add an explicit `--ro`/`--rw` for that specific path — never for `$HOME` as a whole.
+
+**Known credential paths are always masked, wherever they'd appear** — under `$PWD` (always
+bound), and under `$HOME` too if you explicitly `--rw`/`--ro` it. `.ssh`, `.aws`, `.azure`,
+`.kube`, `.config/gcloud`, and `.docker` come back as empty directories; `.git-credentials`,
 `.npmrc`, `.pypirc`, `.netrc`, `.env`, and `.env.local` come back as empty files — the
 sandboxed process sees them exist but empty, never the real contents. This only masks paths
-that already exist for you; nothing is created. An explicit `--ro`/`--rw` (or `--claude`)
-on one of these paths still overrides the mask, same nesting-override rule as below.
+that already exist for you; nothing is created. **Unlike the nesting-override rule below,
+this masking is unconditional** — a generic `--ro`/`--rw` on one of these exact paths does
+not bring the real content back; it's applied last, deliberately not something a task can
+accidentally (or a prompt-injected agent deliberately) unmask by requesting one of these
+paths directly.
 
 **This masking is bwrap-specific and works because bwrap's mounts are sequential,
 individually-overridable syscalls** — a later `--tmpfs`/`--bind` at a path genuinely shadows
@@ -262,15 +272,15 @@ specific subdirectory you actually need instead — same advice Anthropic's own
 secure-deployment guide gives (mount the one project directory needed, never the whole home
 directory).
 
-A common pattern — home read-only, one subdirectory read-write:
+A common pattern — a project directory read-only, one subdirectory inside it read-write:
 ```bash
 bwrap \
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib64 /lib64 --ro-bind /lib /lib \
   --ro-bind /sbin /sbin --ro-bind /etc /etc \
-  --ro-bind "$HOME" "$HOME" \
-  --bind "$HOME/bwrap-workdir" "$HOME/bwrap-workdir" \
+  --ro-bind /groups/mylab/project-x /groups/mylab/project-x \
+  --bind /groups/mylab/project-x/output /groups/mylab/project-x/output \
   --proc /proc --dev /dev --unshare-net --die-with-parent \
-  -- /bin/sh -c 'cd "$HOME/bwrap-workdir" && <run agent-generated code here>'
+  -- /bin/sh -c 'cd /groups/mylab/project-x/output && <run agent-generated code here>'
 ```
 The more specific `--bind` on a subdirectory overrides the broader `--ro-bind` on its parent,
 for that one subtree only — verified with real writes on disk: writes outside the writable
@@ -566,15 +576,18 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
 ```
 
 **What's mounted by default, unconditionally**: the toolchain (`/usr /bin /lib64 /lib /sbin
-/etc`) and your home directory, both read-only (`sandbox-run.sh` additionally masks known
-credential paths inside `$HOME` — `.ssh`, `.aws`, `.git-credentials`, `.npmrc`, etc. come
-back empty even though the rest of `$HOME` is readable; see [Filesystem
-access](#filesystem-access) for the full list); SSSD's NSS socket if present (so
+/etc`), read-only, and **`$PWD`** (wherever you invoke `sandbox-run.sh` from), **read-write**
+— `$HOME` is NOT bound unless you explicitly `--rw`/`--ro` it. Known credential paths are
+masked wherever they'd appear — under `$PWD`, and under `$HOME` too if you do bind it —
+`.ssh`, `.aws`, `.git-credentials`, `.npmrc`, etc. come back empty, unconditionally, even if
+you explicitly `--rw`/`--ro` one of those exact paths; see [Filesystem
+access](#filesystem-access) for the full list. SSSD's NSS socket if present (so
 `whoami`/`id` resolve real names — doesn't affect actual permission enforcement, which is
 UID-number-based regardless); network fully blocked unless you pass `--allow`.
 
-**Everything else is opt-in, every time** — `/scratch/$USER` is not mounted at all (not even
-read-only) unless you pass `--scratch`; same for `.claude`, opencode's dirs, and any network
+**Everything else is opt-in, every time** — `$HOME` (beyond `$PWD`) and `/scratch/$USER` are
+not mounted at all (not even read-only) unless you pass `--rw`/`--ro`/`--scratch`; same for
+`.claude`, opencode's dirs, and any network
 access. This is deliberate: a sandbox that silently grants write access "because that's
 usually what people want" would undermine the default-deny model.
 
