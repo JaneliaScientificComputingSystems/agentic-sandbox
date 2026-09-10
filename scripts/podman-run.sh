@@ -8,10 +8,13 @@
 #   podman-run.sh [options] -- <command...>
 #
 # Options:
-#   --image NAME    Image to run (default: the pre-built image on GHCR --
-#                    `podman pull` it first, or build your own locally with
-#                    `podman build -t agentic-sandbox-gpu:latest .` in this directory
-#                    and pass `--image localhost/agentic-sandbox-gpu:latest`)
+#   --image NAME    Image to run (default: agentic-sandbox-lite, the lightweight pre-built
+#                    image on GHCR -- `podman pull` it first, or build your own locally with
+#                    `podman build -t agentic-sandbox-lite:latest .` in this directory and
+#                    pass `--image localhost/agentic-sandbox-lite:latest`. For a heavier
+#                    image with PyTorch/cuDNN preinstalled, build ./Dockerfile.pytorch
+#                    instead, or pass `--image ghcr.io/janeliascientificcomputingsystems/
+#                    agentic-sandbox-gpu:latest`)
 #   --ro PATH       Read-only bind (repeatable): -v PATH:PATH:ro
 #   --rw PATH       Read-write bind (repeatable): -v PATH:PATH:rw
 #   --allow HOST    Allowed egress domain (repeatable). Starts the allowlist proxy + relay
@@ -32,7 +35,7 @@ set -euo pipefail
 exec 3<&0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest"
+IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
 ALLOW_HOSTS=()
 GPU=0

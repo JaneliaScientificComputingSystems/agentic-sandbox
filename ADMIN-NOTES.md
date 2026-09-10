@@ -423,13 +423,13 @@ batches — call it roughly 1 in 4, not a rare edge case. Still low-severity (no
 no real disk cost, self-clears on `/scratch`'s own cleanup cycle) but worth being honest about
 the actual frequency rather than implying it's unusual.
 
-### The GHCR image
+### The GHCR images
 
-`podman/Dockerfile` builds on `nvcr.io/nvidia/pytorch:26.07-py3` (NVIDIA's official container
-— CUDA 13.3.1, PyTorch 2.13, confirmed current as of the build date via NVIDIA's own release
-notes) plus Node.js, `@anthropic-ai/claude-code`, and opencode. Verified live in one
-build+run job: `nvidia-smi -L` returned a real GPU UUID, `claude --version` →
-`2.1.197 (Claude Code)`, `opencode --version` → `1.18.23`.
+**`podman/Dockerfile.pytorch`** (the original default, built on
+`nvcr.io/nvidia/pytorch:26.07-py3` — CUDA 13.3.1, PyTorch 2.13, confirmed current as of the
+build date via NVIDIA's own release notes — plus Node.js, `@anthropic-ai/claude-code`, and
+opencode). Verified live in one build+run job: `nvidia-smi -L` returned a real GPU UUID,
+`claude --version` → `2.1.197 (Claude Code)`, `opencode --version` → `1.18.23`.
 
 Pushed to `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` — confirmed
 live via the GitHub API that the package exists after push (`podman push` reported `Writing
@@ -437,6 +437,22 @@ manifest to image destination`, the standard success line). The GHCR copy is the
 image pushed straight from the verified build, not a separately-built artifact.
 
 Made public alongside the repo (2026-08-26) so `podman pull` needs no `podman login` first.
+
+**`podman/Dockerfile`** (now the default, 2026-09-10 — renamed from `Dockerfile.lite`; the
+above became `Dockerfile.pytorch`): bare `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` (same
+CUDA version as the PyTorch image's toolkit) plus Node.js, Claude Code, and opencode, no ML
+framework stack. Built and verified live via a real LSF GPU job as an ordinary user (not
+root): GPU passthrough confirmed (`nvidia-smi --query-gpu=name,driver_version` → `NVIDIA L4,
+610.43.02`), `claude --version` → `2.1.267 (Claude Code)`, `opencode --version` → `1.18.30`.
+Final image size **1.24GB**, vs. the PyTorch image's multi-GB footprint (`podman images`
+confirmed both side by side on the same node).
+
+Pushed to `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` from that
+same build (tag + push, not a separate rebuild) — confirmed via the GitHub API that the
+package exists, then made public via the GHCR web UI (no REST API endpoint exists for
+changing a container package's visibility — confirmed live: `PATCH
+/orgs/.../packages/container/...` 404s even though `GET` on the identical path succeeds).
+`podman-run.sh`'s default `--image` now points here instead of `agentic-sandbox-gpu`.
 
 ### Cleanup bugs in both wrappers, found and fixed the same way
 

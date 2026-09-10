@@ -84,10 +84,11 @@ Finally, use `--allow` to grant access to URIs that will be needed by the model.
 `scripts/podman-run.sh` instead — same flag shape and allowlist-proxy network model as
 `sandbox-run.sh`, plus `--gpu` for `--device nvidia.com/gpu=all`.
 
-By default it runs a prebuilt image we provide (NVIDIA's official PyTorch base + Node.js +
-Claude Code + opencode) pulled from GHCR, so there's something to test against immediately —
-it's **not the only option**. Point `--image` at any OCI image you like (your own build, a
-different CUDA/framework base, etc.); the sandboxing (`-v`/`--allow`/`--gpu`) works the same
+By default it runs a prebuilt image we provide (bare CUDA runtime + Node.js + Claude Code +
+opencode, no ML framework stack — `agentic-sandbox-lite`) pulled from GHCR, so there's
+something to test against immediately — it's **not the only option**. Point `--image` at any
+OCI image you like (your own build, a different CUDA/framework base, NVIDIA's heavier PyTorch
+image via `Dockerfile.pytorch`, etc.); the sandboxing (`-v`/`--allow`/`--gpu`) works the same
 regardless of what's inside.
 
 **⚠️ Before any of this: rootless podman needs a `/etc/subuid`/`/etc/subgid` range for your
@@ -140,9 +141,10 @@ cd agentic-sandbox/scripts
   opencode run "who am I speaking to?" --model litellm/kimi-k3
 ```
 No `podman login`/`podman pull` needed first — the image is public, and `podman-run.sh` checks
-for a newer version on every run automatically. The very first pull is a multi-GB download
-(NVIDIA's PyTorch base alone is several GB) and takes a few minutes; every run after that is
-just a fast digest check unless the image actually changed.
+for a newer version on every run automatically. The very first pull is a real download (this
+default image is 1.24GB — much smaller than the PyTorch-based alternate, which is several GB)
+and takes a bit; every run after that is just a fast digest check unless the image actually
+changed.
 
 (`podman-run.sh` also runs the storage reconciliation step — `podman system migrate` and a
 health-check/reset — automatically on every invocation, so you don't need to remember that
@@ -425,39 +427,47 @@ Full investigation (what was ruled out, exact errors) in `ADMIN-NOTES.md`.
 podman run --rm --device nvidia.com/gpu=all <image> nvidia-smi -L
 ```
 
-**The image**: this repo ships one example image (`podman/Dockerfile` — NVIDIA's own official
-PyTorch container, `nvcr.io/nvidia/pytorch:26.07-py3`, plus Node.js, `@anthropic-ai/claude-code`,
-and opencode), pre-built and pushed to GHCR so there's something to test against out of the box
-(see [Try it now — Podman](#try-it-now--podman-gpu)). **It's just a starting point, not a
-requirement** — `podman-run.sh --image` takes any OCI image: build your own from this
-Dockerfile (`cd podman/ && podman build -t agentic-sandbox-gpu:latest .`), start from a
-different base entirely, or point at an image you already use elsewhere. Nothing about the
-sandboxing is tied to this specific image.
+**The image**: this repo ships two example images, both pre-built and pushed to GHCR so
+there's something to test against out of the box (see [Try it now —
+Podman](#try-it-now--podman-gpu)). **Neither is a requirement** — `podman-run.sh --image`
+takes any OCI image: build your own from either Dockerfile below, start from a different base
+entirely, or point at an image you already use elsewhere. Nothing about the sandboxing is
+tied to either specific image.
 
-It's more than just enough to run the two demo CLIs, too — since it's built on NVIDIA's own
-*dev* PyTorch image (not a slim/runtime variant), it already ships a real toolchain: `git`,
-`gcc`/`g++`/`make`, `python3` + `pip` + `venv`, `curl`/`wget`, `rsync`, `vim`/`nano`,
-`unzip`/`jq`/`tar`, `ssh`. So the common "agent needs to set up a venv, `pip install`
-something, compile a native extension, clone a repo" cases work out of the box — you're not
-stuck rebuilding for every small thing. If your task needs something it genuinely doesn't
-have (a specific system library, a different language runtime), that's when `--image`/your own
-Dockerfile comes in.
+- **`podman/Dockerfile` (the default, `agentic-sandbox-lite` on GHCR)**: bare
+  `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` plus Node.js, Claude Code, and opencode — no ML
+  framework stack. **1.24GB**, verified live (GPU passthrough via `nvidia-smi`, both CLIs
+  run). Right choice for a coding-agent GPU sandbox that isn't doing actual ML
+  training/inference — `-base` has just the CUDA runtime libraries (enough for
+  `nvidia-smi`/the CUDA runtime API), not `nvcc` or cuDNN/cuBLAS; switch the base to `-devel`
+  or `-runtime` (or build from `Dockerfile.pytorch` below) if agent-generated code needs to
+  compile CUDA kernels or link against those libraries.
+  ```bash
+  cd podman/ && podman build -t agentic-sandbox-lite:latest .
+  podman-run.sh --gpu --image localhost/agentic-sandbox-lite:latest --scratch --claude \
+    --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
+  ```
 
-**A lighter alternative**: `podman/Dockerfile.lite` builds the same two CLIs on top of bare
-`nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` instead of the full PyTorch image — same CUDA
-version (13.3, matching the default image's driver/toolkit), no ML framework stack. Built and
-verified live (GPU passthrough via `nvidia-smi`, both CLIs run): **1.24GB** vs. the PyTorch
-base's multi-GB footprint. Use this when the task is coding-agent-with-GPU, not actual ML
-training/inference — `-base` has just the CUDA runtime libraries (enough for `nvidia-smi`/CUDA
-runtime API), not `nvcc` or cuDNN/cuBLAS; switch the base to `-devel` or `-runtime` if
-agent-generated code needs to compile CUDA kernels or link against those libraries.
-```bash
-cd podman/ && podman build -t agentic-sandbox-lite:latest -f Dockerfile.lite .
-podman-run.sh --gpu --image localhost/agentic-sandbox-lite:latest --scratch --claude \
-  --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
-```
-Not yet pushed to GHCR (no CI pipeline builds/publishes either image in this repo — the
-default image was pushed manually) — build it locally for now, same as any custom `--image`.
+- **`podman/Dockerfile.pytorch` (the heavier alternate, `agentic-sandbox-gpu` on GHCR)**:
+  NVIDIA's own official PyTorch container (`nvcr.io/nvidia/pytorch:26.07-py3`) plus Node.js,
+  Claude Code, and opencode — the former default, kept for anyone who actually wants
+  PyTorch/cuDNN preinstalled. Since it's built on NVIDIA's *dev* PyTorch image (not a
+  slim/runtime variant), it also ships a real toolchain beyond just PyTorch: `git`,
+  `gcc`/`g++`/`make`, `python3` + `pip` + `venv`, `curl`/`wget`, `rsync`, `vim`/`nano`,
+  `unzip`/`jq`/`tar`, `ssh` — the common "agent needs to set up a venv, `pip install`
+  something, compile a native extension, clone a repo" cases work out of the box, at the cost
+  of a multi-GB image.
+  ```bash
+  cd podman/ && podman build -t agentic-sandbox-pytorch:latest -f Dockerfile.pytorch .
+  podman-run.sh --gpu --image localhost/agentic-sandbox-pytorch:latest --scratch --claude \
+    --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
+  # or skip the local build and pull the pre-built GHCR copy instead:
+  podman-run.sh --gpu --image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest \
+    --scratch --claude --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
+  ```
+
+If your task needs something neither image has (a specific system library, a different
+language runtime), that's when `--image`/your own Dockerfile comes in.
 
 **Two gotchas you'll actually hit** (full root-cause detail in `ADMIN-NOTES.md`):
 - **Storage staleness after a reboot**: `podman-run.sh` runs `podman system migrate` (and
@@ -471,7 +481,7 @@ default image was pushed manually) — build it locally for now, same as any cus
   `$HOME/...`.
 
 ```bash
-# --image defaults to the GHCR image; pass --image localhost/agentic-sandbox-gpu:latest
+# --image defaults to agentic-sandbox-lite on GHCR; pass --image localhost/agentic-sandbox-lite:latest
 # instead if you built your own copy locally.
 ./podman-run.sh --gpu --scratch --opencode --allow litellm.int.janelia.org -- \
   opencode run "your prompt" --model litellm/kimi-k3
