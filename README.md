@@ -519,7 +519,7 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   "$(id -u):$(id -g)"`). **What this actually changes: the process identity *inside* the
   container** (`whoami`, `$HOME` resolution) — not bind-mounted volume ownership, which is
   already correct without it. Confirmed live: a file written to a `--rw`-mounted host
-  directory lands with your real ownership (`cericg:scicompsys`) even *without* `--keep-id`
+  directory lands with your real ownership (your actual user:group) even *without* `--keep-id`
   — rootless podman's default mapping already writes bind-mounted files as your real host
   identity. What's actually root-owned by default is the *container's own internal storage*
   (anything not bind-mounted, e.g. a plain `/tmp` file) — that stays root-owned regardless of

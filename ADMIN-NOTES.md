@@ -351,7 +351,7 @@ bind-mounted.
 
 The section above concluded `--userns=keep-id` failed for lack of a subuid/subgid range.
 Revisited with a range confirmed provisioned (width 65536) — it **still fails**, same error
-class, but now with `cericg`'s exact real uid:gid in the message:
+class, but now with the invoking account's exact real uid:gid in the message:
 ```
 Error: chowning container ... workdir to container root: potentially insufficient UIDs or
 GIDs available in user namespace (requested <uid>:<gid> for ...): Check /etc/subuid and
@@ -367,7 +367,7 @@ and gid independently:
 | B | `<uid>` (real) | 1000 (small) | **works** |
 | C | 65535 (range edge) | 1000 (small) | **works** |
 
-`cericg`'s real **uid** isn't the problem — it works right up to the range edge. The real
+The account's real **uid** isn't the problem — it works right up to the range edge. The real
 **gid** is the entire cause.
 
 **Exact boundary**, sweeping gid values with a fixed small uid: 65534/65535/**65536** all
@@ -375,7 +375,7 @@ work, **65537**/90000/`<gid>` all fail. The threshold is precisely the width of 
 subgid range (65536) — `keep-id`'s identity-mapping needs the target gid `≤` the range
 width, regardless of where the range is positioned. AD/LDAP here assigns primary GIDs well
 above the traditional 16-bit container UID/GID space (0-65535) this mapping needs to fit
-into; `cericg`'s real gid exceeds the granted range's width.
+into; the account's real gid exceeds the granted range's width.
 
 **Resolved**: HPC widened all granted ranges to 131072 ("128k"), confirmed deployed live.
 Retested: `--userns=keep-id --user "$(id -u):$(id -g)"` succeeds — real uid/gid, no chown
@@ -393,7 +393,7 @@ file permission denial) but the same root idea. Fixed in `podman/Dockerfile`:
 loosening.
 
 **Verified live end-to-end against the actual published GHCR image** (rebuilt and
-re-pushed, not just tested locally): `whoami` → `cericg`, `$HOME` → the real home directory,
+re-pushed, not just tested locally): `whoami` → the real account name, `$HOME` → the real home directory,
 `claude --version` → `2.1.267`, `opencode --version` → `1.18.30`.
 
 **Important correction**, found via the checked-in test suite's with/without-`--keep-id`
@@ -411,11 +411,12 @@ identity inside the container** (`whoami`, `$HOME` resolution) — which is what
 `podman-run.sh --keep-id` still closes the "podman runs as root" gap from the Anthropic
 Docker-config comparison — just via in-container identity, not volume ownership.
 
-**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: their real gid (nearly identical
-to `cericg`'s) also exceeded their pre-widening subgid range, so their `--keep-id` instructor
-mode was suspected to share this failure — never independently verified, only inferred from
-the README's claim. Moot now: the widening covered them too. Still worth testing their
-instructor mode live to confirm, rather than taking the README's claim on faith either way.
+**The `janelia-mojo-sandbox` cross-check**: another account's real gid on that project
+(nearly identical to the one investigated above) also exceeded their pre-widening subgid
+range, so that project's `--keep-id` instructor mode was suspected to share this failure —
+never independently verified, only inferred from its README's claim. Moot now: the widening
+covered that account too. Still worth testing their instructor mode live to confirm, rather
+than taking the README's claim on faith either way.
 
 **Implementation**: `--userns=keep-id --user "$(id -u):$(id -g)" -e HOME=$HOME`.
 `--claude`/`--opencode`'s mount destination depends on `--keep-id`'s final state, decided
@@ -435,10 +436,10 @@ protection.
 **Confirmed broken, not just untested.** Live session, `--rw "$HOME"` plus a `--tmpfs` mask
 on `$HOME/.ssh` appended after it (same ordering strategy as the working bwrap fix):
 ```
-root@46dd0ffe1811:/work# ls -al /groups/scicompsys/home/cericg/.ssh
--rw------- 1 root nogroup   1675 Sep 10 14:30 id_rsa
--rw-r--r-- 1 root nogroup    411 Sep 10 14:30 id_rsa.pub
--rw------- 1 root nogroup 123732 Sep 10 14:30 known_hosts
+root@46dd0ffe1811:/work# ls -al $HOME/.ssh
+-rw------- 1 root nogroup   1675 id_rsa
+-rw-r--r-- 1 root nogroup    411 id_rsa.pub
+-rw------- 1 root nogroup 123732 known_hosts
 ```
 Real, live SSH keys — not masked. `df -h` in the same container showed the `tmpfs`
 genuinely present in the mount table at `$HOME/.ssh`, but file access through it still
