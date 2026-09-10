@@ -443,6 +443,22 @@ stuck rebuilding for every small thing. If your task needs something it genuinel
 have (a specific system library, a different language runtime), that's when `--image`/your own
 Dockerfile comes in.
 
+**A lighter alternative**: `podman/Dockerfile.lite` builds the same two CLIs on top of bare
+`nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` instead of the full PyTorch image — same CUDA
+version (13.3, matching the default image's driver/toolkit), no ML framework stack. Built and
+verified live (GPU passthrough via `nvidia-smi`, both CLIs run): **1.24GB** vs. the PyTorch
+base's multi-GB footprint. Use this when the task is coding-agent-with-GPU, not actual ML
+training/inference — `-base` has just the CUDA runtime libraries (enough for `nvidia-smi`/CUDA
+runtime API), not `nvcc` or cuDNN/cuBLAS; switch the base to `-devel` or `-runtime` if
+agent-generated code needs to compile CUDA kernels or link against those libraries.
+```bash
+cd podman/ && podman build -t agentic-sandbox-lite:latest -f Dockerfile.lite .
+podman-run.sh --gpu --image localhost/agentic-sandbox-lite:latest --scratch --claude \
+  --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
+```
+Not yet pushed to GHCR (no CI pipeline builds/publishes either image in this repo — the
+default image was pushed manually) — build it locally for now, same as any custom `--image`.
+
 **Two gotchas you'll actually hit** (full root-cause detail in `ADMIN-NOTES.md`):
 - **Storage staleness after a reboot**: `podman-run.sh` runs `podman system migrate` (and
   `podman system reset -f` if `podman info` fails) automatically on every invocation, so a
