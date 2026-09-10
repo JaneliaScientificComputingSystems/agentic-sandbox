@@ -350,11 +350,11 @@ bind-mounted.
 ### --userns=keep-id, revisited — full evidence and the actual root cause
 
 The section above concluded `--userns=keep-id` failed for lack of a subuid/subgid range.
-Revisited with ranges confirmed provisioned (`cericg:100000:65536`) — it **still fails**,
-same error class, but now with `cericg`'s exact real uid:gid in the message:
+Revisited with a range confirmed provisioned (width 65536) — it **still fails**, same error
+class, but now with `cericg`'s exact real uid:gid in the message:
 ```
 Error: chowning container ... workdir to container root: potentially insufficient UIDs or
-GIDs available in user namespace (requested 28976:93102 for ...): Check /etc/subuid and
+GIDs available in user namespace (requested <uid>:<gid> for ...): Check /etc/subuid and
 /etc/subgid if configured locally and run "podman system migrate"
 ```
 
@@ -363,23 +363,23 @@ and gid independently:
 
 | Test | uid | gid | Result |
 |---|---|---|---|
-| A | 1000 (small) | 93102 (real) | **fails** |
-| B | 28976 (real) | 1000 (small) | **works** |
+| A | 1000 (small) | `<gid>` (real) | **fails** |
+| B | `<uid>` (real) | 1000 (small) | **works** |
 | C | 65535 (range edge) | 1000 (small) | **works** |
 
 `cericg`'s real **uid** isn't the problem — it works right up to the range edge. The real
-**gid** (93102) is the entire cause.
+**gid** is the entire cause.
 
 **Exact boundary**, sweeping gid values with a fixed small uid: 65534/65535/**65536** all
-work, **65537**/90000/93102 all fail. The threshold is precisely the width of the granted
+work, **65537**/90000/`<gid>` all fail. The threshold is precisely the width of the granted
 subgid range (65536) — `keep-id`'s identity-mapping needs the target gid `≤` the range
-width, regardless of where the range is positioned. AD/LDAP here assigns primary GIDs
-(93102 for `cericg`) well above the traditional 16-bit container UID/GID space (0-65535)
-this mapping needs to fit into; `cericg`'s exceeds it by 27566.
+width, regardless of where the range is positioned. AD/LDAP here assigns primary GIDs well
+above the traditional 16-bit container UID/GID space (0-65535) this mapping needs to fit
+into; `cericg`'s real gid exceeds the granted range's width.
 
-**Resolved**: HPC widened all granted ranges to 131072 ("128k")
-(`cericg:100000:131072`, confirmed deployed live). Retested: `--userns=keep-id --user
-"$(id -u):$(id -g)"` succeeds — real uid/gid, no chown error.
+**Resolved**: HPC widened all granted ranges to 131072 ("128k"), confirmed deployed live.
+Retested: `--userns=keep-id --user "$(id -u):$(id -g)"` succeeds — real uid/gid, no chown
+error.
 
 **One more issue surfaced once identity worked**: `claude`/`opencode` then failed with
 `Permission denied` (confirmed via each CLI's full path directly, not "not found"). Both are
@@ -411,12 +411,11 @@ identity inside the container** (`whoami`, `$HOME` resolution) — which is what
 `podman-run.sh --keep-id` still closes the "podman runs as root" gap from the Anthropic
 Docker-config comparison — just via in-container identity, not volume ownership.
 
-**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: their real gid (93099, nearly
-identical to `cericg`'s) also exceeded their pre-widening subgid range, so their `--keep-id`
-instructor mode was suspected to share this failure — never independently verified, only
-inferred from the README's claim. Moot now: the widening covered them too
-(`1017504:131072`). Still worth testing their instructor mode live to confirm, rather than
-taking the README's claim on faith either way.
+**The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: their real gid (nearly identical
+to `cericg`'s) also exceeded their pre-widening subgid range, so their `--keep-id` instructor
+mode was suspected to share this failure — never independently verified, only inferred from
+the README's claim. Moot now: the widening covered them too. Still worth testing their
+instructor mode live to confirm, rather than taking the README's claim on faith either way.
 
 **Implementation**: `--userns=keep-id --user "$(id -u):$(id -g)" -e HOME=$HOME`.
 `--claude`/`--opencode`'s mount destination depends on `--keep-id`'s final state, decided

@@ -31,7 +31,7 @@
 #                    GID (not just "any range") -- confirmed live 2026-09-10: keep-id's
 #                    default identity-mapping needs your own uid AND gid to individually fit
 #                    within the granted range's width, and AD/LDAP GIDs here commonly exceed
-#                    a standard 65536-wide grant (e.g. cericg's real gid 93102 > 65536).
+#                    a standard 65536-wide grant.
 #                    Fails with "potentially insufficient UIDs or GIDs available in user
 #                    namespace" if your range isn't wide enough -- ask HPC for a wider one
 #                    (width > your real gid, not just "a range") if you hit this.
