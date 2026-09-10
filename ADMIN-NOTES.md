@@ -4,9 +4,6 @@ This is the "why," not the "how to use" — full test evidence, exact error text
 that was ruled out along the way, and the design rationale behind every choice in the main
 README. If you just want to *use* this repo, you don't need this file; see `README.md`.
 
-Everything below was verified live on Janelia's LSF cluster, as the real user account, not
-root — not theorized.
-
 ## How bwrap actually works, mechanically
 
 bwrap doesn't create a "container" in the Docker/Podman sense. It uses Linux namespaces
