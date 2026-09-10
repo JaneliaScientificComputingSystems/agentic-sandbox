@@ -74,8 +74,8 @@ sandboxing policy is about — see [Mode A / Mode B](#the-three-operating-modes)
 
 (opencode+Kimi K3 and Claude Code+Anthropic are the two harnesses this repo documents and has
 tested — any other harness follows the same pattern: figure out where it keeps its
-config/state, then use `--rw`/`--ro` to grant access to those files in the sandbox,
-Finally, use `--allow` to grant access to URIs that will be needed by the model.)
+config/state, use `--rw`/`--ro` to grant access to those files in the sandbox, then `--allow`
+to grant access to whatever domains the model needs.)
 
 ## Try it now — Podman (GPU)
 
@@ -169,6 +169,20 @@ Same wrapper, same sandboxing — just run a shell instead of `claude`/`opencode
 command. You'll land inside the container as root, with your `--scratch`/`--opencode`/
 `--claude` mounts (if any) already in place at `/root/...` (see the identity/HOME gotcha
 below for why `/root` and not `$HOME`).
+
+**Same, but as your real identity instead of root** — add `--keep-id` (requires a
+`/etc/subuid`/`/etc/subgid` range wider than your real GID; see the `--keep-id` gotcha below
+if it fails):
+```bash
+./podman-run.sh --gpu --keep-id --claude \
+  --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- /bin/bash
+```
+`whoami` now reports your real account, `--claude`/`--opencode` mount at your real
+`$HOME/...` instead of `/root/...`, and `claude`/`opencode` invoked from inside this shell
+work normally. **Don't forget `--allow`** — without it, `claude`/`opencode` will hang
+retrying with no useful error ("Request timed out... Retrying") since the sandbox has
+`--network=none` with zero exceptions by default; this is the single most common thing that
+looks like a bug but isn't one.
 
 Everything else — Claude Code, the interactive/one-shot/loop modes, the Kimi K3 safeguard —
 works exactly the same as the bwrap examples above; just swap `sandbox-run.sh` for
@@ -491,7 +505,7 @@ tied to either specific image.
 If your task needs something neither image has (a specific system library, a different
 language runtime), that's when `--image`/your own Dockerfile comes in.
 
-**Two gotchas you'll actually hit** (full root-cause detail in `ADMIN-NOTES.md`):
+**Gotchas you'll actually hit** (full root-cause detail in `ADMIN-NOTES.md`):
 - **Storage staleness after a reboot**: `podman-run.sh` runs `podman system migrate` (and
   `podman system reset -f` if `podman info` fails) automatically on every invocation, so a
   node reboot leaving podman's cached state stale doesn't need a manual fix. Concurrent
@@ -644,9 +658,13 @@ need a writable path nested inside something already read-only.
 - **`Read-only file system` when writing somewhere unexpected**: that path isn't inside one
   of your `--rw`/`--bind` paths. Usually correct behavior, not a bug — add the path
   explicitly rather than widening an existing RW bind.
-- **A network request hangs forever with no error**: you didn't `--allow` that host, and your
-  client doesn't fail fast on absent network. Check the proxy's log (`<socket-path>.log`) for
-  `DENY` lines.
+- **A network request hangs forever, or `claude`/`opencode` retries indefinitely with
+  `Request timed out`**: you didn't `--allow` that host, and your client doesn't fail fast on
+  absent network — it just keeps retrying against a sandbox that has `--network=none` with
+  zero exceptions. Check the proxy's log (`<socket-path>.log`) for `DENY` lines, or just
+  double-check your `--allow` list against what the client actually needs
+  (`api.anthropic.com`/`claude.ai`/`platform.claude.com` for Claude Code,
+  `litellm.int.janelia.org` for opencode+Kimi K3).
 - **`GuardrailRaisedException`/HTTP 400 from a `kimi-k3` request**: the Kimi K3 safeguard
   doing its job, not a sandbox problem — see [The Kimi K3 safeguard](#the-kimi-k3-safeguard-and-why-it-matters-here).
 - **opencode interactive session gives `Forbidden`**: you launched bare `opencode` without
