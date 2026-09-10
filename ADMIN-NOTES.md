@@ -419,11 +419,26 @@ would open everything else that might end up there.
 
 **Verified live end-to-end, against the actual published GHCR image** (rebuilt and
 re-pushed with the `/root` fix, not just tested locally): `whoami` → `cericg`, `$HOME` → the
-real home directory, `claude --version` → `2.1.267`, `opencode --version` → `1.18.30`, and a
-file written from inside the sandbox to a `--rw`-mounted host directory landed as
-`-rw-r--r-- 1 cericg scicompsys` -- real ownership, not a subordinate namespace-mapped UID.
-`podman-run.sh --keep-id` closes the "podman runs as root" gap from the original Anthropic
-Docker-config comparison.
+real home directory, `claude --version` → `2.1.267`, `opencode --version` → `1.18.30`.
+
+**Important correction, found via the checked-in test suite's with/without-`--keep-id`
+matrix (`tests/test-podman.sh`)**: a file written to a `--rw`-mounted host directory lands
+with real ownership (`-rw-r--r-- 1 cericg scicompsys`) **even without `--keep-id`** --
+confirmed by directly comparing both cases side by side. Rootless podman's default mapping
+(no `--userns` flag at all) already writes bind-mounted files as the real invoking user;
+that part was never actually broken. What *does* stay root-owned regardless of `--keep-id`
+is the *container's own internal storage* -- confirmed separately: a file written to `/tmp`
+(not bind-mounted, living in podman's own subuid-mapped storage tree) showed `root root`
+in both the `--keep-id` and non-`--keep-id` cases.
+
+So `--keep-id`'s actual, confirmed value is narrower than originally framed (that framing
+was borrowed from `janelia-mojo-sandbox`'s comment, which conflated the two): it changes the
+**process identity as seen from inside the container** (`whoami`, `$HOME` resolution) --
+which is what `--claude`/`--opencode` actually need to correctly switch their mount
+destination to your real `$HOME/...` instead of `/root/...`. It does not fix bind-mounted
+file ownership, because that was never the part that was broken. `podman-run.sh --keep-id`
+still closes the "podman runs as root" gap from the original Anthropic Docker-config
+comparison -- just via in-container identity, not volume ownership.
 
 **The `kittisopikulm`/`janelia-mojo-sandbox` cross-check**: at the time this was first
 investigated, `kittisopikulm`'s real gid (93099, nearly identical to `cericg`'s 93102) also
