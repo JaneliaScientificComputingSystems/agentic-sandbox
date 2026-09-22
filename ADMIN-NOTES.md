@@ -501,8 +501,10 @@ override into the wrapper the same way, since it's podman's own global config lo
 something the wrapper's invocation can override per-call.
 
 **Fixed**: `podman-run.sh` now gives every invocation its own `--root`/`--runroot`, keyed on
-`$LSB_JOBID` (falling back to `$$-$RANDOM` outside LSF), instead of sharing the one from
-`storage.conf`. That per-job root/runroot is what corrupted under concurrent access —
+`$LSB_JOBID`, `$LSB_JOBINDEX` and the wrapper's PID (`nolsf-<pid>` outside LSF), instead of
+sharing the one from `storage.conf`. `$LSB_JOBID` alone was not enough: every element of an
+array job shares it, as do two invocations inside one job, and those would have shared a
+root/runroot and then deleted each other's storage in cleanup. That per-job root/runroot is what corrupted under concurrent access —
 isolating it removes the collision risk entirely, without needing exclusive-host or
 whole-node reservation at all. It doesn't cost a re-pull for another job landing on the *same*
 node: `--storage-opt additionalimagestore=<shared graphroot>` points the per-job store at the
