@@ -125,6 +125,24 @@ EOF
 This is a **per-user** config file — it doesn't happen automatically, and podman gives no
 warning that it's filling your home directory instead. Do this once, ever, per account.
 
+Also disable podman's own event/container logging while you're in there. Nothing in this
+repo reads `podman logs` or `podman events` — `podman-run.sh` captures the container's
+stdout/stderr itself — so leaving podman's own logging on just pollutes the shared system
+logs for no benefit, and that only gets worse once multiple jobs are packed onto one node (the
+whole point of the isolated-storage change below).
+```bash
+cat > ~/.config/containers/containers.conf << 'EOF'
+[engine]
+events_logger = "none"
+
+[containers]
+log_driver = "none"
+EOF
+```
+Same one-time, per-user scope as `storage.conf` above — if you already have a
+`containers.conf` with an `events_logger` line in it, just add/update these two settings
+rather than overwriting the whole file.
+
 `podman-run.sh` gives each invocation its own isolated podman storage, keyed on `$LSB_JOBID` —
 concurrent podman jobs from the same user can safely share a GPU node, no whole-node
 reservation needed. Just request the GPU(s) your task actually needs, the normal way for
