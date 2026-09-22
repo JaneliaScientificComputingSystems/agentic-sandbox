@@ -119,7 +119,17 @@ fi
 # -- this is about the shared store's own integrity, not job-vs-job collision.
 unset XDG_RUNTIME_DIR
 podman system migrate 2>/dev/null || true
-podman info >/dev/null 2>&1 || podman system reset -f
+# Do NOT `podman system reset -f` the shared store on a failed `podman info` here: this
+# script deliberately runs multiple podman jobs concurrently on one node (see the
+# --root/--runroot section below), so that store may be in active use by a sibling job's
+# --storage-opt additionalimagestore right now. Resetting it out from under a running job
+# is exactly the kind of cross-job collision the per-job --root/--runroot below exists to
+# avoid. Just note it and skip the additionalimagestore cache for this invocation instead.
+SHARED_STORE_HEALTHY=1
+if ! podman info >/dev/null 2>&1; then
+  echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
+  SHARED_STORE_HEALTHY=0
+fi
 
 # Check for a newer version of the image on every run rather than relying on the caller to
 # remember `podman pull`. Cheap in the common case -- this is a manifest-digest check, not a
@@ -140,12 +150,14 @@ fi
 # README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
 # lands on a different node still pays a fresh pull regardless of this mechanism.) Keyed on
 # $LSB_JOBID so concurrent LSF jobs never collide; falls back to $$-$RANDOM outside LSF.
-SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
 JOBTAG="${LSB_JOBID:-$$-$RANDOM}"
 JOB_STORAGE_DIR="/scratch/$USER/podman-jobs/$JOBTAG"
 mkdir -p "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run"
 PODMAN_GLOBAL_ARGS=(--root "$JOB_STORAGE_DIR/root" --runroot "$JOB_STORAGE_DIR/run")
-[[ -n "$SHARED_GRAPHROOT" ]] && PODMAN_GLOBAL_ARGS+=(--storage-opt "additionalimagestore=$SHARED_GRAPHROOT")
+if [[ "$SHARED_STORE_HEALTHY" -eq 1 ]]; then
+  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
+  [[ -n "$SHARED_GRAPHROOT" ]] && PODMAN_GLOBAL_ARGS+=(--storage-opt "additionalimagestore=$SHARED_GRAPHROOT")
+fi
 
 # Kill any catatonit for OUR job that's actually orphaned (lingering, PPID reparented to 1) --
 # NOT just any catatonit that happens to reference our storage path, which is also true of our
@@ -213,9 +225,12 @@ cleanup() {
   # kill above happens -- an immediate rm -rf of the storage dir can still hit a busy mount.
   # Retry for up to 30s; if it still hasn't cleared, leave it and say so rather than failing
   # silently -- it's cheap to leave (lock/metadata files only, not image data, since that
-  # lives in the shared additionalimagestore).
+  # lives in the shared additionalimagestore). `podman unshare` first: a private
+  # graphroot's overlay diff dirs are owned by subuid-mapped UIDs, so a plain rm -rf as the
+  # invoking user gets "Permission denied" on most of the tree and leaves debris behind.
   for _ in $(seq 1 30); do
-    rm -rf "$JOB_STORAGE_DIR" 2>/dev/null && break
+    { podman unshare rm -rf "$JOB_STORAGE_DIR" 2>/dev/null \
+        || rm -rf "$JOB_STORAGE_DIR" 2>/dev/null; } && break
     sleep 1
   done
   if [[ -e "$JOB_STORAGE_DIR" ]]; then
