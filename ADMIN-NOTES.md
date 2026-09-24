@@ -492,21 +492,27 @@ unset XDG_RUNTIME_DIR
 podman system migrate 2>/dev/null || true
 podman info >/dev/null 2>&1 || podman system reset -f
 ```
-Now baked into `scripts/podman-run.sh` itself (runs on every invocation, unconditionally) —
-not left as a step the caller has to remember. The `containers/storage.conf` pointing
+The `migrate` half is baked into `scripts/podman-run.sh` (runs on every invocation). The
+`reset -f` half was later dropped by both wrappers: with several jobs packed onto one node the
+shared store may be in active use by a sibling's `additionalimagestores`, so an unhealthy
+`podman info` now just disables the image cache for this invocation instead (see "Ported from
+the Harbor fork" below). The `containers/storage.conf` pointing
 `graphroot`/`runroot` at `/scratch/$USER/podman-storage` and `/scratch/$USER/podman-run`
 (keeps podman's own large image/container data off small home-directory quotas) is still a
 manual, one-time, per-user setup step — there's no way to bake a per-user config file
 override into the wrapper the same way, since it's podman's own global config location, not
 something the wrapper's invocation can override per-call.
 
-**Fixed**: `podman-run.sh` now gives every invocation its own `--root`/`--runroot`, keyed on
-`$LSB_JOBID` (falling back to `$$-$RANDOM` outside LSF), instead of sharing the one from
-`storage.conf`. That per-job root/runroot is what corrupted under concurrent access —
+**Fixed**: `podman-run.sh` now gives every invocation its own graphroot/runroot under
+`/scratch/$USER/podman-jobs/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>` (`manual-<pid>` outside LSF),
+written to a per-job `storage.conf` and handed to podman via `CONTAINERS_STORAGE_CONF`
+(originally `--root`/`--runroot` flags on `podman run`; switched to the environment variable so
+every podman call the script makes — including the `podman rm`/`podman unshare` in cleanup —
+is scoped the same way). That shared root/runroot is what corrupted under concurrent access —
 isolating it removes the collision risk entirely, without needing exclusive-host or
 whole-node reservation at all. It doesn't cost a re-pull for another job landing on the *same*
-node: `--storage-opt additionalimagestore=<shared graphroot>` points the per-job store at the
-shared one from `storage.conf` as a **read-only** layer source, so the multi-GB image stays
+node: `additionalimagestores` in the per-job `storage.conf` points at the
+shared one from the user's `storage.conf` as a **read-only** layer source, so the multi-GB image stays
 cached there — only each job's own writable container-layer state (locks, per-container
 metadata) is isolated. This benefit is node-scoped, not cluster-scoped: `storage.conf`'s
 `graphroot`/`runroot` point at `/scratch/$USER`, which per the README's one-time setup is
@@ -545,8 +551,9 @@ in the background, a sibling subshell polls for and kills any orphaned `catatoni
 to *this job specifically* while the main wait is still in progress, scoped by two conditions
 together (both required — confirmed live that checking only one is unsafe, see rough edge #2):
 `PPID == 1` (actually orphaned, not just referencing our path while still healthy) **and** its
-own mount namespace (`/proc/<pid>/mountinfo`) references this job's unique
-`--root`/`--runroot` path (so it's never a sibling's).
+environment (`/proc/<pid>/environ`) references this job's unique storage path (so it's never a
+sibling's). The match was originally on `/proc/<pid>/mountinfo`; see "Ported from the Harbor
+fork" below for why that never actually fired.
 
 **Rough edge #2 — a real exit-code bug, unrelated to `catatonit`, found while testing #1.**
 The very first attempt at rough edge #1 checked *only* the mount-namespace condition, no PPID
@@ -598,6 +605,60 @@ files, no image data) that didn't clear within the 30s retry window, consistentl
 batches — call it roughly 1 in 4, not a rare edge case. Still low-severity (no live process,
 no real disk cost, self-clears on `/scratch`'s own cleanup cycle) but worth being honest about
 the actual frequency rather than implying it's unusual.
+
+### Ported from the Harbor fork (2026-09-23)
+
+Janelia's Harbor fork (`hpc/harbor-lsf-wrapper.sh`) drives rootless podman under LSF with the
+same per-job-store design, but had accumulated fixes from real packed-job failures that
+`podman-run.sh` lacked. All of them were adopted here wholesale, so the two wrappers now use
+the same mechanics:
+
+- **Per-job `XDG_RUNTIME_DIR`**, not just `unset`. `CONTAINERS_STORAGE_CONF` only isolates
+  *persistent* storage; crun's *live* per-container state lives under `$XDG_RUNTIME_DIR/crun`,
+  which with the variable merely unset defaults to the shared, UID-keyed `/run/user/<uid>` —
+  identical for every concurrent job from one user on a node. Harbor reproduced this 3/3 times
+  with packed `claude-code` jobs (`crun: container ... does not exist ...
+  /run/user/<uid>/crun/<id>/status: No such file or directory`). Now `$JOB_STORAGE_DIR/xdg-runtime`,
+  created and exported *before* the first podman call so even the pause process spawned by the
+  prologue health checks is job-scoped.
+- **`CONTAINERS_STORAGE_CONF` instead of `--root`/`--runroot` flags**, so the cleanup's
+  `podman rm`/`podman unshare` calls address the job store too (previously they ran flagless,
+  i.e. against the shared store, and could spawn a fresh pause process nobody swept).
+- **Orphan sweep matches `/proc/<pid>/environ`, not `mountinfo`.** Harbor confirmed live that
+  the mountinfo check never fires in the state it targets: the storage path leaves mountinfo the
+  moment the container's overlay is torn down. The pause process's environment still carries the
+  job path (via `CONTAINERS_STORAGE_CONF`/`XDG_RUNTIME_DIR`) regardless of mounts. Matched with a
+  trailing slash so job `12345`'s sweep can't match sibling `123456`.
+- **Sweep gated on `$LSB_JOBID` being set.** The `PPID == 1` test assumes LSF's `res` is a
+  subreaper above the pause process; on a plain host rootless podman's double-forked pause
+  process lands on PPID 1 while perfectly healthy, and the sweep would kill it mid-run.
+  `podman-run.sh` supports non-LSF use, so outside LSF the sweep is a no-op.
+- **Job tag is `${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$`.** Every element of an
+  LSF array job shares `LSB_JOBID`, a `brequeue`d job reuses it, and a job script calling the
+  wrapper twice is one job ID too — all of which previously shared (and then mutually destroyed)
+  a storage dir. Found in this repo's review, adopted by both wrappers.
+- **`podman rm -f --all --time 10` before tearing down storage**, so no container outlives the
+  config it's addressed through (scoped to the job store, so it can't touch a sibling).
+- **Cleanup deletes `root/` and `run/` in the retry loop, then the rest.** `podman unshare`
+  needs `XDG_RUNTIME_DIR` and `CONTAINERS_STORAGE_CONF` (both inside the job dir) alive to run,
+  so deleting the whole tree on iteration 1 degraded every later retry to the debris-leaving
+  plain-`rm` path. A second orphan sweep follows the `unshare`, which can itself spawn a
+  replacement pause process.
+- **`TERM`/`INT`/`USR2` trapped to `exit`.** bash skips EXIT traps on untrapped fatal signals,
+  which is exactly how `bkill` and walltime kills arrive — previously those leaked the
+  container, pause process, and per-job `/scratch` store until the cleanup cron.
+- **Prologue `podman info` retry (10 × 3s)** after the job store is configured, absorbing the
+  shared-store DB-lock contention Harbor saw when several jobs start on one node in the same
+  second.
+- **No more `podman system reset -f`** on an unhealthy shared store (already applied in the
+  previous commit; kept). The shared graphroot is under `/scratch`, which the periodic cleanup
+  cron can partially purge mid-run, so an unhealthy `podman info` is a routine, expected state
+  — the job just runs without the image cache.
+
+Smoke-tested after the port on a rootful podman host (no LSF): a container ran, a nonzero
+in-container exit code (`7`) propagated as the script's exit code, and the per-job dir was
+fully removed. The rootless/LSF paths (subuid-owned layers, the environ sweep, signal
+cleanup) still need a live run of `tests/test-podman.sh` on the cluster.
 
 ### The GHCR images
 

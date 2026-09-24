@@ -524,11 +524,13 @@ If your task needs something neither image has (a specific system library, a dif
 language runtime), that's when `--image`/your own Dockerfile comes in.
 
 **Gotchas you'll actually hit** (full root-cause detail in `ADMIN-NOTES.md`):
-- **Storage staleness after a reboot**: `podman-run.sh` runs `podman system migrate` (and
-  `podman system reset -f` if `podman info` fails) automatically on every invocation, so a
-  node reboot leaving podman's cached state stale doesn't need a manual fix. Concurrent
-  podman jobs from the same user are already handled separately — each invocation gets its
-  own isolated storage root, so they can't corrupt each other regardless.
+- **Storage staleness after a reboot**: `podman-run.sh` runs `podman system migrate`
+  automatically on every invocation, so a node reboot leaving podman's cached state stale
+  doesn't need a manual fix. If `podman info` still fails afterwards it does **not** reset the
+  shared store (a sibling job on the node may be reading it) — it just runs without the image
+  cache and says so on stderr. Concurrent podman jobs from the same user are handled
+  separately — each invocation gets its own isolated storage root and runtime dir (same
+  mechanism as Janelia's Harbor fork), so they can't corrupt each other regardless.
 - **Identity/HOME**: podman containers run as **root** with `$HOME=/root` by default, unlike
   bwrap where you're still "you." `scripts/podman-run.sh`'s `--claude`/`--opencode` shorthands
   mount your real config to `/root/...` (where the container's actual user looks), not to

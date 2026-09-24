@@ -113,18 +113,49 @@ if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
 
-# Rootless podman's shared storage state can go stale after a node reboot (Janelia's own
-# Harbor-fork prior art documents this). Reconcile before every invocation instead of
-# requiring the caller to remember to. Concurrency between jobs is handled separately, below
-# -- this is about the shared store's own integrity, not job-vs-job collision.
-unset XDG_RUNTIME_DIR
+# Per-job storage and runtime paths, created FIRST, before any podman command below runs.
+# Keyed on $LSB_JOBID plus $LSB_JOBINDEX plus this script's own $$, so no two invocations can
+# ever share one: every element of an LSF array job shares the same $LSB_JOBID, so two
+# elements packed onto one node would otherwise share (and then mutually destroy) a storage
+# dir; a `brequeue`d job reuses its LSB_JOBID too; and a job script that calls podman-run.sh
+# twice is one LSB_JOBID as well -- $$ makes each invocation unique regardless. Falls back to
+# "manual" outside LSF. Two things live here, both ported from Janelia's Harbor fork (hpc/harbor-lsf-wrapper.sh),
+# where each was found by real packed-job failures:
+#   root/ + run/   -- this job's own podman graphroot/runroot (see CONTAINERS_STORAGE_CONF
+#                     below). Sharing the static one from storage.conf is what let two
+#                     concurrent podman jobs from the same user corrupt each other's state on
+#                     one node (the original reason this repo asked for a full node per job).
+#   xdg-runtime/   -- this job's own XDG_RUNTIME_DIR. CONTAINERS_STORAGE_CONF only isolates
+#                     *persistent* storage; crun's *live* per-container state lives under
+#                     $XDG_RUNTIME_DIR/crun, and with the variable merely unset that defaults
+#                     to the shared, UID-keyed /run/user/$(id -u), identical for every
+#                     concurrent job from this user on the node. Harbor confirmed live that
+#                     packed claude-code jobs then intermittently lost track of their own
+#                     still-running container ("crun: container ... does not exist ...
+#                     /run/user/<uid>/crun/<id>/status: No such file or directory").
+# It also has to exist before the prologue calls because the orphan sweep further down
+# matches candidates by this path appearing in /proc/<pid>/environ -- a pause process spawned
+# by the prologue health checks before the export would carry no job-scoped path and be
+# unreapable by both the watchdog and the cleanup trap.
+JOB_STORAGE_DIR="/scratch/$USER/podman-jobs/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
+mkdir -p "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run" "$JOB_STORAGE_DIR/xdg-runtime"
+chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
+export XDG_RUNTIME_DIR="$JOB_STORAGE_DIR/xdg-runtime"
+
+# Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
+# used the shared graphroot (Janelia's Harbor fork documents this). Cheap and harmless when
+# there's nothing to migrate. CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
+# these prologue calls must see the SHARED store from ~/.config/containers/storage.conf, both
+# to health-check it and to read its graphroot for the cache reference below.
 podman system migrate 2>/dev/null || true
 # Do NOT `podman system reset -f` the shared store on a failed `podman info` here: this
-# script deliberately runs multiple podman jobs concurrently on one node (see the
-# --root/--runroot section below), so that store may be in active use by a sibling job's
-# --storage-opt additionalimagestore right now. Resetting it out from under a running job
-# is exactly the kind of cross-job collision the per-job --root/--runroot below exists to
-# avoid. Just note it and skip the additionalimagestore cache for this invocation instead.
+# script deliberately runs multiple podman jobs concurrently on one node, so that store may
+# be in active use by a sibling job's additionalimagestores right now. Resetting it out from
+# under a running job is exactly the kind of cross-job collision the per-job store exists to
+# avoid. Just note it and skip the image cache for this invocation instead. This isn't only
+# defensive: the shared graphroot lives under /scratch, which is swept on a periodic cleanup
+# cron that can delete blobs out from under a live store's metadata DB, so `podman info`
+# genuinely can go unhealthy mid-run through no fault of any job here.
 SHARED_STORE_HEALTHY=1
 if ! podman info >/dev/null 2>&1; then
   echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
@@ -133,31 +164,51 @@ fi
 
 # Check for a newer version of the image on every run rather than relying on the caller to
 # remember `podman pull`. Cheap in the common case -- this is a manifest-digest check, not a
-# re-download, unless the image actually changed. Skipped for a purely local image
+# re-download, unless the image actually changed. Runs against the SHARED store on purpose
+# (before CONTAINERS_STORAGE_CONF is exported) so the pull warms the node-local cache that
+# every sibling job reads through additionalimagestores. Skipped for a purely local image
 # (localhost/...), which has no registry to check against.
 if [[ "$IMAGE" != localhost/* ]]; then
   podman pull "$IMAGE" || true
 fi
 
-# Give this invocation its own storage root/runroot instead of sharing the one from
-# storage.conf -- that's what let two concurrent podman jobs from the same user corrupt each
-# other's state on the same node (the original reason this whole repo asked for a full node
-# per podman job; see ADMIN-NOTES.md). --storage-opt additionalimagestore points back at the
-# shared graphroot as a READ-ONLY layer source, so this doesn't cost a re-pull for another job
-# landing on the SAME node -- confirmed live: two concurrent invocations with distinct
-# --root/--runroot both saw the already-pulled image instantly via `podman images` and ran to
-# completion with no collision. (If storage.conf's graphroot is under /scratch, per the
+# Give this invocation its own storage root/runroot via a per-job storage.conf, handed to
+# podman through CONTAINERS_STORAGE_CONF rather than --root/--runroot flags: the environment
+# variable is honored by EVERY podman call from here on -- `podman run`, the `podman rm` and
+# `podman unshare` in cleanup, and anything the container's own tooling shells out to -- so
+# nothing can accidentally address the shared store with a job-scoped flag missing.
+# additionalimagestores points back at the shared graphroot as a READ-ONLY layer source (when
+# healthy), so this doesn't cost a re-pull for another job landing on the SAME node --
+# confirmed live: two concurrent invocations both saw the already-pulled image instantly and
+# ran to completion with no collision. (If storage.conf's graphroot is under /scratch, per the
 # README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
-# lands on a different node still pays a fresh pull regardless of this mechanism.) Keyed on
-# $LSB_JOBID so concurrent LSF jobs never collide; falls back to $$-$RANDOM outside LSF.
-JOBTAG="${LSB_JOBID:-$$-$RANDOM}"
-JOB_STORAGE_DIR="/scratch/$USER/podman-jobs/$JOBTAG"
-mkdir -p "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run"
-PODMAN_GLOBAL_ARGS=(--root "$JOB_STORAGE_DIR/root" --runroot "$JOB_STORAGE_DIR/run")
+# lands on a different node still pays a fresh pull regardless of this mechanism.)
+SHARED_GRAPHROOT=""
 if [[ "$SHARED_STORE_HEALTHY" -eq 1 ]]; then
   SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
-  [[ -n "$SHARED_GRAPHROOT" ]] && PODMAN_GLOBAL_ARGS+=(--storage-opt "additionalimagestore=$SHARED_GRAPHROOT")
 fi
+cat > "$JOB_STORAGE_DIR/storage.conf" <<STORAGECONF
+[storage]
+driver = "overlay"
+runroot = "$JOB_STORAGE_DIR/run"
+graphroot = "$JOB_STORAGE_DIR/root"
+
+[storage.options]
+mount_program = "/usr/bin/fuse-overlayfs"
+STORAGECONF
+if [[ -n "$SHARED_GRAPHROOT" ]]; then
+  echo "additionalimagestores = [\"$SHARED_GRAPHROOT\"]" >> "$JOB_STORAGE_DIR/storage.conf"
+fi
+export CONTAINERS_STORAGE_CONF="$JOB_STORAGE_DIR/storage.conf"
+
+# Absorb transient shared-store lock contention: when several jobs start on one node in the
+# same second, their prologue migrate/info calls can hold the shared store's DB lock long
+# enough that a sibling's first call against its job store (which reads the shared store
+# through additionalimagestores) fails. Retry until the job store answers before launching.
+for _ in $(seq 1 10); do
+  podman info >/dev/null 2>&1 && break
+  sleep 3
+done
 
 # Kill any catatonit for OUR job that's actually orphaned (lingering, PPID reparented to 1) --
 # NOT just any catatonit that happens to reference our storage path, which is also true of our
@@ -165,10 +216,28 @@ fi
 # without the PPID check, the watchdog below can catch a perfectly healthy catatonit mid-exit
 # and SIGKILL it, which is what was actually causing a wrong/nonzero podman-run.sh exit code
 # even on fast, successful runs -- not a cluster-specific storage quirk, a bug in this check.
+#
+# Match by /proc/$pid/environ, NOT /proc/$pid/mountinfo (ported from the Harbor fork, which
+# confirmed live this is the difference between a check that never fires and one that works):
+# mountinfo only references this job's storage path while a container's overlay is still
+# actively mounted, so by the time the container has been torn down (exactly the state being
+# checked for) it no longer matches anything. The pause process still carries
+# CONTAINERS_STORAGE_CONF / XDG_RUNTIME_DIR (both pointing inside this job's dir) in its
+# environment, inherited from whichever podman invocation spawned it, and that survives in
+# /proc/$pid/environ regardless of what's still mounted. The trailing slash on the match is
+# load-bearing: without it, job 12345's sweep also matches sibling job 123456's environ.
+#
+# Caveat on the PPID==1 gate: it assumes a healthy job's pause process is reparented to
+# something OTHER than init (LSF's res acting as a subreaper), which holds under LSF on this
+# cluster but is not guaranteed by podman itself -- rootless podman double-forks the pause
+# process, so on a host with no subreaper in the chain a HEALTHY pause process also lands on
+# PPID 1 and this sweep would kill it mid-run. Since this script also supports running outside
+# LSF, the sweep is a no-op unless $LSB_JOBID is set.
 kill_orphaned_catatonit_for_this_job() {
+  [[ -n "${LSB_JOBID:-}" ]] || return 0
   for pid in $(pgrep -u "$USER" -x catatonit 2>/dev/null); do
     [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "1" ]] || continue
-    grep -q "$JOB_STORAGE_DIR" "/proc/$pid/mountinfo" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null && kill -9 "$pid" 2>/dev/null
   done
   true
 }
@@ -218,27 +287,58 @@ cleanup() {
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "$PROXY_SOCK" && -e "$PROXY_SOCK" ]] && rm -f "$PROXY_SOCK" || true
+
+  # Remove this job's own containers before tearing down the storage config they're addressed
+  # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
+  # gone. Scoped to CONTAINERS_STORAGE_CONF, so this can never touch a sibling job's containers.
+  podman rm -f --all --time 10 >/dev/null 2>&1 || true
+
   # The watchdog below should already have reaped any lingering catatonit for this job by the
   # time we get here; this is just a last-chance sweep before removing the storage dir.
   kill_orphaned_catatonit_for_this_job
+
   # The overlay unmount for a just-removed container isn't always finished the instant the
   # kill above happens -- an immediate rm -rf of the storage dir can still hit a busy mount.
   # Retry for up to 30s; if it still hasn't cleared, leave it and say so rather than failing
-  # silently -- it's cheap to leave (lock/metadata files only, not image data, since that
-  # lives in the shared additionalimagestore). `podman unshare` first: a private
-  # graphroot's overlay diff dirs are owned by subuid-mapped UIDs, so a plain rm -rf as the
-  # invoking user gets "Permission denied" on most of the tree and leaves debris behind.
+  # silently. `podman unshare` first: a private graphroot's overlay diff dirs are owned by
+  # subuid-mapped UIDs, so a plain rm -rf as the invoking user gets "Permission denied" on
+  # most of the tree and leaves debris behind.
+  #
+  # Only root/ and run/ here, NOT the whole $JOB_STORAGE_DIR: podman unshare itself needs
+  # $XDG_RUNTIME_DIR and $CONTAINERS_STORAGE_CONF (both inside this dir) alive to run --
+  # deleting the whole tree on iteration 1 while a busy mount makes the overall rm fail would
+  # leave iterations 2-30 invoking podman against its own deleted runtime dir, degrading every
+  # retry to the debris-leaving plain-rm path this loop exists to avoid.
   for _ in $(seq 1 30); do
-    { podman unshare rm -rf "$JOB_STORAGE_DIR" 2>/dev/null \
-        || rm -rf "$JOB_STORAGE_DIR" 2>/dev/null; } && break
+    { podman unshare rm -rf "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run" 2>/dev/null \
+        || rm -rf "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run" 2>/dev/null; } && break
     sleep 1
   done
+
+  # `podman unshare` above is itself a podman command, run AFTER the sweep may have already
+  # killed this job's pause process -- that sequence can spawn a brand new replacement pause
+  # process to service it, which nothing then checks for again. One more sweep here catches
+  # that replacement instead of leaving it as a second, unnoticed orphan. (The environ match
+  # stays valid even once the directory itself no longer exists on disk.)
+  kill_orphaned_catatonit_for_this_job
+
+  # Everything left (xdg-runtime, storage.conf) is owned by the invoking user directly -- no
+  # subuid mapping -- so a plain rm finishes the job without needing podman at all.
+  rm -rf "$JOB_STORAGE_DIR" 2>/dev/null
   if [[ -e "$JOB_STORAGE_DIR" ]]; then
-    echo "podman-run.sh: couldn't clean up $JOB_STORAGE_DIR (still busy after 30s) -- safe to remove later" >&2
+    echo "podman-run.sh: couldn't clean up $JOB_STORAGE_DIR (still busy after 30s) -- remove later with: podman unshare rm -rf $JOB_STORAGE_DIR" >&2
   fi
   true
 }
 trap cleanup EXIT
+# bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
+# how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
+# without these, a walltime kill leaks the container, the pause process, and the per-job
+# /scratch store until the cleanup cron. Trapping the signal to `exit` routes it through the
+# EXIT trap above.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 141' USR2
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
@@ -252,14 +352,14 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     -v "$SCRIPT_DIR/relay.py:/opt/relay.py:ro"
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
-  podman "${PODMAN_GLOBAL_ARGS[@]}" run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
+  podman run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
     sleep 1
     export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"'
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
-  podman "${PODMAN_GLOBAL_ARGS[@]}" run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
+  podman run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
 fi
 PODMAN_PID=$!
 
