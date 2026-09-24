@@ -323,8 +323,17 @@ cleanup() {
   kill_orphaned_catatonit_for_this_job
 
   # Everything left (xdg-runtime, storage.conf) is owned by the invoking user directly -- no
-  # subuid mapping -- so a plain rm finishes the job without needing podman at all.
-  rm -rf "$JOB_STORAGE_DIR" 2>/dev/null
+  # subuid mapping -- so a plain rm finishes the job without needing podman at all. Retried
+  # with a sweep in between: confirmed live (first invocation of tests/test-podman.sh on the
+  # cluster) that a single rm here can race the replacement pause process's last writes into
+  # xdg-runtime/libpod/tmp (alive, alive.lck, exits/, persist/, rootless-netns/ -- all owned by
+  # the invoking user, all trivially removable a minute later), leaving that subtree behind.
+  for _ in $(seq 1 5); do
+    rm -rf "$JOB_STORAGE_DIR" 2>/dev/null
+    [[ -e "$JOB_STORAGE_DIR" ]] || break
+    sleep 1
+    kill_orphaned_catatonit_for_this_job
+  done
   if [[ -e "$JOB_STORAGE_DIR" ]]; then
     echo "podman-run.sh: couldn't clean up $JOB_STORAGE_DIR (still busy after 30s) -- remove later with: podman unshare rm -rf $JOB_STORAGE_DIR" >&2
   fi
