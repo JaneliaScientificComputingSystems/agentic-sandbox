@@ -156,6 +156,35 @@ chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
 # exported only AFTER the prologue, right alongside CONTAINERS_STORAGE_CONF.
 unset XDG_RUNTIME_DIR
 
+# Where rootless podman keeps the SHARED store's pause process pid with XDG_RUNTIME_DIR unset:
+# <runtime dir>/libpod/tmp/pause.pid, where c/storage derives the runtime dir as /run/user/<uid>
+# if that exists and is ours, else ${TMPDIR:-/tmp}/storage-run-<uid> (confirmed live: podman
+# 5.8.2 on the cluster reports its socket under /tmp/storage-run-<uid>/podman/). The orphan
+# sweep below kills that pause process at job end, and podman 5.8.2 does NOT recover from the
+# stale pid file it leaves behind -- every later `podman info`/`pull` on the node fails with
+# "cannot re-exec process to join the existing user namespace" (rc 125) until the file is
+# removed, which this script would otherwise misread as a permanently unhealthy shared store
+# (confirmed live on h08u08). So the pid file is removed whenever the pid it names is dead:
+# here, before the prologue, to heal a node an earlier job left in that state, and in the
+# sweep itself right after the kill. A live pid (a sibling's pause) is never touched.
+shared_runtime_dir() {
+  local d="/run/user/$(id -u)"
+  if [[ -d "$d" && -O "$d" ]]; then echo "$d"; else echo "${TMPDIR:-/tmp}/storage-run-$(id -u)"; fi
+}
+SHARED_RUNTIME_DIR="$(shared_runtime_dir)"
+SHARED_PAUSE_PIDFILE="$SHARED_RUNTIME_DIR/libpod/tmp/pause.pid"
+remove_stale_shared_pause_pidfile() {
+  local p
+  [[ -f "$SHARED_PAUSE_PIDFILE" ]] || return 0
+  p="$(cat "$SHARED_PAUSE_PIDFILE" 2>/dev/null)"
+  if [[ -n "$p" ]] && ! kill -0 "$p" 2>/dev/null; then
+    rm -f "$SHARED_PAUSE_PIDFILE"
+    echo "podman-run.sh: removed stale shared pause pid file ($SHARED_PAUSE_PIDFILE -> dead pid $p)" >&2
+  fi
+  true
+}
+remove_stale_shared_pause_pidfile
+
 # Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
 # used the shared graphroot (Janelia's Harbor fork documents this). Cheap and harmless when
 # there's nothing to migrate. CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
@@ -185,11 +214,17 @@ fi
 # DBConfig short of `podman system reset` (which would wipe the image cache out from under
 # sibling jobs), so this is a one-column, idempotent sqlite update, applied ONLY when the
 # recorded tmp dir is under this user's podman-jobs/ tree, and set to exactly the path podman
-# would have derived on its own with XDG_RUNTIME_DIR unset. Concurrent jobs repairing at once
-# write the same value; sqlite serializes them. Never deletes the stale dir itself: it might
-# still belong to a live sibling.
+# would have derived on its own with XDG_RUNTIME_DIR unset (<shared runtime dir>/libpod/tmp).
+# Concurrent jobs repairing at once write the same value; sqlite serializes them. Never
+# deletes the stale dir itself: it might still belong to a live sibling.
+#
+# Expect this to log almost never: the Harbor fork observed live that `podman system migrate`
+# above, running with XDG_RUNTIME_DIR unset, already re-stamps podman's own derived default
+# whenever the recorded dir is MISSING on disk -- which it normally is, since the poisoning
+# job deleted it at cleanup. This only matters when the poisoned path still exists (a live
+# sibling running an unfixed wrapper version).
 repair_shared_store_tmpdir() {
-  local db="$1/db.sql" want="${TMPDIR:-/tmp}/podman-run-$(id -u)/libpod/tmp"
+  local db="$1/db.sql" want="$SHARED_RUNTIME_DIR/libpod/tmp"
   [[ -f "$db" ]] || return 0
   python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
 import sqlite3, sys
@@ -296,6 +331,10 @@ kill_orphaned_catatonit_for_this_job() {
       kill -9 "$pid" 2>/dev/null
     fi
   done
+  # The shared pause we may just have killed leaves a pid file podman 5.8 can't get past --
+  # see remove_stale_shared_pause_pidfile above. Give the kill a moment to land first.
+  sleep 0.2
+  remove_stale_shared_pause_pidfile 2>/dev/null
   true
 }
 
