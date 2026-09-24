@@ -655,10 +655,37 @@ the same mechanics:
   cron can partially purge mid-run, so an unhealthy `podman info` is a routine, expected state
   — the job just runs without the image cache.
 
-Smoke-tested after the port on a rootful podman host (no LSF): a container ran, a nonzero
-in-container exit code (`7`) propagated as the script's exit code, and the per-job dir was
-fully removed. The rootless/LSF paths (subuid-owned layers, the environ sweep, signal
-cleanup) still need a live run of `tests/test-podman.sh` on the cluster.
+**Cluster verification (2026-09-23, `tests/test-podman.sh` on `gpu_l4`, plus two concurrent
+invocations pinned to one node with `bsub -m`)**: 11/12 pass, the one failure being the
+invoking account's expired Claude OAuth session (now correctly reported as a FAIL — the test
+previously matched only `^Error:` and passed on "Failed to authenticate"). Both concurrent
+invocations ran to completion, every job dir was removed, no `catatonit` survived, and the LSF
+job ended the same second the script did (no lingering RUN). Two bugs found and fixed on the
+way, both also present in the Harbor wrapper:
+
+- **The shared store's DB gets stamped with a per-job tmp dir.** Podman records its libpod tmp
+  dir in the store's own database (`DBConfig.TmpDir` in `<graphroot>/db.sql`) when it first
+  initializes the store, and every later call without an explicit `--tmpdir` silently adopts
+  the recorded value. With the per-job `XDG_RUNTIME_DIR` exported *before* the prologue calls,
+  the first job to touch a fresh shared store stamped
+  `/scratch/$USER/podman-jobs/<job>/xdg-runtime/libpod/tmp` in permanently; that job deleted
+  the dir in cleanup and every later job's prologue on the node recreated it (observed as a
+  long-gone job's dir reappearing, and read directly from the sqlite DB on three nodes, two of
+  them stamped by Harbor's own batch). Fix: the prologue runs with `XDG_RUNTIME_DIR` unset, the
+  per-job value is exported together with `CONTAINERS_STORAGE_CONF` afterwards, the sweep also
+  matches the prologue's shared pause process by our own `LSB_JOBID` environ entry, and
+  `repair_shared_store_tmpdir` rewrites an already-poisoned `DBConfig.TmpDir` back to podman's
+  stable default (`${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp`) — a one-column sqlite update,
+  since podman offers nothing short of `system reset` for this.
+- **The final plain `rm -rf` of the job dir can race the pause process's last writes**, leaving
+  `xdg-runtime/libpod/tmp/{alive,alive.lck,exits,persist,rootless-netns}` behind (all owned by
+  the invoking user, trivially removable a minute later). Now retried five times with a sweep in
+  between.
+
+Also learned: `tests/test-bwrap.sh` and `tests/test-podman.sh` must not run at the same time
+for the same account — both drive opencode against the same `~/.local/share/opencode/opencode.db`
+(sqlite, on NFS) and the loser sees `Failed to execute statement` or a LiteLLM
+`UnknownError`. Run them sequentially.
 
 ### The GHCR images
 
