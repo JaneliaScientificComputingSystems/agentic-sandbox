@@ -140,7 +140,21 @@ fi
 JOB_STORAGE_DIR="/scratch/$USER/podman-jobs/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
 mkdir -p "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run" "$JOB_STORAGE_DIR/xdg-runtime"
 chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
-export XDG_RUNTIME_DIR="$JOB_STORAGE_DIR/xdg-runtime"
+
+# The prologue calls below (migrate / info / pull) run against the SHARED store with
+# XDG_RUNTIME_DIR UNSET, so podman derives its libpod tmp dir from its stable default
+# (${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp), NOT from this job's xdg-runtime dir. This
+# matters far more than it looks: podman records the tmp dir in the store's own database
+# (DBConfig.TmpDir) the first time it initializes that store, and every later invocation
+# that doesn't pass --tmpdir explicitly silently ADOPTS the recorded value. Confirmed live on
+# three cluster nodes: with the per-job XDG_RUNTIME_DIR exported before these calls, the
+# first job to touch a fresh shared store (post-reboot, post-/scratch-purge) permanently
+# stamped ITS per-job path into the shared DB; that job then deleted the dir in cleanup, and
+# every subsequent job's prologue on that node recreated
+# /scratch/$USER/podman-jobs/<long-gone-job>/xdg-runtime/libpod/tmp -- the shared store
+# believed it had rebooted on every single invocation. The per-job XDG_RUNTIME_DIR is
+# exported only AFTER the prologue, right alongside CONTAINERS_STORAGE_CONF.
+unset XDG_RUNTIME_DIR
 
 # Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
 # used the shared graphroot (Janelia's Harbor fork documents this). Cheap and harmless when
@@ -157,10 +171,42 @@ podman system migrate 2>/dev/null || true
 # cron that can delete blobs out from under a live store's metadata DB, so `podman info`
 # genuinely can go unhealthy mid-run through no fault of any job here.
 SHARED_STORE_HEALTHY=1
-if ! podman info >/dev/null 2>&1; then
+SHARED_GRAPHROOT=""
+if podman info >/dev/null 2>&1; then
+  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
+else
   echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
   SHARED_STORE_HEALTHY=0
 fi
+
+# Repair a shared-store DB already stamped with some job's per-job tmp dir by an earlier
+# version of this script (or of the Harbor fork's wrapper, which shares this design and had
+# the same bug) -- see the XDG_RUNTIME_DIR comment above. Podman offers no command to change
+# DBConfig short of `podman system reset` (which would wipe the image cache out from under
+# sibling jobs), so this is a one-column, idempotent sqlite update, applied ONLY when the
+# recorded tmp dir is under this user's podman-jobs/ tree, and set to exactly the path podman
+# would have derived on its own with XDG_RUNTIME_DIR unset. Concurrent jobs repairing at once
+# write the same value; sqlite serializes them. Never deletes the stale dir itself: it might
+# still belong to a live sibling.
+repair_shared_store_tmpdir() {
+  local db="$1/db.sql" want="${TMPDIR:-/tmp}/podman-run-$(id -u)/libpod/tmp"
+  [[ -f "$db" ]] || return 0
+  python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
+import sqlite3, sys
+db, want, bad_prefix = sys.argv[1:4]
+try:
+    c = sqlite3.connect(db, timeout=15)
+    row = c.execute("select TmpDir from DBConfig").fetchone()
+    if row and row[0].startswith(bad_prefix) and row[0] != want:
+        c.execute("update DBConfig set TmpDir = ?", (want,))
+        c.commit()
+        print(f"repaired shared store tmp dir: {row[0]} -> {want}")
+except Exception as e:
+    print(f"could not check/repair shared store tmp dir in {db}: {e}")
+REPAIR
+  true
+}
+[[ -n "$SHARED_GRAPHROOT" ]] && repair_shared_store_tmpdir "$SHARED_GRAPHROOT"
 
 # Check for a newer version of the image on every run rather than relying on the caller to
 # remember `podman pull`. Cheap in the common case -- this is a manifest-digest check, not a
@@ -183,10 +229,6 @@ fi
 # ran to completion with no collision. (If storage.conf's graphroot is under /scratch, per the
 # README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
 # lands on a different node still pays a fresh pull regardless of this mechanism.)
-SHARED_GRAPHROOT=""
-if [[ "$SHARED_STORE_HEALTHY" -eq 1 ]]; then
-  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
-fi
 cat > "$JOB_STORAGE_DIR/storage.conf" <<STORAGECONF
 [storage]
 driver = "overlay"
@@ -200,6 +242,10 @@ if [[ -n "$SHARED_GRAPHROOT" ]]; then
   echo "additionalimagestores = [\"$SHARED_GRAPHROOT\"]" >> "$JOB_STORAGE_DIR/storage.conf"
 fi
 export CONTAINERS_STORAGE_CONF="$JOB_STORAGE_DIR/storage.conf"
+# From here on every podman call is job-scoped: its own store AND its own runtime dir (crun's
+# live per-container state, the pause process, rootless-netns) -- see the header comment on
+# xdg-runtime/ above for why the runtime dir has to be per-job too.
+export XDG_RUNTIME_DIR="$JOB_STORAGE_DIR/xdg-runtime"
 
 # Absorb transient shared-store lock contention: when several jobs start on one node in the
 # same second, their prologue migrate/info calls can hold the shared store's DB lock long
@@ -233,11 +279,22 @@ done
 # process, so on a host with no subreaper in the chain a HEALTHY pause process also lands on
 # PPID 1 and this sweep would kill it mid-run. Since this script also supports running outside
 # LSF, the sweep is a no-op unless $LSB_JOBID is set.
+#
+# Two kinds of pause process can be ours: the per-job one (environ carries this job's storage
+# path via CONTAINERS_STORAGE_CONF/XDG_RUNTIME_DIR), and the SHARED-store one spawned by our
+# prologue calls, which ran with XDG_RUNTIME_DIR unset and so carry no job path -- but do carry
+# our LSB_JOBID (matched as a whole NUL-delimited environ entry). Killing that shared pause is
+# safe now that no container ever runs under it: a sibling's in-flight prologue call has
+# already joined its namespaces (which outlive the pause process), and its next call simply
+# spawns a fresh one. Left alive, it's what held finished LSF jobs in RUN for minutes.
 kill_orphaned_catatonit_for_this_job() {
   [[ -n "${LSB_JOBID:-}" ]] || return 0
   for pid in $(pgrep -u "$USER" -x catatonit 2>/dev/null); do
     [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "1" ]] || continue
-    grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    if grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null \
+       || grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null
+    fi
   done
   true
 }

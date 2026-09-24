@@ -50,7 +50,7 @@ OUT=$("$PODMAN_RUN" --gpu --scratch --claude \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- \
   claude -p "who am i speaking to?" --model sonnet 2>&1)
 # See test-bwrap.sh's comment on this same check -- don't assert on specific wording.
-if echo "$OUT" | grep -qE "^(Error|error):"; then
+if echo "$OUT" | grep -qE "^(Error|error):|Failed to authenticate"; then
   echo "FAIL: claude one-shot (sandbox/tool error): $OUT"
   FAIL=$((FAIL + 1))
 elif [[ -n "$OUT" ]]; then

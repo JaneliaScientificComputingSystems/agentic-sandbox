@@ -84,7 +84,7 @@ OUT=$("$SANDBOX_RUN" --scratch --claude \
 # names itself, sometimes it addresses the logged-in user by name/email instead), and
 # pinning to exact keywords makes this brittle against normal LLM response variance. The
 # actual thing worth testing is "did the sandboxed API call succeed at all," not word choice.
-if echo "$OUT" | grep -qE "^(bwrap|Error|error):"; then
+if echo "$OUT" | grep -qE "^(bwrap|Error|error):|Failed to authenticate"; then
   echo "FAIL: claude one-shot (sandbox/tool error): $OUT"
   FAIL=$((FAIL + 1))
 elif [[ -n "$OUT" ]]; then
