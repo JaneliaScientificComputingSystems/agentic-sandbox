@@ -677,6 +677,21 @@ way, both also present in the Harbor wrapper:
   `repair_shared_store_tmpdir` rewrites an already-poisoned `DBConfig.TmpDir` back to podman's
   stable default (`${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp`) — a one-column sqlite update,
   since podman offers nothing short of `system reset` for this.
+- **Killing the shared pause process leaves a `pause.pid` podman 5.8.2 may not recover from.**
+  The sweep's `LSB_JOBID` branch (needed so the prologue's shared pause doesn't hold the LSF
+  job in RUN) leaves `<runtime dir>/libpod/tmp/pause.pid` naming a dead pid. Confirmed live on
+  h08u08: every subsequent `podman info`/`pull` on the node then failed with "cannot re-exec
+  process to join the existing user namespace" (rc 125), which the wrapper misread as a
+  permanently unhealthy shared store; deleting the file restored it instantly. (On two other
+  occasions podman did recover from a dead pid on its own — the failure mode looks
+  pid-reuse-dependent, so it can't be relied on either way.) The wrapper now removes the pid
+  file whenever the pid it names is dead: before the prologue, and inside the sweep right
+  after the kill. The runtime dir is derived the way c/storage does it — `/run/user/<uid>` if
+  present and ours, else `${TMPDIR:-/tmp}/storage-run-<uid>` (podman 5.8.2's socket on the
+  cluster is under `/tmp/storage-run-<uid>/podman/`, which is how this was confirmed) — and
+  `repair_shared_store_tmpdir` targets the same `<runtime dir>/libpod/tmp`, matching what
+  podman re-derives itself. Verified on h08u08 and h06u18: two back-to-back wrapper runs, no
+  pid file, no catatonit, no job dirs, LSF job ended within a second of the script.
 - **The final plain `rm -rf` of the job dir can race the pause process's last writes**, leaving
   `xdg-runtime/libpod/tmp/{alive,alive.lck,exits,persist,rootless-netns}` behind (all owned by
   the invoking user, trivially removable a minute later). Now retried five times with a sweep in
