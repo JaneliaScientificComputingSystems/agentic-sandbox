@@ -92,8 +92,7 @@ to grant access to whatever domains the model needs.)
 **bwrap cannot do GPU passthrough** — a real, confirmed limitation, not a missing flag (see
 [GPU / device access](#gpu--device-access) below for why). For anything that needs a GPU, use
 `scripts/podman-run.sh` instead — same flag shape and allowlist-proxy network model as
-`sandbox-run.sh`, plus `--gpu` to attach the GPU(s) LSF allocated to the job (one
-`--device nvidia.com/gpu=<idx>` per entry in `$CUDA_VISIBLE_DEVICES`).
+`sandbox-run.sh`, plus `--gpu` for `--device nvidia.com/gpu=all`.
 
 By default it runs a prebuilt image we provide (bare CUDA runtime + Node.js + Claude Code +
 opencode, no ML framework stack — `agentic-sandbox-lite`) pulled from GHCR, so there's
@@ -409,7 +408,10 @@ Claude Code keeps OAuth credentials, settings and session state under `~/.claude
 gets a fresh directory under `/scratch/$USER` holding **copies** of `~/.claude.json`,
 `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with only `~/.claude/.credentials.json`
 shared with the real file (bound through under bwrap; copied in and, if still valid JSON,
-copied back afterwards under podman). The directory is deleted when the run ends.
+copied back afterwards under podman). The directory is deleted when the run ends. Under
+podman the copy-back is skipped if the real file changed while the job ran — another
+`--claude` job, or your own `claude`, refreshed the token meanwhile, and with rotating refresh
+tokens that newer one is the one to keep.
 
 Why copies and not a read-write bind of `~/.claude`: `settings.json` hooks and
 `~/.claude.json` MCP server entries are shell commands Claude Code runs as you, unsandboxed,
@@ -444,9 +446,11 @@ features.
 **Option 3 — skip OAuth with an API key.** Claude Code also accepts `ANTHROPIC_API_KEY` (or
 `ANTHROPIC_AUTH_TOKEN` for a bearer key, e.g. a LiteLLM virtual key). Verified live in all
 three modes (bwrap, podman as container-root, podman `--keep-id`) with an expired OAuth
-session — the key takes precedence. One wrinkle: `sandbox-run.sh` inherits your environment,
-so an exported `ANTHROPIC_API_KEY` just reaches `claude`; `podman-run.sh` does **not** forward
-host env vars into the container, so get the key in another way — e.g. a `chmod 600` file
+session — the key takes precedence. Neither wrapper passes your environment through:
+`sandbox-run.sh` starts from an empty one (`--clearenv`), so name the key explicitly —
+`sandbox-run.sh --env ANTHROPIC_API_KEY ...` passes the value you exported, and nothing else;
+`podman-run.sh` does **not** forward host env vars into the container at all, so get the key
+in another way — e.g. a `chmod 600` file
 under `/scratch/$USER` and `-- bash -c 'export ANTHROPIC_API_KEY=$(cat /scratch/$USER/key); claude ...'`
 with `--scratch`. Never put the key on the `bsub` command line: LSF stores that verbatim in
 `bjobs -l`/`bhist -l`.
@@ -587,7 +591,7 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   host owned by you (confirmed live, test 11b), and "root" capabilities apply only inside the
   container's own namespaces. What differs is purely the *identity as seen from inside*.
   `scripts/podman-run.sh` sidesteps it for the harness config by pointing
-  `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` at the per-job copy (same path inside and out); only
+  `CLAUDE_CONFIG_DIR`/`OPENCODE_CONFIG` at the per-job copy (same path inside and out); only
   opencode's data dirs are mounted to `/root/...` (where the in-container user looks) rather
   than `$HOME/...`. If you want the identity to match too, use `--keep-id` (next gotcha) — it
   isn't the default only because of the subuid/subgid range width it needs.
@@ -640,9 +644,10 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
 ```
 `scripts/podman-run.sh` mirrors `sandbox-run.sh`'s flags (`--ro`/`--rw` → `-v ...:ro`/`-v
 ...:rw`, `--allow` → the identical proxy/relay mechanism, `--scratch`/`--claude`/`--opencode`
-shorthands) plus `--gpu` → one `--device nvidia.com/gpu=<idx>` per GPU in
-`$CUDA_VISIBLE_DEVICES` (`nvidia.com/gpu=all` only when that variable is unset, i.e. outside
-LSF — on a shared node `all` would expose other jobs' GPUs).
+shorthands) plus `--gpu` → `--device nvidia.com/gpu=all`. Inside an LSF job that is only the
+job's own GPUs: the job's device cgroup refuses the others. It is not one `--device` per entry
+in `$CUDA_VISIBLE_DEVICES` on purpose: LSF numbers a job's GPUs from 0, CDI numbers the whole
+node, and a node's CDI spec can be stale.
 
 **Sandboxing podman itself needs no host firewall access** — same namespace primitives as
 bwrap underneath: `-v host:container:ro/rw` for filesystem (default-deny by construction —
@@ -694,10 +699,12 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
   --claude        Per-job CLAUDE_CONFIG_DIR seeded with copies of your Claude Code config;
                   only the credentials file is shared with ~/.claude (see "Authenticating
                   Claude Code" above)
-  --opencode      Per-job XDG_CONFIG_HOME seeded with a copy of ~/.config/opencode, plus RW
+  --opencode      Per-job copy of ~/.config/opencode, used through OPENCODE_CONFIG and
+                  OPENCODE_CONFIG_DIR (XDG_CONFIG_HOME, and so git/gh config, untouched), plus RW
                   binds on opencode's three data dirs (~/.local/share, ~/.local/state,
                   ~/.cache)
-  --gpu           (podman-run.sh only) attach the GPUs in $CUDA_VISIBLE_DEVICES (all, if unset)
+  --gpu           (podman-run.sh only) --device nvidia.com/gpu=all (an error in an LSF job
+                  without a GPU)
   --keep-id       (podman-run.sh only) run as your real uid/gid instead of root -- see
                   "GPU / device access" below for the subuid/subgid range width it requires
   --image NAME    (podman-run.sh only) any OCI image; defaults to the example GHCR image,

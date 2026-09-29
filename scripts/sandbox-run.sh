@@ -23,7 +23,8 @@
 #                          through to the real file (CLAUDE_CONFIG_DIR points at it). See
 #                          "Config isolation" below.
 #   --opencode             Same idea for opencode: a throwaway copy of ~/.config/opencode
-#                          (XDG_CONFIG_HOME points at it) plus RW binds on its data dirs
+#                          (OPENCODE_CONFIG/OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is
+#                          left alone, so git/gh config still resolve) plus RW binds on its data dirs
 #                          (~/.local/share/opencode, ~/.local/state/opencode, ~/.cache/opencode)
 #   -h, --help             Show this help
 #
@@ -80,7 +81,8 @@ LATE_BINDS=()     # binds that must come after every --rw (nested file binds ove
 EXTRA_SETENV=()
 SANDBOX_CFG_ROOT=""
 
-usage() { sed -n '2,59p' "${BASH_SOURCE[0]}"; }
+# Everything from line 2 down to the line before `set -euo pipefail`.
+usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -147,6 +149,10 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   OPENCODE_XDG_CONFIG="$SANDBOX_CFG_ROOT/opencode-xdg-config"
   mkdir -p "$OPENCODE_XDG_CONFIG"
   [[ -d "$HOME/.config/opencode" ]] && cp -R "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
+  mkdir -p "$OPENCODE_XDG_CONFIG/opencode"
+  OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
+  [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
+    && OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc"
   RW_BINDS+=("$OPENCODE_XDG_CONFIG")
   # Data dirs (auth.json, sessions, cache) stay bound to the real ones; created if missing so
   # bwrap has a source path on a fresh account.
@@ -154,14 +160,20 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
     mkdir -p "$HOME/$d"
     RW_BINDS+=("$HOME/$d")
   done
-  EXTRA_SETENV+=(XDG_CONFIG_HOME "$OPENCODE_XDG_CONFIG")
+  # opencode's own variables, not XDG_CONFIG_HOME: that would also hide git's, gh's and every
+  # other tool's ~/.config from the sandboxed process. OPENCODE_CONFIG is the config file,
+  # OPENCODE_CONFIG_DIR the agents/commands/modes/plugins directory (opencode.ai/docs/config).
+  EXTRA_SETENV+=(OPENCODE_CONFIG "$OPENCODE_CONFIG_FILE"
+                 OPENCODE_CONFIG_DIR "$OPENCODE_XDG_CONFIG/opencode")
 fi
 
 BWRAP_ARGS=(
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib64 /lib64 --ro-bind /lib /lib
   --ro-bind /sbin /sbin --ro-bind /etc /etc
-  --bind "$PWD" "$PWD"
+  # /tmp BEFORE $PWD: bwrap applies mounts in order, so a tmpfs mounted after the $PWD bind
+  # would cover a $PWD that lives under /tmp, and the agent would start in an empty directory.
   --tmpfs /tmp
+  --bind "$PWD" "$PWD"
   --proc /proc --dev /dev --unshare-net --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
@@ -173,8 +185,10 @@ BWRAP_ARGS=(
 
 # Start from an empty environment; copy in only what a shell/CLI needs plus --env extras.
 BWRAP_ARGS+=(--clearenv --setenv TMPDIR /tmp)
-PASSTHROUGH_ENV=(PATH HOME USER LOGNAME SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE LC_MESSAGES TZ
+PASSTHROUGH_ENV=(PATH HOME USER LOGNAME SHELL TERM COLORTERM LANG TZ
                  SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS)
+# Every LC_* the invoking shell has, as documented above -- not a fixed subset.
+while IFS= read -r name; do PASSTHROUGH_ENV+=("$name"); done < <(compgen -e LC_)
 for name in "${PASSTHROUGH_ENV[@]}" "${PASS_ENV[@]:-}"; do
   [[ -n "$name" && -n "${!name+x}" ]] && BWRAP_ARGS+=(--setenv "$name" "${!name}")
 done
@@ -252,23 +266,25 @@ for root in "${MASK_ROOTS[@]}"; do
 done
 
 PROXY_PID=""
+PROXY_DIR=""
 PROXY_SOCK=""
 wait_for_proxy_socket() {
-  # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first.
+  # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
+  # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
   for _ in $(seq 1 100); do
     [[ -S "$1" ]] && return 0
     if ! kill -0 "$2" 2>/dev/null; then
-      echo "sandbox-run.sh: allowlist proxy exited before creating $1 -- see ${1}.log" >&2
+      echo "sandbox-run.sh: allowlist proxy exited before creating $1 -- see $PROXY_DIR/proxy.log" >&2
       return 1
     fi
     sleep 0.1
   done
-  echo "sandbox-run.sh: allowlist proxy did not create $1 within 10s -- see ${1}.log" >&2
+  echo "sandbox-run.sh: allowlist proxy did not create $1 within 10s -- see $PROXY_DIR/proxy.log" >&2
   return 1
 }
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$PROXY_SOCK" && -e "$PROXY_SOCK" ]] && rm -f "$PROXY_SOCK"
+  [[ -n "$PROXY_DIR" && -d "$PROXY_DIR" ]] && rm -rf "$PROXY_DIR"
   [[ -n "$EMPTY_MASK_FILE" && -e "$EMPTY_MASK_FILE" ]] && rm -f "$EMPTY_MASK_FILE"
   # The per-job config copies include ~/.claude.json (account details) -- never leave them.
   [[ -n "$SANDBOX_CFG_ROOT" && -d "$SANDBOX_CFG_ROOT" ]] && rm -rf "$SANDBOX_CFG_ROOT"
@@ -279,9 +295,14 @@ trap cleanup EXIT
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
-  PROXY_SOCK="$(mktemp -u /tmp/sandbox-proxy.XXXXXX.sock)"
+  # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
+  # socket (it is created 0755), and no one else's socket can stand in for ours. It must stay on
+  # node-local storage -- a Unix socket cannot be bound on NFS.
+  PROXY_DIR="$(mktemp -d /tmp/sandbox-proxy.XXXXXX)"
+  chmod 700 "$PROXY_DIR"
+  PROXY_SOCK="$PROXY_DIR/proxy.sock"
   python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
-    > "${PROXY_SOCK}.log" 2>&1 &
+    > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Wait for the socket to actually exist before bind-mounting it, and fail closed if the
   # proxy died (bad allowlist, python missing). A fixed `sleep 1` raced a slow interpreter
