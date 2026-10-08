@@ -21,4 +21,11 @@ RUN curl -fsSL https://claude.ai/install.sh | bash && \
 RUN curl -fsSL https://opencode.ai/install | bash && \
     ln -s /root/.opencode/bin/opencode /usr/local/bin/opencode
 
+# Same fix as ./Dockerfile: /root is 0700, which blocks a non-root process (what
+# `podman-run.sh --keep-id` runs as) from traversing into it at all, so the two symlinks above
+# fail with "Permission denied" even though the targets themselves are readable. Open traversal
+# on /root plus read+execute on the two install trees only -- not a blanket loosening of /root.
+# Without this, --keep-id with --claude/--opencode worked on the lite image but not on this one.
+RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
+
 WORKDIR /work
