@@ -22,6 +22,11 @@ mkdir -p "$TEST_CWD"
 cd "$TEST_CWD"
 trap 'cd /; rm -rf "$TEST_CWD"' EXIT
 
+# Snapshot of wrapper-named /tmp entries before the suite: the "no /tmp writes" check at the
+# end compares against this rather than asserting an empty /tmp, since other runs (older
+# wrapper versions, other sessions) may have left entries on a shared node.
+TMP_SANDBOX_BEFORE=$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')
+
 PASS=0
 FAIL=0
 check() {
@@ -166,7 +171,7 @@ check "--scratch: state parent not mounted at all" "$OUT" "hidden"
 OUT=$("$SANDBOX_RUN" --rw "/scratch/$USER" --claude -- bash -c 'echo "$(ls -A /scratch/$USER/.agentic-sandbox | grep -c fake-sibling),$(test -f "$CLAUDE_CONFIG_DIR/.claude.json" && echo own-cfg-ok)"' 2>/dev/null)
 check "--rw /scratch/\$USER: siblings masked by tmpfs, own cfg still bound" "$OUT" "0,own-cfg-ok"
 rm -rf "$FAKE"
-check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-proxy.* /tmp/sandbox-empty.* /tmp/sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

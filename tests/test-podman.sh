@@ -10,6 +10,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PODMAN_RUN="$SCRIPT_DIR/../scripts/podman-run.sh"
 
+# See test-bwrap.sh: compare against the pre-suite count, not an empty /tmp.
+TMP_SANDBOX_BEFORE=$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')
+
 PASS=0
 FAIL=0
 check() {
@@ -147,7 +150,7 @@ if [[ -f "$CREDS" ]]; then
   check "host credentials untouched" "$(md5sum < "$CREDS")" "$B"
 fi
 check "per-job state dirs removed on exit" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
-check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-proxy.* /tmp/podman-sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
