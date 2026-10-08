@@ -33,8 +33,8 @@
 #                    `claude auth login` persist -- but edits to settings (hooks) or MCP
 #                    server entries made inside the container die with it. Those are shell
 #                    commands Claude Code would otherwise run unsandboxed in your next session.
-#   --opencode      Same idea: a throwaway copy of ~/.config/opencode (OPENCODE_CONFIG /
-#                    OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is left alone) plus
+#   --opencode      Same idea: a throwaway copy of ~/.config/opencode, mounted at opencode's
+#                    default location inside (~/.config/opencode of the in-container user), plus
 #                    RW binds on its data dirs (~/.local/share, ~/.local/state, ~/.cache)
 #   --keep-id       Run as your real uid/gid instead of root (--userns=keep-id --user
 #                    "$(id -u):$(id -g)"), so files land on the real filesystem with your
@@ -96,13 +96,18 @@ while [[ $# -gt 0 ]]; do
 done
 CMD=("$@")
 
-# --claude/--opencode: the harness CONFIG is copied into a per-job directory that is mounted
-# at the same path inside the container and pointed to via CLAUDE_CONFIG_DIR /
-# OPENCODE_CONFIG(_DIR), so its location no longer depends on --keep-id (root's $HOME=/root vs your
-# real $HOME). Only opencode's DATA dirs still need the HOME-dependent destination: default
-# (no --keep-id) the container runs as root and looks under /root/...; --keep-id runs as your
-# real uid with $HOME=$HOME (set via -e HOME below), same convention as bwrap. See
-# ADMIN-NOTES.md's "identity/HOME saga" for why forcing identity without remapping failed.
+# --claude/--opencode: the harness CONFIG is copied into a per-job directory. Claude's copy is
+# mounted at the same path inside the container and pointed to via CLAUDE_CONFIG_DIR, so its
+# location doesn't depend on --keep-id. opencode's copy is mounted at opencode's DEFAULT config
+# location for the in-container user instead: confirmed live that even with OPENCODE_CONFIG /
+# OPENCODE_CONFIG_DIR pointing elsewhere, opencode still mkdir()s ~/.config, and under --keep-id
+# that fails with EACCES because podman auto-creates the unmounted $HOME inside the container
+# root-owned (Bun crash banner, test 8). Mounting at the default location means the parent
+# exists as a mount point, exactly as it did when the real dir was bound. So opencode's config
+# AND data dirs use the HOME-dependent destination: default (no --keep-id) the container runs
+# as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
+# -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "identity/HOME saga" for why
+# forcing identity without remapping failed.
 SANDBOX_CFG_ROOT=""
 CLAUDE_CFG=""
 CLAUDE_CREDS_BEFORE=""
@@ -136,26 +141,24 @@ if [[ $WANT_CLAUDE -eq 1 ]]; then
 fi
 if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
-  OPENCODE_XDG_CONFIG="$SANDBOX_CFG_ROOT/opencode-xdg-config"
-  mkdir -p "$OPENCODE_XDG_CONFIG"
-  [[ -d "$HOME/.config/opencode" ]] && cp -R "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
-  mkdir -p "$OPENCODE_XDG_CONFIG/opencode"
-  OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
-  [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
-    && OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc"
-  VOLUMES+=("-v" "$OPENCODE_XDG_CONFIG:$OPENCODE_XDG_CONFIG:rw")
-  # opencode's own variables, not XDG_CONFIG_HOME, which would redirect every tool's ~/.config.
-  ENV_ARGS+=(-e "OPENCODE_CONFIG=$OPENCODE_CONFIG_FILE" -e "OPENCODE_CONFIG_DIR=$OPENCODE_XDG_CONFIG/opencode")
-  # Data dirs stay bound to the real ones; created first so podman never has to auto-create a
-  # missing source (it would, silently, as a root-owned directory).
-  for d in .local/share/opencode .local/state/opencode .cache/opencode; do
-    mkdir -p "$HOME/$d"
-    if [[ $KEEP_ID -eq 1 ]]; then
-      VOLUMES+=("-v" "$HOME/$d:$HOME/$d:rw")
-    else
-      VOLUMES+=("-v" "$HOME/$d:/root/$d:rw")
-    fi
-  done
+  OPENCODE_CFG="$SANDBOX_CFG_ROOT/opencode-config"
+  if [[ -d "$HOME/.config/opencode" ]]; then
+    cp -R "$HOME/.config/opencode" "$OPENCODE_CFG"
+  else
+    mkdir -p "$OPENCODE_CFG"
+  fi
+  # Config copy at opencode's default location (see the comment above the --claude block for
+  # why not OPENCODE_CONFIG); data dirs stay bound to the real ones. The data dirs are created
+  # first so podman never has to auto-create a missing source (it would, silently, as a
+  # root-owned directory).
+  for d in .local/share/opencode .local/state/opencode .cache/opencode; do mkdir -p "$HOME/$d"; done
+  if [[ $KEEP_ID -eq 1 ]]; then
+    VOLUMES+=("-v" "$OPENCODE_CFG:$HOME/.config/opencode:rw")
+    for d in .local/share/opencode .local/state/opencode .cache/opencode; do VOLUMES+=("-v" "$HOME/$d:$HOME/$d:rw"); done
+  else
+    VOLUMES+=("-v" "$OPENCODE_CFG:/root/.config/opencode:rw")
+    for d in .local/share/opencode .local/state/opencode .cache/opencode; do VOLUMES+=("-v" "$HOME/$d:/root/$d:rw"); done
+  fi
 fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1

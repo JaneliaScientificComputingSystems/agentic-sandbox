@@ -590,10 +590,10 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   permissions on every mount and nothing more: a file it writes to a `--rw` path lands on the
   host owned by you (confirmed live, test 11b), and "root" capabilities apply only inside the
   container's own namespaces. What differs is purely the *identity as seen from inside*.
-  `scripts/podman-run.sh` sidesteps it for the harness config by pointing
-  `CLAUDE_CONFIG_DIR`/`OPENCODE_CONFIG` at the per-job copy (same path inside and out); only
-  opencode's data dirs are mounted to `/root/...` (where the in-container user looks) rather
-  than `$HOME/...`. If you want the identity to match too, use `--keep-id` (next gotcha) — it
+  `scripts/podman-run.sh` sidesteps it for Claude Code's config by pointing
+  `CLAUDE_CONFIG_DIR` at the per-job copy (same path inside and out); opencode's per-job
+  config copy and its data dirs are mounted to `/root/...` (where the in-container user looks)
+  rather than `$HOME/...`. If you want the identity to match too, use `--keep-id` (next gotcha) — it
   isn't the default only because of the subuid/subgid range width it needs.
 - **`--keep-id`**: run as your real uid/gid instead of root (`--userns=keep-id --user
   "$(id -u):$(id -g)"`). **What this actually changes: the process identity *inside* the
@@ -699,10 +699,10 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
   --claude        Per-job CLAUDE_CONFIG_DIR seeded with copies of your Claude Code config;
                   only the credentials file is shared with ~/.claude (see "Authenticating
                   Claude Code" above)
-  --opencode      Per-job copy of ~/.config/opencode, used through OPENCODE_CONFIG and
-                  OPENCODE_CONFIG_DIR (XDG_CONFIG_HOME, and so git/gh config, untouched), plus RW
-                  binds on opencode's three data dirs (~/.local/share, ~/.local/state,
-                  ~/.cache)
+  --opencode      Per-job copy of ~/.config/opencode, mounted at opencode's default config
+                  location inside the sandbox (XDG_CONFIG_HOME, and so git/gh config,
+                  untouched), plus RW binds on opencode's three data dirs (~/.local/share,
+                  ~/.local/state, ~/.cache)
   --gpu           (podman-run.sh only) --device nvidia.com/gpu=all (an error in an LSF job
                   without a GPU)
   --keep-id       (podman-run.sh only) run as your real uid/gid instead of root -- see
