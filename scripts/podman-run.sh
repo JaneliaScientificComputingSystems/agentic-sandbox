@@ -23,7 +23,12 @@
 #   --gpu           Add --device nvidia.com/gpu=all. Under LSF the job's device cgroup lets
 #                    only the allocated GPUs through. In an LSF job with no GPU allocated
 #                    (CUDA_VISIBLE_DEVICES empty) this is an error.
-#   --scratch       Shorthand for --rw /scratch/$USER
+#   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing). Deliberately
+#                    NOT all of /scratch/$USER: this wrapper's own per-job state (podman store,
+#                    runtime dir, config copies, proxy socket) lives under
+#                    /scratch/$USER/.agentic-sandbox/<job>/, and podman cannot mask a path
+#                    under an ancestor -v bind, so binding the whole tree would expose every
+#                    concurrent job's state to this one. Never bind /scratch/$USER itself.
 #   --claude        Run Claude Code with a per-job config directory (CLAUDE_CONFIG_DIR): a
 #                    throwaway copy of ~/.claude.json, ~/.claude/settings.json,
 #                    ~/.claude/CLAUDE.md and ~/.claude/.credentials.json, deleted on exit.
@@ -86,7 +91,7 @@ while [[ $# -gt 0 ]]; do
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
-    --scratch) VOLUMES+=("-v" "/scratch/$USER:/scratch/$USER:rw"); shift ;;
+    --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -108,35 +113,52 @@ CMD=("$@")
 # as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
 # -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "identity/HOME saga" for why
 # forcing identity without remapping failed.
+# Per-job state directory: ONE place for everything this wrapper creates for a run --
+# podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/
+# (allowlist proxy socket + log). Mode 700, removed whole by cleanup(), nothing in /tmp.
+# /scratch/$USER is node-local (a Unix socket can't live on NFS) and swept by a periodic
+# cleanup cron, which makes a crashed job's leftovers a non-problem; a background keepalive
+# touches the dir hourly so a job longer than the retention window keeps its state. The tag
+# is $LSB_JOBID plus $LSB_JOBINDEX plus this shell's PID, so no two invocations can share one:
+# every element of an LSF array job shares the same $LSB_JOBID, a `brequeue`d job reuses it,
+# and a job script calling this wrapper twice is one LSB_JOBID as well. "manual" outside LSF.
+# /scratch/$USER is required here (podman's per-job store needs node-local storage anyway).
+SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
+mkdir -p "$SANDBOX_STATE_PARENT"
+chmod 700 "$SANDBOX_STATE_PARENT"
+JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
+mkdir -p "$JOB_DIR"
+chmod 700 "$JOB_DIR"
+JOB_STORAGE_DIR="$JOB_DIR/podman"
+
 SANDBOX_CFG_ROOT=""
 CLAUDE_CFG=""
-CLAUDE_CREDS_BEFORE=""
 HOST_CREDS="$HOME/.claude/.credentials.json"
-HOST_CREDS_BEFORE=""
 new_cfg_root() {
   [[ -n "$SANDBOX_CFG_ROOT" ]] && return 0
-  local base="/scratch/$USER"
-  [[ -d "$base" && -w "$base" ]] || base="${TMPDIR:-/tmp}"
-  SANDBOX_CFG_ROOT="$(mktemp -d "$base/podman-sandbox-cfg.XXXXXX")"
-  # The copies are read by the container's user (root-in-userns maps to you on the host, but
-  # --keep-id does not remap) -- keep the tree readable by the invoking account only.
-  chmod 700 "$SANDBOX_CFG_ROOT"
+  SANDBOX_CFG_ROOT="$JOB_DIR/cfg"
+  mkdir -p "$SANDBOX_CFG_ROOT"
 }
-# Contents of a file, or a marker that cannot be a file's contents when it does not exist.
-file_state() { if [[ -f "$1" ]]; then cat "$1"; else printf '\001absent'; fi; }
 if [[ $WANT_CLAUDE -eq 1 ]]; then
   new_cfg_root
   CLAUDE_CFG="$SANDBOX_CFG_ROOT/claude"
   mkdir -p "$CLAUDE_CFG"
-  for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" \
-           "$HOST_CREDS"; do
+  for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md"; do
     [[ -f "$f" ]] && cp "$f" "$CLAUDE_CFG/$(basename "$f")"
   done
-  # Snapshots so cleanup() can tell whether the container changed the credentials (token
-  # refresh / login) and whether anything else changed the HOST copy while this job ran.
-  [[ -f "$CLAUDE_CFG/.credentials.json" ]] && CLAUDE_CREDS_BEFORE="$(cat "$CLAUDE_CFG/.credentials.json")"
-  HOST_CREDS_BEFORE="$(file_state "$HOST_CREDS")"
   VOLUMES+=("-v" "$CLAUDE_CFG:$CLAUDE_CFG:rw")
+  # The credentials file is bind-mounted THROUGH to the real one, exactly as sandbox-run.sh
+  # does -- not copied in and back. No token copy ever sits on scratch, two concurrent --claude
+  # jobs see each other's refreshes immediately instead of racing a copy-back, and the file
+  # mount lands on top of the directory mount (podman orders mounts by destination depth), so
+  # Claude Code finds it at $CLAUDE_CONFIG_DIR/.credentials.json. Refresh-through-the-bind
+  # works because the CLI falls back to an in-place rewrite when its rename-over fails with
+  # EBUSY on a mountpoint (verified under bwrap with a forced refresh; same mount semantics).
+  if [[ -f "$HOST_CREDS" ]]; then
+    VOLUMES+=("-v" "$HOST_CREDS:$CLAUDE_CFG/.credentials.json:rw")
+  else
+    echo "podman-run.sh: warning: no $HOST_CREDS -- a \`claude auth login\` done inside the container will NOT persist past this run. Log in once outside first, or deliver ANTHROPIC_API_KEY into the container." >&2
+  fi
   ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CFG")
 fi
 if [[ $WANT_OPENCODE -eq 1 ]]; then
@@ -164,14 +186,10 @@ if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
 
-# Per-job storage and runtime paths, created FIRST, before any podman command below runs.
-# Keyed on $LSB_JOBID plus $LSB_JOBINDEX plus this script's own $$, so no two invocations can
-# ever share one: every element of an LSF array job shares the same $LSB_JOBID, so two
-# elements packed onto one node would otherwise share (and then mutually destroy) a storage
-# dir; a `brequeue`d job reuses its LSB_JOBID too; and a job script that calls podman-run.sh
-# twice is one LSB_JOBID as well -- $$ makes each invocation unique regardless. Falls back to
-# "manual" outside LSF. Two things live here, both ported from Janelia's Harbor fork (hpc/harbor-lsf-wrapper.sh),
-# where each was found by real packed-job failures:
+# Per-job podman storage and runtime paths ($JOB_DIR/podman, see the state-dir comment above),
+# created FIRST, before any podman command below runs. Two things live here, both ported from
+# Janelia's Harbor fork (hpc/harbor-lsf-wrapper.sh), where each was found by real packed-job
+# failures:
 #   root/ + run/   -- this job's own podman graphroot/runroot (see CONTAINERS_STORAGE_CONF
 #                     below). Sharing the static one from storage.conf is what let two
 #                     concurrent podman jobs from the same user corrupt each other's state on
@@ -188,7 +206,6 @@ fi
 # matches candidates by this path appearing in /proc/<pid>/environ -- a pause process spawned
 # by the prologue health checks before the export would carry no job-scoped path and be
 # unreapable by both the watchdog and the cleanup trap.
-JOB_STORAGE_DIR="/scratch/$USER/podman-jobs/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
 mkdir -p "$JOB_STORAGE_DIR/root" "$JOB_STORAGE_DIR/run" "$JOB_STORAGE_DIR/xdg-runtime"
 chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
 
@@ -277,13 +294,14 @@ fi
 repair_shared_store_tmpdir() {
   local db="$1/db.sql" want="$SHARED_RUNTIME_DIR/libpod/tmp"
   [[ -f "$db" ]] || return 0
-  python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
+  python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" "$SANDBOX_STATE_PARENT/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
 import sqlite3, sys
-db, want, bad_prefix = sys.argv[1:4]
+db, want = sys.argv[1:3]
+bad_prefixes = tuple(sys.argv[3:])
 try:
     c = sqlite3.connect(db, timeout=15)
     row = c.execute("select TmpDir from DBConfig").fetchone()
-    if row and row[0].startswith(bad_prefix) and row[0] != want:
+    if row and row[0].startswith(bad_prefixes) and row[0] != want:
         c.execute("update DBConfig set TmpDir = ?", (want,))
         c.commit()
         print(f"repaired shared store tmp dir: {row[0]} -> {want}")
@@ -438,6 +456,7 @@ fi
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
+KEEPALIVE_PID=""
 wait_for_proxy_socket() {
   # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
   # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
@@ -462,27 +481,10 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$PROXY_DIR" && -d "$PROXY_DIR" ]] && rm -rf "$PROXY_DIR" || true
-  # --claude: persist ONLY the credentials file, and only if the container left valid JSON
-  # behind that differs from what went in (token refresh, or a fresh `claude auth login`), and
-  # the host copy is still what it was when this job started. If another session (a second
-  # --claude job, or the user's own claude) refreshed it meanwhile, its token is the newer one;
-  # with rotating refresh tokens, overwriting it would log that session out.
-  if [[ -n "$CLAUDE_CFG" && -f "$CLAUDE_CFG/.credentials.json" ]]; then
-    if [[ "$(cat "$CLAUDE_CFG/.credentials.json")" != "$CLAUDE_CREDS_BEFORE" ]] \
-       && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) else 1)' \
-            "$CLAUDE_CFG/.credentials.json" 2>/dev/null; then
-      if [[ "$(file_state "$HOST_CREDS")" == "$HOST_CREDS_BEFORE" ]]; then
-        mkdir -p "$HOME/.claude"
-        (umask 077; cp "$CLAUDE_CFG/.credentials.json" "$HOST_CREDS.tmp.$$") \
-          && mv -f "$HOST_CREDS.tmp.$$" "$HOST_CREDS" || true
-      else
-        echo "podman-run.sh: $HOST_CREDS changed while this job ran (another session refreshed it);" \
-             "keeping that one, not this job's" >&2
-      fi
-    fi
-  fi
-  [[ -n "$SANDBOX_CFG_ROOT" && -d "$SANDBOX_CFG_ROOT" ]] && { podman unshare rm -rf "$SANDBOX_CFG_ROOT" 2>/dev/null || rm -rf "$SANDBOX_CFG_ROOT" 2>/dev/null; } || true
+  # The keepalive's current `sleep 3600` is a child of the subshell and would outlive it as an
+  # orphan -- exactly the "background helper survives normal job completion" class from
+  # ADMIN-NOTES -- so kill the children first, then the subshell.
+  [[ -n "$KEEPALIVE_PID" ]] && { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; } || true
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
@@ -518,24 +520,33 @@ cleanup() {
   # stays valid even once the directory itself no longer exists on disk.)
   kill_orphaned_catatonit_for_this_job
 
-  # Everything left (xdg-runtime, storage.conf) is owned by the invoking user directly -- no
-  # subuid mapping -- so a plain rm finishes the job without needing podman at all. Retried
+  # Everything left (xdg-runtime, storage.conf, cfg/, proxy/) is owned by the invoking user
+  # directly -- no subuid mapping -- so a plain rm of the whole per-job state dir finishes the
+  # job without needing podman at all (the credentials bind only ever existed in the
+  # container's namespace; on the host cfg/ holds an empty placeholder at most). Retried
   # with a sweep in between: confirmed live (first invocation of tests/test-podman.sh on the
   # cluster) that a single rm here can race the replacement pause process's last writes into
   # xdg-runtime/libpod/tmp (alive, alive.lck, exits/, persist/, rootless-netns/ -- all owned by
   # the invoking user, all trivially removable a minute later), leaving that subtree behind.
   for _ in $(seq 1 5); do
-    rm -rf "$JOB_STORAGE_DIR" 2>/dev/null
-    [[ -e "$JOB_STORAGE_DIR" ]] || break
+    rm -rf "$JOB_DIR" 2>/dev/null
+    [[ -e "$JOB_DIR" ]] || break
     sleep 1
     kill_orphaned_catatonit_for_this_job
   done
-  if [[ -e "$JOB_STORAGE_DIR" ]]; then
-    echo "podman-run.sh: couldn't clean up $JOB_STORAGE_DIR (still busy after 30s) -- remove later with: podman unshare rm -rf $JOB_STORAGE_DIR" >&2
+  if [[ -e "$JOB_DIR" ]]; then
+    echo "podman-run.sh: couldn't clean up $JOB_DIR (still busy after 30s) -- remove later with: podman unshare rm -rf $JOB_DIR" >&2
   fi
   true
 }
 trap cleanup EXIT
+# Keepalive against the scratch cleanup cron (see the state-dir comment near the top): hourly
+# touch of everything in the per-job dir while this wrapper is alive. $$ is the wrapper's own
+# pid even inside the subshell, so a SIGKILLed wrapper doesn't leave this loop behind.
+# stdio detached: a subshell holding the wrapper's stdout open would make any `$(...)` or pipe
+# around the wrapper wait a full hour for the sleep to end (confirmed live: it hung the tests).
+( while sleep 3600; do kill -0 $$ 2>/dev/null || exit 0; find "$JOB_DIR" -exec touch -c {} + 2>/dev/null; done ) >/dev/null 2>&1 </dev/null &
+KEEPALIVE_PID=$!
 # bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
 # how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
 # without these, a walltime kill leaks the container, the pause process, and the per-job
@@ -551,8 +562,8 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
   # socket (it is created 0755), and no one else's socket can stand in for ours. It must stay on
   # node-local storage -- a Unix socket cannot be bound on NFS.
-  PROXY_DIR="$(mktemp -d /tmp/podman-sandbox-proxy.XXXXXX)"
-  chmod 700 "$PROXY_DIR"
+  PROXY_DIR="$JOB_DIR/proxy"
+  mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
   python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &

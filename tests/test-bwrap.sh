@@ -22,6 +22,11 @@ mkdir -p "$TEST_CWD"
 cd "$TEST_CWD"
 trap 'cd /; rm -rf "$TEST_CWD"' EXIT
 
+# Snapshot of wrapper-named /tmp entries before the suite: the "no /tmp writes" check at the
+# end compares against this rather than asserting an empty /tmp, since other runs (older
+# wrapper versions, other sessions) may have left entries on a shared node.
+TMP_SANDBOX_BEFORE=$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')
+
 PASS=0
 FAIL=0
 check() {
@@ -40,7 +45,7 @@ OUT=$("$SANDBOX_RUN" -- bash -c 'echo ok')
 check "basic run" "$OUT" "ok"
 
 echo "=== 2. --scratch ==="
-OUT=$("$SANDBOX_RUN" --scratch -- bash -c "test -d /scratch/$USER && echo ok")
+OUT=$("$SANDBOX_RUN" --scratch -- bash -c "test -d /scratch/$USER/work && ! test -e /scratch/$USER/.agentic-sandbox && echo ok")
 check "--scratch mounted" "$OUT" "ok"
 
 echo "=== 3. \$HOME not exposing real content by default ==="
@@ -144,7 +149,7 @@ OUT=$("$SANDBOX_RUN" --claude -- bash -c 'echo "{\"hooks\":{}}" > "$CLAUDE_CONFI
 AFTER=$(cat "$HOME/.claude/settings.json" 2>/dev/null | md5sum)
 check "CLAUDE_CONFIG_DIR is a per-job dir" "$OUT" "isolated"
 check "host settings.json untouched" "$AFTER" "$BEFORE"
-check "per-job config dir removed on exit" "$(ls -d /scratch/$USER/sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "per-job state dir removed on exit" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 echo "=== 15. Credential masking under an explicit --rw / --ro root ==="
 PROJ="/scratch/$USER/test-bwrap-mask-root-$$"
@@ -157,6 +162,16 @@ check "--rw root: .env and .ssh masked, nested .env not (by design)" "$OUT" "0,0
 OUT=$("$SANDBOX_RUN" --ro "$PROJ" -- bash -c "wc -c < $PROJ/.env | tr -d ' '; ls $PROJ/.ssh | wc -l | tr -d ' '" | tr '\n' ',')
 check "--ro root: .env and .ssh masked" "$OUT" "0,0,"
 rm -rf "$PROJ"
+
+echo "=== 16. Sibling jobs' state dirs are never visible inside ==="
+FAKE="/scratch/$USER/.agentic-sandbox/fake-sibling-$$"
+mkdir -p "$FAKE/proxy" && echo "not-yours" > "$FAKE/proxy/proxy.log"
+OUT=$("$SANDBOX_RUN" --scratch -- bash -c 'test -e /scratch/$USER/.agentic-sandbox && echo visible || echo hidden')
+check "--scratch: state parent not mounted at all" "$OUT" "hidden"
+OUT=$("$SANDBOX_RUN" --rw "/scratch/$USER" --claude -- bash -c 'echo "$(ls -A /scratch/$USER/.agentic-sandbox | grep -c fake-sibling),$(test -f "$CLAUDE_CONFIG_DIR/.claude.json" && echo own-cfg-ok)"' 2>/dev/null)
+check "--rw /scratch/\$USER: siblings masked by tmpfs, own cfg still bound" "$OUT" "0,own-cfg-ok"
+rm -rf "$FAKE"
+check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
