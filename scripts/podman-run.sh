@@ -116,9 +116,10 @@ CMD=("$@")
 # Per-job state directory: ONE place for everything this wrapper creates for a run --
 # podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/
 # (allowlist proxy socket + log). Mode 700, removed whole by cleanup(), nothing in /tmp.
-# /scratch/$USER is node-local (a Unix socket can't live on NFS) and swept by a periodic
-# cleanup cron, which makes a crashed job's leftovers a non-problem; a background keepalive
-# touches the dir hourly so a job longer than the retention window keeps its state. The tag
+# /scratch/$USER is node-local (where a Unix socket belongs) and swept by an hourly cleanup
+# cron that is not age-based: it wipes /scratch/<user> only on nodes where the user has no
+# running LSF job, so a job's state is safe for its whole lifetime and gone within an hour
+# after (crash debris included). The tag
 # is $LSB_JOBID plus $LSB_JOBINDEX plus this shell's PID, so no two invocations can share one:
 # every element of an LSF array job shares the same $LSB_JOBID, a `brequeue`d job reuses it,
 # and a job script calling this wrapper twice is one LSB_JOBID as well. "manual" outside LSF.
@@ -456,7 +457,6 @@ fi
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
-KEEPALIVE_PID=""
 wait_for_proxy_socket() {
   # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
   # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
@@ -481,10 +481,6 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  # The keepalive's current `sleep 3600` is a child of the subshell and would outlive it as an
-  # orphan -- exactly the "background helper survives normal job completion" class from
-  # ADMIN-NOTES -- so kill the children first, then the subshell.
-  [[ -n "$KEEPALIVE_PID" ]] && { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; } || true
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
@@ -540,13 +536,6 @@ cleanup() {
   true
 }
 trap cleanup EXIT
-# Keepalive against the scratch cleanup cron (see the state-dir comment near the top): hourly
-# touch of everything in the per-job dir while this wrapper is alive. $$ is the wrapper's own
-# pid even inside the subshell, so a SIGKILLed wrapper doesn't leave this loop behind.
-# stdio detached: a subshell holding the wrapper's stdout open would make any `$(...)` or pipe
-# around the wrapper wait a full hour for the sleep to end (confirmed live: it hung the tests).
-( while sleep 3600; do kill -0 $$ 2>/dev/null || exit 0; find "$JOB_DIR" -exec touch -c {} + 2>/dev/null; done ) >/dev/null 2>&1 </dev/null &
-KEEPALIVE_PID=$!
 # bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
 # how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
 # without these, a walltime kill leaks the container, the pause process, and the per-job

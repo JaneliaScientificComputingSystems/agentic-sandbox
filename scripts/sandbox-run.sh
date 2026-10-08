@@ -64,16 +64,17 @@
 # /scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/ (mode 700): cfg/ (the
 # copies above), proxy/ (the allowlist proxy's Unix socket + log), and the empty file used to
 # mask credential files. Nothing is ever written to /tmp. /scratch/$USER is node-local, which
-# a Unix socket needs (it can't be bound on NFS), and is swept by a periodic cleanup cron,
-# which turns a crashed job's leftovers into a non-problem. Two consequences:
+# is where a Unix socket belongs, and is swept by an hourly cleanup cron, which turns a crashed
+# job's leftovers into a non-problem. Two consequences:
 #   - --scratch binds /scratch/$USER/work, not /scratch/$USER: binding the whole tree would
 #     expose every concurrent job's state dir (same uid, so permissions don't help) -- a
 #     sibling's proxy socket, which has a DIFFERENT allowlist, and its config copies. As
 #     belt and braces, if any --rw/--ro root does contain .agentic-sandbox/, an empty tmpfs
 #     is mounted over it after all other binds, and only this job's own cfg/ is bound back.
 #     Never bind /scratch/$USER itself; use --rw /scratch/$USER/<subdir> for anything else.
-#   - a background keepalive touches the state dir hourly, so a session longer than the
-#     scratch retention window doesn't lose its socket or config copies mid-run.
+#   - the hourly scratch cleanup (/misc/local/admin/lsf_clean_scratch.py) is not age-based:
+#     it wipes /scratch/<user> only on nodes where that user has NO running LSF job, so a
+#     job's state is safe for the job's whole lifetime and gone within an hour after.
 #
 # Examples:
 #   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
@@ -312,7 +313,6 @@ done
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
-KEEPALIVE_PID=""
 wait_for_proxy_socket() {
   # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
   # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
@@ -329,10 +329,6 @@ wait_for_proxy_socket() {
 }
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  # The keepalive's current `sleep 3600` is a child of the subshell and would outlive it as an
-  # orphan -- exactly the "background helper survives normal job completion" class from
-  # ADMIN-NOTES -- so kill the children first, then the subshell.
-  [[ -n "$KEEPALIVE_PID" ]] && { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; } || true
   # The per-job config copies include ~/.claude.json (account details) -- never leave them.
   # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
   # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on
@@ -341,13 +337,6 @@ cleanup() {
   true
 }
 trap cleanup EXIT
-# Keepalive against the scratch cleanup cron (see "Per-job state"): hourly touch of everything
-# in the state dir, for as long as this wrapper is alive. $$ is the wrapper's own pid even
-# inside the subshell, so a wrapper that was SIGKILLed doesn't leave this loop behind.
-# stdio detached: a subshell holding the wrapper's stdout open would make any `$(...)` or pipe
-# around the wrapper wait a full hour for the sleep to end (confirmed live: it hung the tests).
-( while sleep 3600; do kill -0 $$ 2>/dev/null || exit 0; find "$JOB_DIR" -exec touch -c {} + 2>/dev/null; done ) >/dev/null 2>&1 </dev/null &
-KEEPALIVE_PID=$!
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 

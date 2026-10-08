@@ -765,13 +765,17 @@ instead of copying it in and back: no token copy on scratch, and no copy-back ra
 concurrent jobs. It relies on the same CLI fallback (rename-over fails with `EBUSY` on a
 mountpoint → in-place rewrite) that the forced-refresh test under bwrap confirmed.
 
-A keepalive subshell touches the state dir hourly against the cleanup cron. Two bugs found
-in it before it ever reached the cluster, both worth remembering: (1) a background subshell
+An hourly keepalive touch was added here and then removed the same day after reading the
+actual cleanup script (`/misc/local/admin/lsf_clean_scratch.py`, run hourly from
+`lsf_clean_scratch.sh`): it is not age-based. It deletes everything under `/scratch/<user>`
+on nodes where that user has no LSF job (per `bjobs -m <host>`), skipping system accounts and
+users owning a running systemd service, and aborts if `bjobs` fails. So a running job's state
+is never touched regardless of age, crash debris disappears within an hour of the user's last
+job leaving the node, and the shared image cache only persists between back-to-back jobs on a
+node. Two lessons from the short-lived keepalive are still worth keeping: a background subshell
 that inherits the wrapper's stdout keeps any `$(...)`/pipe around the wrapper open until its
-`sleep` ends — the podman smoke test hung for the full hour; stdio must be detached
-(`>/dev/null 2>&1 </dev/null`). (2) killing the subshell orphans its current `sleep 3600`;
-cleanup kills the children first (`pkill -P`). The loop also checks the wrapper is still
-alive each tick so a `SIGKILL`ed wrapper doesn't leave it behind.
+`sleep` ends (it hung the podman smoke test for a full hour; stdio must be detached), and
+killing such a subshell orphans its current `sleep` (kill the children first).
 
 ### Cleanup bugs in both wrappers, found and fixed the same way
 

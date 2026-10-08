@@ -110,10 +110,11 @@ all, and you'll never get as far as the storage setup below.
 **⚠️ One-time setup, before your first podman job ever** — point podman's image/container
 storage at `/scratch/$USER` instead of its default (`~/.local/share/containers`, i.e. your
 **home directory**). This way you're using transient scratch storage local to the compute
-node, which is cleaned up regularly — instead of filling your home directory with GB-sized
-images. The trade-off: that cache is local to whichever node a job actually lands on and gets
-swept periodically, so a job on a different node, or one that lands after a cleanup sweep,
-pays a fresh multi-GB pull rather than reusing an earlier one. If you'd rather keep a durable,
+node, which is cleaned up hourly — instead of filling your home directory with GB-sized
+images. The trade-off: that cache is local to whichever node a job actually lands on, and the
+hourly cleanup wipes `/scratch/$USER` on any node where you have no running job, so a job on a
+different node, or one that starts more than an hour after your previous job on the same node
+ended, pays a fresh multi-GB pull rather than reusing an earlier one. If you'd rather keep a durable,
 cross-node image cache instead, point `graphroot`/`runroot` below at a path under `$HOME`.
 
 This step is genuinely one-time-ever, even though `/scratch` itself is node-local, not
@@ -772,9 +773,12 @@ Two things follow from that:
   with an empty tmpfs if some `--rw`/`--ro` root does contain it; podman can't (same reason
   as the credential-masking caveat), so **never bind `/scratch/$USER` itself** — use
   `--rw /scratch/$USER/<subdir>` for anything outside `work/`.
-- **A background keepalive touches the state dir hourly** while the wrapper runs, so a
-  session longer than the scratch retention window doesn't lose its socket or config copies
-  mid-run. It dies with the wrapper (and with a `SIGKILL`ed wrapper, at its next tick).
+- **The hourly scratch cleanup is not age-based.** `/misc/local/admin/lsf_clean_scratch.py`
+  wipes `/scratch/<user>` only on nodes where that user has *no running LSF job*, so a job's
+  state is safe for the job's whole lifetime however long it runs, and gone within an hour
+  after your last job on that node ends. The same applies to the shared image cache under
+  `/scratch/$USER`: it only survives between back-to-back jobs on one node. A node you use
+  via plain `ssh` with no LSF job gets your scratch wiped hourly.
 
 **Adding mounts beyond the built-in shorthands** — `--ro PATH`/`--rw PATH` are the general
 escape hatch, repeatable, for anything the shorthands don't cover:
@@ -805,10 +809,10 @@ need a writable path nested inside something already read-only.
   sandbox (Mode B) are fine; packing several opencode jobs per user is not, until opencode's
   state can be pointed somewhere per-job. Claude Code has no equivalent problem.
 - **`--keep-id` needs a widened subuid/subgid range** (see the GPU section).
-- **Per-job state depends on `/scratch/$USER`** and on the hourly keepalive for runs longer
-  than the scratch retention window (see [Per-job state](#per-job-state-on-scratch)).
-  `sandbox-run.sh` falls back to `$TMPDIR` only on a machine with no writable `/scratch/$USER`
-  (i.e. not a cluster node) and says so; `podman-run.sh` requires it.
+- **Per-job state depends on `/scratch/$USER`** (see [Per-job
+  state](#per-job-state-on-scratch)). `sandbox-run.sh` falls back to `$TMPDIR` only on a
+  machine with no writable `/scratch/$USER` (i.e. not a cluster node) and says so;
+  `podman-run.sh` requires it.
 - **Not tested**: fresh `claude auth login` combined with the loop/one-shot modes (only tested
   interactively so far), GPU-queue behavior beyond what's documented, any host/queue beyond
   the ones checked so far.
