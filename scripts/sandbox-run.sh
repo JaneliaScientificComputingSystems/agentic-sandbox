@@ -227,9 +227,13 @@ done
 # above (including --claude/--opencode/--scratch and anything the caller
 # added), so this is the unconditional final word, not something a generic
 # --rw/--ro on one of these exact paths can quietly re-expose. Checked under
-# both $PWD (always bound above) and $HOME (only actually visible in the
-# sandbox if the caller explicitly --rw/--ro'd it or it happens to equal
-# $PWD) -- deduplicated so a path checked under both isn't masked twice.
+# every root that ends up visible: $PWD (always bound above), $HOME (only
+# actually visible if the caller --rw/--ro'd it or it equals $PWD), and every
+# --ro/--rw/--scratch/shorthand path -- a project dir passed with --rw can
+# carry a .env or .git-credentials just as easily as $PWD can (and it used to
+# be the one place these were NOT masked). Deduplicated so a path reached via
+# two roots isn't masked twice. Only DIRECT children of a root are checked;
+# a .env two levels down inside a project is not, by design.
 # Read access alone is enough for a prompt-injected agent to exfiltrate or
 # display secret contents (Anthropic's own explicit warning in their
 # secure-deployment guide). Directories get an empty tmpfs overlay (agent
@@ -247,7 +251,8 @@ SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker)
 SENSITIVE_HOME_FILES=(.git-credentials .npmrc .pypirc .netrc .env .env.local)
 declare -A MASK_ROOTS_SEEN=()
 MASK_ROOTS=()
-for root in "$PWD" "$HOME"; do
+for root in "$PWD" "$HOME" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
+  [[ -n "$root" && -d "$root" ]] || continue
   [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
   MASK_ROOTS_SEEN[$root]=1
   MASK_ROOTS+=("$root")

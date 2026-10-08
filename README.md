@@ -296,12 +296,15 @@ that — read-only exposure is still enough for a prompt-injected agent to exfil
 display secret contents. If a task genuinely needs files elsewhere in your home directory,
 add an explicit `--ro`/`--rw` for that specific path — never for `$HOME` as a whole.
 
-**Known credential paths are always masked, wherever they'd appear** — under `$PWD` (always
-bound), and under `$HOME` too if you explicitly `--rw`/`--ro` it. `.ssh`, `.aws`, `.azure`,
+**Known credential paths are always masked, directly under every bound root** — `$PWD`
+(always bound), `$HOME` if you explicitly `--rw`/`--ro` it, and every `--ro`/`--rw`/`--scratch`
+path you add (a project directory can carry a `.env` just as easily). `.ssh`, `.aws`, `.azure`,
 `.kube`, `.config/gcloud`, and `.docker` come back as empty directories; `.git-credentials`,
 `.npmrc`, `.pypirc`, `.netrc`, `.env`, and `.env.local` come back as empty files — the
 sandboxed process sees them exist but empty, never the real contents. This only masks paths
-that already exist for you; nothing is created. **Unlike the nesting-override rule below,
+that already exist for you; nothing is created. Only *direct children* of a root are checked:
+a `.env` two levels down inside a project is not masked — scope the bind to the subdirectory
+you need, or don't keep secrets in files the agent's project tree can reach. **Unlike the nesting-override rule below,
 this masking is unconditional** — a generic `--ro`/`--rw` on one of these exact paths does
 not bring the real content back; it's applied last, deliberately not something a task can
 accidentally (or a prompt-injected agent deliberately) unmask by requesting one of these
@@ -724,7 +727,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
 **What's mounted by default, unconditionally**: the toolchain (`/usr /bin /lib64 /lib /sbin
 /etc`), read-only, and **`$PWD`** (wherever you invoke `sandbox-run.sh` from), **read-write**
 — `$HOME` is NOT bound unless you explicitly `--rw`/`--ro` it. Known credential paths are
-masked wherever they'd appear — under `$PWD`, and under `$HOME` too if you do bind it —
+masked directly under every bound root — `$PWD`, `$HOME` if you bind it, and every
+`--ro`/`--rw`/`--scratch` path —
 `.ssh`, `.aws`, `.git-credentials`, `.npmrc`, etc. come back empty, unconditionally, even if
 you explicitly `--rw`/`--ro` one of those exact paths; see [Filesystem
 access](#filesystem-access) for the full list. SSSD's NSS socket if present (so

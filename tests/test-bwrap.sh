@@ -146,5 +146,17 @@ check "CLAUDE_CONFIG_DIR is a per-job dir" "$OUT" "isolated"
 check "host settings.json untouched" "$AFTER" "$BEFORE"
 check "per-job config dir removed on exit" "$(ls -d /scratch/$USER/sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
 
+echo "=== 15. Credential masking under an explicit --rw / --ro root ==="
+PROJ="/scratch/$USER/test-bwrap-mask-root-$$"
+mkdir -p "$PROJ/.ssh" "$PROJ/sub"
+echo "fake-key" > "$PROJ/.ssh/id_ed25519"
+echo "SECRET=1" > "$PROJ/.env"
+echo "SECRET=2" > "$PROJ/sub/.env"
+OUT=$("$SANDBOX_RUN" --rw "$PROJ" -- bash -c "wc -c < $PROJ/.env | tr -d ' '; ls $PROJ/.ssh | wc -l | tr -d ' '; wc -c < $PROJ/sub/.env | tr -d ' '" | tr '\n' ',')
+check "--rw root: .env and .ssh masked, nested .env not (by design)" "$OUT" "0,0,9,"
+OUT=$("$SANDBOX_RUN" --ro "$PROJ" -- bash -c "wc -c < $PROJ/.env | tr -d ' '; ls $PROJ/.ssh | wc -l | tr -d ' '" | tr '\n' ',')
+check "--ro root: .env and .ssh masked" "$OUT" "0,0,"
+rm -rf "$PROJ"
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
