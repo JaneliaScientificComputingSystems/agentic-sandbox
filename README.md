@@ -793,6 +793,10 @@ need a writable path nested inside something already read-only.
 - **bwrap cannot do GPU passthrough** — use `podman-run.sh` instead; see above.
 - **No SOCKS5 support** in `allowlist_proxy.py` — fine for Claude Code (doesn't support SOCKS
   anyway), a gap if some other tool needs arbitrary TCP.
+- **`podman-run.sh --allow` needs `bash` and `python3` inside the image** — the in-container
+  relay is a Python script started from a bash wrapper. Both shipped images have them; a
+  minimal image (e.g. `alpine`) fails with `executable file /bin/bash not found`. Without
+  `--allow` any image works.
 - **One opencode sandbox per account at a time.** opencode keeps its state in a sqlite
   database (`~/.local/share/opencode/opencode.db`) that lives on NFS and is bind-mounted, not
   copied, into every sandbox that uses `--opencode`. Two sandboxes using it concurrently — two
