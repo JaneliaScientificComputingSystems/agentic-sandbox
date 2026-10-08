@@ -12,11 +12,18 @@ Supports:
   - Plain HTTP via the Host header (checks that against the allowlist, then
     forwards the raw request bytes as-is).
 
+Allowlist entries are hostnames (case-insensitive; a leading dot is ignored,
+so ".example.com" and "example.com" mean the same thing). An entry matches
+itself and any subdomain: "example.com" allows "api.example.com" but not
+"evil-example.com" or "example.com.evil.net". Any port is allowed on an
+allowed host.
+
 Usage:
     python3 allowlist_proxy.py /run/agent-proxy.sock litellm.int.janelia.org example.com
 """
 import asyncio
 import sys
+from typing import Optional, Tuple
 
 
 async def pipe(reader, writer):
@@ -33,9 +40,62 @@ async def pipe(reader, writer):
         writer.close()
 
 
-def host_allowed(host: str, allowlist: list[str]) -> bool:
-    host = host.lower()
-    return any(host == a or host.endswith("." + a) for a in allowlist)
+def normalize_host(host: str) -> str:
+    """Lower-case, strip whitespace and a trailing dot (FQDN form)."""
+    return host.strip().lower().rstrip(".")
+
+
+def normalize_allowlist(entries: list) -> list:
+    """Allowlist as given on the command line -> canonical form used by host_allowed()."""
+    out = []
+    for entry in entries:
+        entry = normalize_host(entry).lstrip(".")
+        if entry and entry not in out:
+            out.append(entry)
+    return out
+
+
+def host_allowed(host: str, allowlist: list) -> bool:
+    host = normalize_host(host)
+    return bool(host) and any(host == a or host.endswith("." + a) for a in allowlist)
+
+
+def split_hostport(hostport: str, default_port: int) -> Optional[Tuple[str, int]]:
+    """Split "host", "host:port" or "[v6]:port" into (host, port).
+
+    Returns None when the port is not a valid TCP port. The host is returned
+    without brackets, ready for asyncio.open_connection().
+    """
+    hostport = hostport.strip()
+    if hostport.startswith("["):
+        host, sep, rest = hostport[1:].partition("]")
+        if not sep:
+            return None
+        portstr = rest[1:] if rest.startswith(":") else ""
+        if rest and not rest.startswith(":"):
+            return None
+    else:
+        host, sep, portstr = hostport.rpartition(":")
+        if not sep:
+            host, portstr = hostport, ""
+        elif ":" in host:
+            # Bare IPv6 literal with no brackets: ambiguous, refuse.
+            return None
+    if not host:
+        return None
+    try:
+        port = int(portstr) if portstr else default_port
+    except ValueError:
+        return None
+    if not 0 < port < 65536:
+        return None
+    return host, port
+
+
+async def _reject(writer, status: bytes):
+    writer.write(b"HTTP/1.1 " + status + b"\r\nConnection: close\r\n\r\n")
+    await writer.drain()
+    writer.close()
 
 
 async def handle_client(reader, writer, allowlist):
@@ -53,28 +113,27 @@ async def handle_client(reader, writer, allowlist):
         method, target = parts[0], parts[1]
 
         if method == "CONNECT":
-            host = target.split(":")[0]
             headers = b""
             while True:
                 line = await reader.readline()
                 headers += line
                 if line in (b"\r\n", b""):
                     break
-            if not host_allowed(host, allowlist):
-                print(f"[allowlist_proxy] DENY CONNECT {host} (peer={peer})", file=sys.stderr)
-                writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                await writer.drain()
-                writer.close()
+            hp = split_hostport(target, 443)
+            if hp is None:
+                print(f"[allowlist_proxy] BAD CONNECT target {target!r} (peer={peer})", file=sys.stderr)
+                await _reject(writer, b"400 Bad Request")
                 return
-            print(f"[allowlist_proxy] ALLOW CONNECT {host} (peer={peer})", file=sys.stderr)
-            hostname, _, portstr = target.partition(":")
-            port = int(portstr) if portstr else 443
+            host, port = hp
+            if not host_allowed(host, allowlist):
+                print(f"[allowlist_proxy] DENY CONNECT {host}:{port} (peer={peer})", file=sys.stderr)
+                await _reject(writer, b"403 Forbidden")
+                return
+            print(f"[allowlist_proxy] ALLOW CONNECT {host}:{port} (peer={peer})", file=sys.stderr)
             try:
-                remote_reader, remote_writer = await asyncio.open_connection(hostname, port)
-            except OSError as e:
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await writer.drain()
-                writer.close()
+                remote_reader, remote_writer = await asyncio.open_connection(host, port)
+            except OSError:
+                await _reject(writer, b"502 Bad Gateway")
                 return
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
@@ -85,27 +144,29 @@ async def handle_client(reader, writer, allowlist):
         else:
             # Plain HTTP: read headers, find Host:, forward raw bytes.
             headers = first_line
-            host = None
+            hostport = None
             while True:
                 line = await reader.readline()
                 headers += line
                 if line.lower().startswith(b"host:"):
-                    host = line.split(b":", 1)[1].strip().decode("latin1").split(":")[0]
+                    hostport = line.split(b":", 1)[1].strip().decode("latin1")
                 if line in (b"\r\n", b""):
                     break
-            if not host or not host_allowed(host, allowlist):
-                print(f"[allowlist_proxy] DENY HTTP {host} (peer={peer})", file=sys.stderr)
-                writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                await writer.drain()
-                writer.close()
+            hp = split_hostport(hostport, 80) if hostport else None
+            if hp is None:
+                print(f"[allowlist_proxy] DENY HTTP bad/missing Host {hostport!r} (peer={peer})", file=sys.stderr)
+                await _reject(writer, b"400 Bad Request")
                 return
-            print(f"[allowlist_proxy] ALLOW HTTP {host} (peer={peer})", file=sys.stderr)
+            host, port = hp
+            if not host_allowed(host, allowlist):
+                print(f"[allowlist_proxy] DENY HTTP {host}:{port} (peer={peer})", file=sys.stderr)
+                await _reject(writer, b"403 Forbidden")
+                return
+            print(f"[allowlist_proxy] ALLOW HTTP {host}:{port} (peer={peer})", file=sys.stderr)
             try:
-                remote_reader, remote_writer = await asyncio.open_connection(host, 80)
+                remote_reader, remote_writer = await asyncio.open_connection(host, port)
             except OSError:
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                await writer.drain()
-                writer.close()
+                await _reject(writer, b"502 Bad Gateway")
                 return
             remote_writer.write(headers)
             await remote_writer.drain()
@@ -124,7 +185,10 @@ async def main():
         print(f"usage: {sys.argv[0]} <unix-socket-path> <allowed-host> [more-allowed-hosts...]", file=sys.stderr)
         sys.exit(1)
     sock_path = sys.argv[1]
-    allowlist = sys.argv[2:]
+    allowlist = normalize_allowlist(sys.argv[2:])
+    if not allowlist:
+        print("[allowlist_proxy] refusing to start: allowlist is empty after normalization", file=sys.stderr)
+        sys.exit(1)
     print(f"[allowlist_proxy] listening on {sock_path}, allowlist={allowlist}", file=sys.stderr)
 
     server = await asyncio.start_unix_server(

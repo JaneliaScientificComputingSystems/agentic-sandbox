@@ -118,5 +118,33 @@ OUT=$(cd "$WORKDIR" && "$SANDBOX_RUN" -- bash -c 'wc -c < .git-credentials' | tr
 check "credential masking under \$PWD" "$OUT" "0"
 rm -rf "$WORKDIR"
 
+echo "=== 10. Host environment is not inherited (only --env passes through) ==="
+OUT=$(SANDBOX_TEST_SECRET=leaked SANDBOX_TEST_WANTED=ok "$SANDBOX_RUN" --env SANDBOX_TEST_WANTED -- \
+  bash -c 'echo "${SANDBOX_TEST_SECRET:-unset},${SANDBOX_TEST_WANTED:-unset},${TMPDIR:-unset}"')
+check "env cleared except --env" "$OUT" "unset,ok,/tmp"
+
+echo "=== 11. /tmp is a private, writable tmpfs ==="
+OUT=$("$SANDBOX_RUN" -- bash -c 'f=$(mktemp) && echo hi > "$f" && cat "$f" && ls /tmp | wc -l | tr -d " "')
+check "mktemp works and /tmp is otherwise empty" "$OUT" "hi
+1"
+
+echo "=== 12. Own session when stdin is not a terminal (Mode A/B) ==="
+# Under --unshare-pid the session leader is bwrap's own init (pid 1), so a new session shows
+# as sid 1; an inherited (outer) session is not visible in the namespace and shows as sid 0.
+OUT=$("$SANDBOX_RUN" -- bash -c 'test "$(ps -o sid= -p $$ | tr -d " ")" != "0" && echo own-session || echo shared' </dev/null)
+check "--new-session applied without a tty" "$OUT" "own-session"
+
+echo "=== 13. Script directory is read-only inside even when run from the checkout ==="
+OUT=$(cd "$SCRIPT_DIR/../scripts" && ./sandbox-run.sh -- bash -c 'touch sandbox-run.sh 2>/dev/null && echo writable || echo read-only' 2>/dev/null)
+check "scripts/ shadowed read-only" "$OUT" "read-only"
+
+echo "=== 14. --claude: config edits inside do not reach ~/.claude ==="
+BEFORE=$(cat "$HOME/.claude/settings.json" 2>/dev/null | md5sum)
+OUT=$("$SANDBOX_RUN" --claude -- bash -c 'echo "{\"hooks\":{}}" > "$CLAUDE_CONFIG_DIR/settings.json" && echo "{}" > "$CLAUDE_CONFIG_DIR/.claude.json" && test "$CLAUDE_CONFIG_DIR" != "$HOME/.claude" && echo isolated' 2>/dev/null)
+AFTER=$(cat "$HOME/.claude/settings.json" 2>/dev/null | md5sum)
+check "CLAUDE_CONFIG_DIR is a per-job dir" "$OUT" "isolated"
+check "host settings.json untouched" "$AFTER" "$BEFORE"
+check "per-job config dir removed on exit" "$(ls -d /scratch/$USER/sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

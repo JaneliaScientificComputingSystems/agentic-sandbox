@@ -20,10 +20,22 @@
 #   --allow HOST    Allowed egress domain (repeatable). Starts the allowlist proxy + relay
 #                   automatically, same mechanism as sandbox-run.sh. Omit for --network=none
 #                   with no exceptions.
-#   --gpu           Add --device nvidia.com/gpu=all
+#   --gpu           Add --device nvidia.com/gpu=all. Under LSF the job's device cgroup lets
+#                    only the allocated GPUs through. In an LSF job with no GPU allocated
+#                    (CUDA_VISIBLE_DEVICES empty) this is an error.
 #   --scratch       Shorthand for --rw /scratch/$USER
-#   --claude        Shorthand for RW binds on ~/.claude and ~/.claude.json
-#   --opencode      Shorthand for RW binds on opencode's XDG dirs
+#   --claude        Run Claude Code with a per-job config directory (CLAUDE_CONFIG_DIR): a
+#                    throwaway copy of ~/.claude.json, ~/.claude/settings.json,
+#                    ~/.claude/CLAUDE.md and ~/.claude/.credentials.json, deleted on exit.
+#                    Only .credentials.json is copied back afterwards (if it is still valid
+#                    JSON, and the host copy was not changed by something else meanwhile), so
+#                    an existing login is reused and token refreshes / a fresh
+#                    `claude auth login` persist -- but edits to settings (hooks) or MCP
+#                    server entries made inside the container die with it. Those are shell
+#                    commands Claude Code would otherwise run unsandboxed in your next session.
+#   --opencode      Same idea: a throwaway copy of ~/.config/opencode (OPENCODE_CONFIG /
+#                    OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is left alone) plus
+#                    RW binds on its data dirs (~/.local/share, ~/.local/state, ~/.cache)
 #   --keep-id       Run as your real uid/gid instead of root (--userns=keep-id --user
 #                    "$(id -u):$(id -g)"), so files land on the real filesystem with your
 #                    normal ownership instead of root-mapped-through-the-user-namespace.
@@ -61,8 +73,10 @@ GPU=0
 KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
+ENV_ARGS=()
 
-usage() { sed -n '2,46p' "${BASH_SOURCE[0]}"; }
+# Everything from line 2 down to the blank comment line before `set -euo pipefail`.
+usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,32 +96,66 @@ while [[ $# -gt 0 ]]; do
 done
 CMD=("$@")
 
-# --claude/--opencode's mount DESTINATION depends on --keep-id, decided here (after the full
-# parse) rather than at the point each flag was seen, so flag order never matters. Default
-# (no --keep-id): container runs as root, $HOME=/root -- mount to /root/... where root
-# actually looks; forcing identity via --user without namespace remapping hit real
-# subuid/subgid and file-permission problems (see ADMIN-NOTES.md's "identity/HOME saga").
-# --keep-id: container runs as your real uid, $HOME=$HOME (set via -e HOME below) -- mount to
-# the real $HOME/... path instead, same convention as bwrap.
+# --claude/--opencode: the harness CONFIG is copied into a per-job directory that is mounted
+# at the same path inside the container and pointed to via CLAUDE_CONFIG_DIR /
+# OPENCODE_CONFIG(_DIR), so its location no longer depends on --keep-id (root's $HOME=/root vs your
+# real $HOME). Only opencode's DATA dirs still need the HOME-dependent destination: default
+# (no --keep-id) the container runs as root and looks under /root/...; --keep-id runs as your
+# real uid with $HOME=$HOME (set via -e HOME below), same convention as bwrap. See
+# ADMIN-NOTES.md's "identity/HOME saga" for why forcing identity without remapping failed.
+SANDBOX_CFG_ROOT=""
+CLAUDE_CFG=""
+CLAUDE_CREDS_BEFORE=""
+HOST_CREDS="$HOME/.claude/.credentials.json"
+HOST_CREDS_BEFORE=""
+new_cfg_root() {
+  [[ -n "$SANDBOX_CFG_ROOT" ]] && return 0
+  local base="/scratch/$USER"
+  [[ -d "$base" && -w "$base" ]] || base="${TMPDIR:-/tmp}"
+  SANDBOX_CFG_ROOT="$(mktemp -d "$base/podman-sandbox-cfg.XXXXXX")"
+  # The copies are read by the container's user (root-in-userns maps to you on the host, but
+  # --keep-id does not remap) -- keep the tree readable by the invoking account only.
+  chmod 700 "$SANDBOX_CFG_ROOT"
+}
+# Contents of a file, or a marker that cannot be a file's contents when it does not exist.
+file_state() { if [[ -f "$1" ]]; then cat "$1"; else printf '\001absent'; fi; }
 if [[ $WANT_CLAUDE -eq 1 ]]; then
-  if [[ $KEEP_ID -eq 1 ]]; then
-    VOLUMES+=("-v" "$HOME/.claude:$HOME/.claude:rw" "-v" "$HOME/.claude.json:$HOME/.claude.json:rw")
-  else
-    VOLUMES+=("-v" "$HOME/.claude:/root/.claude:rw" "-v" "$HOME/.claude.json:/root/.claude.json:rw")
-  fi
+  new_cfg_root
+  CLAUDE_CFG="$SANDBOX_CFG_ROOT/claude"
+  mkdir -p "$CLAUDE_CFG"
+  for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" \
+           "$HOST_CREDS"; do
+    [[ -f "$f" ]] && cp "$f" "$CLAUDE_CFG/$(basename "$f")"
+  done
+  # Snapshots so cleanup() can tell whether the container changed the credentials (token
+  # refresh / login) and whether anything else changed the HOST copy while this job ran.
+  [[ -f "$CLAUDE_CFG/.credentials.json" ]] && CLAUDE_CREDS_BEFORE="$(cat "$CLAUDE_CFG/.credentials.json")"
+  HOST_CREDS_BEFORE="$(file_state "$HOST_CREDS")"
+  VOLUMES+=("-v" "$CLAUDE_CFG:$CLAUDE_CFG:rw")
+  ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CFG")
 fi
 if [[ $WANT_OPENCODE -eq 1 ]]; then
-  if [[ $KEEP_ID -eq 1 ]]; then
-    VOLUMES+=("-v" "$HOME/.config/opencode:$HOME/.config/opencode:rw"
-              "-v" "$HOME/.local/share/opencode:$HOME/.local/share/opencode:rw"
-              "-v" "$HOME/.local/state/opencode:$HOME/.local/state/opencode:rw"
-              "-v" "$HOME/.cache/opencode:$HOME/.cache/opencode:rw")
-  else
-    VOLUMES+=("-v" "$HOME/.config/opencode:/root/.config/opencode:rw"
-              "-v" "$HOME/.local/share/opencode:/root/.local/share/opencode:rw"
-              "-v" "$HOME/.local/state/opencode:/root/.local/state/opencode:rw"
-              "-v" "$HOME/.cache/opencode:/root/.cache/opencode:rw")
-  fi
+  new_cfg_root
+  OPENCODE_XDG_CONFIG="$SANDBOX_CFG_ROOT/opencode-xdg-config"
+  mkdir -p "$OPENCODE_XDG_CONFIG"
+  [[ -d "$HOME/.config/opencode" ]] && cp -R "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
+  mkdir -p "$OPENCODE_XDG_CONFIG/opencode"
+  OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
+  [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
+    && OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc"
+  VOLUMES+=("-v" "$OPENCODE_XDG_CONFIG:$OPENCODE_XDG_CONFIG:rw")
+  # opencode's own variables, not XDG_CONFIG_HOME, which would redirect every tool's ~/.config.
+  ENV_ARGS+=(-e "OPENCODE_CONFIG=$OPENCODE_CONFIG_FILE" -e "OPENCODE_CONFIG_DIR=$OPENCODE_XDG_CONFIG/opencode")
+  # Data dirs stay bound to the real ones; created first so podman never has to auto-create a
+  # missing source (it would, silently, as a root-owned directory).
+  for d in .local/share/opencode .local/state/opencode .cache/opencode; do
+    mkdir -p "$HOME/$d"
+    if [[ $KEEP_ID -eq 1 ]]; then
+      VOLUMES+=("-v" "$HOME/$d:$HOME/$d:rw")
+    else
+      VOLUMES+=("-v" "$HOME/$d:/root/$d:rw")
+    fi
+  done
 fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
@@ -348,11 +396,25 @@ if [[ -t 0 ]]; then
 else
   PODMAN_ARGS+=(-i)
 fi
-[[ $GPU -eq 1 ]] && PODMAN_ARGS+=(--device nvidia.com/gpu=all)
+if [[ $GPU -eq 1 ]]; then
+  # All CDI devices, not one per entry in CUDA_VISIBLE_DEVICES: LSF renumbers the allocated GPUs
+  # from 0 inside the job (a 1-GPU job always sees CUDA_VISIBLE_DEVICES=0), while CDI names
+  # count the whole node, and a node's CDI spec can map names to the wrong /dev/nvidiaN when it
+  # was generated before device minors changed. Either way a per-GPU --device can hand the
+  # container a node the job may not open. The job's device cgroup lets only the allocated GPUs
+  # through, so `all` inside it is exactly the job's GPUs.
+  if [[ -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
+         "the job has no GPU allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
+    exit 1
+  fi
+  PODMAN_ARGS+=(--device nvidia.com/gpu=all)
+fi
 if [[ $KEEP_ID -eq 1 ]]; then
   PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
 fi
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
+[[ ${#ENV_ARGS[@]} -gt 0 ]] && PODMAN_ARGS+=("${ENV_ARGS[@]}")
 
 # NOTE: an earlier version of this script attempted to mask credential paths under $HOME
 # here, the same way sandbox-run.sh does (an empty --tmpfs over .ssh/.aws/etc., appended
@@ -371,7 +433,22 @@ fi
 # (never --rw/--ro a path containing $HOME -- scope to the specific subdirectory you need).
 
 PROXY_PID=""
+PROXY_DIR=""
 PROXY_SOCK=""
+wait_for_proxy_socket() {
+  # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
+  # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
+  for _ in $(seq 1 100); do
+    [[ -S "$1" ]] && return 0
+    if ! kill -0 "$2" 2>/dev/null; then
+      echo "podman-run.sh: allowlist proxy exited before creating $1 -- see $PROXY_DIR/proxy.log" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  echo "podman-run.sh: allowlist proxy did not create $1 within 10s -- see $PROXY_DIR/proxy.log" >&2
+  return 1
+}
 cleanup() {
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
   # code, silently overriding whatever `exit N` triggered it -- bash only honors the original
@@ -382,7 +459,27 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$PROXY_SOCK" && -e "$PROXY_SOCK" ]] && rm -f "$PROXY_SOCK" || true
+  [[ -n "$PROXY_DIR" && -d "$PROXY_DIR" ]] && rm -rf "$PROXY_DIR" || true
+  # --claude: persist ONLY the credentials file, and only if the container left valid JSON
+  # behind that differs from what went in (token refresh, or a fresh `claude auth login`), and
+  # the host copy is still what it was when this job started. If another session (a second
+  # --claude job, or the user's own claude) refreshed it meanwhile, its token is the newer one;
+  # with rotating refresh tokens, overwriting it would log that session out.
+  if [[ -n "$CLAUDE_CFG" && -f "$CLAUDE_CFG/.credentials.json" ]]; then
+    if [[ "$(cat "$CLAUDE_CFG/.credentials.json")" != "$CLAUDE_CREDS_BEFORE" ]] \
+       && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) else 1)' \
+            "$CLAUDE_CFG/.credentials.json" 2>/dev/null; then
+      if [[ "$(file_state "$HOST_CREDS")" == "$HOST_CREDS_BEFORE" ]]; then
+        mkdir -p "$HOME/.claude"
+        (umask 077; cp "$CLAUDE_CFG/.credentials.json" "$HOST_CREDS.tmp.$$") \
+          && mv -f "$HOST_CREDS.tmp.$$" "$HOST_CREDS" || true
+      else
+        echo "podman-run.sh: $HOST_CREDS changed while this job ran (another session refreshed it);" \
+             "keeping that one, not this job's" >&2
+      fi
+    fi
+  fi
+  [[ -n "$SANDBOX_CFG_ROOT" && -d "$SANDBOX_CFG_ROOT" ]] && { podman unshare rm -rf "$SANDBOX_CFG_ROOT" 2>/dev/null || rm -rf "$SANDBOX_CFG_ROOT" 2>/dev/null; } || true
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
@@ -448,11 +545,17 @@ trap 'exit 141' USR2
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
-  PROXY_SOCK="$(mktemp -u /tmp/podman-sandbox-proxy.XXXXXX.sock)"
+  # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
+  # socket (it is created 0755), and no one else's socket can stand in for ours. It must stay on
+  # node-local storage -- a Unix socket cannot be bound on NFS.
+  PROXY_DIR="$(mktemp -d /tmp/podman-sandbox-proxy.XXXXXX)"
+  chmod 700 "$PROXY_DIR"
+  PROXY_SOCK="$PROXY_DIR/proxy.sock"
   python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
-    > "${PROXY_SOCK}.log" 2>&1 &
+    > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
-  sleep 1
+  # Bounded, fail-closed wait, as in sandbox-run.sh (a fixed sleep raced the interpreter start).
+  wait_for_proxy_socket "$PROXY_SOCK" "$PROXY_PID" || exit 1
   PODMAN_ARGS+=(
     -v "$SCRIPT_DIR/relay.py:/opt/relay.py:ro"
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
@@ -461,6 +564,8 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
     sleep 1
     export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"'
+    export HTTP_PROXY=http://127.0.0.1:'"$RELAY_PORT"' HTTPS_PROXY=http://127.0.0.1:'"$RELAY_PORT"'
+    export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
