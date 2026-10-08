@@ -16,7 +16,8 @@
 #                         Omit entirely for a fully network-less sandbox.
 #   --env NAME            Pass host environment variable NAME into the sandbox (repeatable).
 #                         The host environment is NOT inherited by default -- see below.
-#   --scratch             Shorthand for --rw /scratch/$USER
+#   --scratch             Shorthand for --rw /scratch/$USER/work (created if missing).
+#                         Deliberately NOT all of /scratch/$USER -- see "Per-job state" below.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
 #                          copy of ~/.claude.json, ~/.claude/settings.json and
 #                          ~/.claude/CLAUDE.md, with only ~/.claude/.credentials.json bound
@@ -54,10 +55,25 @@
 # server entries are shell commands Claude Code runs -- unsandboxed, as you -- in your next
 # session (and settings hot-reload into an already-running one); opencode.json accepts
 # plugins/MCP the same way. So those files are never bound read-write. Each run gets a fresh
-# directory under /scratch/$USER seeded with COPIES, which is deleted on exit; edits made
-# inside die with the job. The one file that is shared is the credentials file, so an existing
-# login is reused and token refreshes persist. Not carried in: ~/.claude/plugins, skills,
-# projects/ history -- pass --ro/--rw explicitly if a task needs them.
+# cfg/ directory inside its per-job state dir (below) seeded with COPIES, deleted on exit;
+# edits made inside die with the job. The one file that is shared is the credentials file, so
+# an existing login is reused and token refreshes persist. Not carried in: ~/.claude/plugins,
+# skills, projects/ history -- pass --ro/--rw explicitly if a task needs them.
+#
+# Per-job state: everything this wrapper creates for one run lives in ONE directory,
+# /scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/ (mode 700): cfg/ (the
+# copies above), proxy/ (the allowlist proxy's Unix socket + log), and the empty file used to
+# mask credential files. Nothing is ever written to /tmp. /scratch/$USER is node-local, which
+# a Unix socket needs (it can't be bound on NFS), and is swept by a periodic cleanup cron,
+# which turns a crashed job's leftovers into a non-problem. Two consequences:
+#   - --scratch binds /scratch/$USER/work, not /scratch/$USER: binding the whole tree would
+#     expose every concurrent job's state dir (same uid, so permissions don't help) -- a
+#     sibling's proxy socket, which has a DIFFERENT allowlist, and its config copies. As
+#     belt and braces, if any --rw/--ro root does contain .agentic-sandbox/, an empty tmpfs
+#     is mounted over it after all other binds, and only this job's own cfg/ is bound back.
+#     Never bind /scratch/$USER itself; use --rw /scratch/$USER/<subdir> for anything else.
+#   - a background keepalive touches the state dir hourly, so a session longer than the
+#     scratch retention window doesn't lose its socket or config copies mid-run.
 #
 # Examples:
 #   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
@@ -77,7 +93,8 @@ ALLOW_HOSTS=()
 PASS_ENV=()
 WANT_CLAUDE=0
 WANT_OPENCODE=0
-LATE_BINDS=()     # binds that must come after every --rw (nested file binds over a per-job dir)
+CFG_BINDS=()      # the per-job cfg/ dirs: bound after the sibling-state tmpfs (see "Per-job state")
+LATE_BINDS=()     # binds that must come after CFG_BINDS (nested file binds over a per-job dir)
 EXTRA_SETENV=()
 SANDBOX_CFG_ROOT=""
 
@@ -90,7 +107,7 @@ while [[ $# -gt 0 ]]; do
     --rw) RW_BINDS+=("$2"); shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --env) PASS_ENV+=("$2"); shift 2 ;;
-    --scratch) mkdir -p "/scratch/$USER"; RW_BINDS+=("/scratch/$USER"); shift ;;
+    --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("/scratch/$USER/work"); shift ;;
     --claude)
       WANT_CLAUDE=1
       # The CLI's own install location, not just its credential/session state -- without
@@ -120,13 +137,23 @@ if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
 
-# Per-job config directories for --claude/--opencode (see "Config isolation" in the header).
-# Created here, before the bwrap argument list, and removed by cleanup() on exit.
+# Per-job state directory (see "Per-job state" in the header). Created here, before the bwrap
+# argument list, and removed whole by cleanup() on exit. The tag matches podman-run.sh's.
+SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
+if ! mkdir -p "$SANDBOX_STATE_PARENT" 2>/dev/null; then
+  # Not a cluster node (no writable /scratch/$USER). Only then fall back to $TMPDIR.
+  SANDBOX_STATE_PARENT="${TMPDIR:-/tmp}/agentic-sandbox-$(id -u)"
+  echo "sandbox-run.sh: note: /scratch/$USER is not writable here; per-job state goes to $SANDBOX_STATE_PARENT instead" >&2
+  mkdir -p "$SANDBOX_STATE_PARENT"
+fi
+chmod 700 "$SANDBOX_STATE_PARENT"
+JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
+mkdir -p "$JOB_DIR"
+chmod 700 "$JOB_DIR"
 new_cfg_root() {
   [[ -n "$SANDBOX_CFG_ROOT" ]] && return 0
-  local base="/scratch/$USER"
-  [[ -d "$base" && -w "$base" ]] || base="${TMPDIR:-/tmp}"
-  SANDBOX_CFG_ROOT="$(mktemp -d "$base/sandbox-cfg.XXXXXX")"
+  SANDBOX_CFG_ROOT="$JOB_DIR/cfg"
+  mkdir -p "$SANDBOX_CFG_ROOT"
 }
 if [[ $WANT_CLAUDE -eq 1 ]]; then
   new_cfg_root
@@ -135,7 +162,7 @@ if [[ $WANT_CLAUDE -eq 1 ]]; then
   for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md"; do
     [[ -f "$f" ]] && cp "$f" "$CLAUDE_CFG/$(basename "$f")"
   done
-  RW_BINDS+=("$CLAUDE_CFG")
+  CFG_BINDS+=(--bind "$CLAUDE_CFG" "$CLAUDE_CFG")
   if [[ -f "$HOME/.claude/.credentials.json" ]]; then
     # Bound AFTER the directory bind (LATE_BINDS), so the real file shows through the copy dir.
     LATE_BINDS+=(--bind "$HOME/.claude/.credentials.json" "$CLAUDE_CFG/.credentials.json")
@@ -153,7 +180,7 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
   [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
     && OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc"
-  RW_BINDS+=("$OPENCODE_XDG_CONFIG")
+  CFG_BINDS+=(--bind "$OPENCODE_XDG_CONFIG" "$OPENCODE_XDG_CONFIG")
   # Data dirs (auth.json, sessions, cache) stay bound to the real ones; created if missing so
   # bwrap has a source path on a fresh account.
   for d in .local/share/opencode .local/state/opencode .cache/opencode; do
@@ -206,7 +233,6 @@ for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--ro-bind "$p" "$p
 for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--ro-bind-try "$p" "$p"); done
 for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--bind "$p" "$p"); done
 for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--bind-try "$p" "$p"); done
-[[ ${#LATE_BINDS[@]} -gt 0 ]] && BWRAP_ARGS+=("${LATE_BINDS[@]}")
 
 # This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
 # the sandbox). If the directory they live in falls inside a read-write bind -- which is the
@@ -264,15 +290,29 @@ for root in "${MASK_ROOTS[@]}"; do
   done
   for f in "${SENSITIVE_HOME_FILES[@]}"; do
     if [[ -f "$root/$f" ]]; then
-      [[ -z "$EMPTY_MASK_FILE" ]] && EMPTY_MASK_FILE="$(mktemp /tmp/sandbox-empty.XXXXXX)"
+      [[ -z "$EMPTY_MASK_FILE" ]] && { EMPTY_MASK_FILE="$JOB_DIR/empty"; : > "$EMPTY_MASK_FILE"; }
       BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$root/$f")
     fi
   done
 done
 
+# Hide every OTHER job's state dir if a bound root happens to contain the state parent (someone
+# passed --rw /scratch/$USER despite the header), then bind this job's own cfg/ dirs back on top
+# -- later mounts win, so the order here is the whole point. See "Per-job state" in the header.
+for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
+  [[ -n "$root" ]] || continue
+  if [[ "$SANDBOX_STATE_PARENT" == "$root" || "$SANDBOX_STATE_PARENT" == "$root/"* ]]; then
+    BWRAP_ARGS+=(--tmpfs "$SANDBOX_STATE_PARENT")
+    break
+  fi
+done
+[[ ${#CFG_BINDS[@]} -gt 0 ]] && BWRAP_ARGS+=("${CFG_BINDS[@]}")
+[[ ${#LATE_BINDS[@]} -gt 0 ]] && BWRAP_ARGS+=("${LATE_BINDS[@]}")
+
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
+KEEPALIVE_PID=""
 wait_for_proxy_socket() {
   # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
   # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
@@ -289,13 +329,25 @@ wait_for_proxy_socket() {
 }
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$PROXY_DIR" && -d "$PROXY_DIR" ]] && rm -rf "$PROXY_DIR"
-  [[ -n "$EMPTY_MASK_FILE" && -e "$EMPTY_MASK_FILE" ]] && rm -f "$EMPTY_MASK_FILE"
+  # The keepalive's current `sleep 3600` is a child of the subshell and would outlive it as an
+  # orphan -- exactly the "background helper survives normal job completion" class from
+  # ADMIN-NOTES -- so kill the children first, then the subshell.
+  [[ -n "$KEEPALIVE_PID" ]] && { pkill -P "$KEEPALIVE_PID" 2>/dev/null; kill "$KEEPALIVE_PID" 2>/dev/null; } || true
   # The per-job config copies include ~/.claude.json (account details) -- never leave them.
-  [[ -n "$SANDBOX_CFG_ROOT" && -d "$SANDBOX_CFG_ROOT" ]] && rm -rf "$SANDBOX_CFG_ROOT"
+  # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
+  # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on
+  # the host side -- bwrap's mount only ever existed in the sandbox's namespace.
+  [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]] && rm -rf "$JOB_DIR"
   true
 }
 trap cleanup EXIT
+# Keepalive against the scratch cleanup cron (see "Per-job state"): hourly touch of everything
+# in the state dir, for as long as this wrapper is alive. $$ is the wrapper's own pid even
+# inside the subshell, so a wrapper that was SIGKILLed doesn't leave this loop behind.
+# stdio detached: a subshell holding the wrapper's stdout open would make any `$(...)` or pipe
+# around the wrapper wait a full hour for the sleep to end (confirmed live: it hung the tests).
+( while sleep 3600; do kill -0 $$ 2>/dev/null || exit 0; find "$JOB_DIR" -exec touch -c {} + 2>/dev/null; done ) >/dev/null 2>&1 </dev/null &
+KEEPALIVE_PID=$!
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
@@ -303,8 +355,8 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
   # socket (it is created 0755), and no one else's socket can stand in for ours. It must stay on
   # node-local storage -- a Unix socket cannot be bound on NFS.
-  PROXY_DIR="$(mktemp -d /tmp/sandbox-proxy.XXXXXX)"
-  chmod 700 "$PROXY_DIR"
+  PROXY_DIR="$JOB_DIR/proxy"
+  mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
   python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &

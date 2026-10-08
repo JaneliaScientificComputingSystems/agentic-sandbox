@@ -408,13 +408,12 @@ the job is submitted, changes.
 
 Claude Code keeps OAuth credentials, settings and session state under `~/.claude/` and
 `~/.claude.json`, and `CLAUDE_CONFIG_DIR` relocates all of it. `--claude` uses that: each run
-gets a fresh directory under `/scratch/$USER` holding **copies** of `~/.claude.json`,
+gets a fresh `cfg/claude/` directory inside its per-job state dir (see [Per-job
+state](#per-job-state-on-scratch)) holding **copies** of `~/.claude.json`,
 `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with only `~/.claude/.credentials.json`
-shared with the real file (bound through under bwrap; copied in and, if still valid JSON,
-copied back afterwards under podman). The directory is deleted when the run ends. Under
-podman the copy-back is skipped if the real file changed while the job ran — another
-`--claude` job, or your own `claude`, refreshed the token meanwhile, and with rotating refresh
-tokens that newer one is the one to keep.
+bound through to the real file — under both wrappers, so no token copy ever sits on disk and
+two concurrent `--claude` jobs see each other's refreshes immediately. The directory is
+deleted when the run ends.
 
 Why copies and not a read-write bind of `~/.claude`: `settings.json` hooks and
 `~/.claude.json` MCP server entries are shell commands Claude Code runs as you, unsandboxed,
@@ -432,11 +431,10 @@ sandbox-run.sh --scratch --claude \
 **Option 1 — reuse an existing login (simplest).** If you're already logged in outside the
 sandbox, it just works — the credentials file is the real one, not a copy.
 
-**Option 2 — fresh `claude auth login`, done entirely inside the sandbox.** Works under
-`podman-run.sh` (the credentials file is copied back). Under `sandbox-run.sh` it needs
-`~/.claude/.credentials.json` to already exist on the host, because a file can only be bound
-through if it exists — log in once outside first, or pass `--env ANTHROPIC_API_KEY`; the
-wrapper warns when this applies. Also
+**Option 2 — fresh `claude auth login`, done entirely inside the sandbox.** Needs
+`~/.claude/.credentials.json` to already exist on the host under both wrappers, because a
+file can only be bound through if it exists — log in once outside first, or use an API key;
+the wrappers warn when this applies. Also
 was verified rigorously (logged out outside, confirmed the sandbox saw the same logged-out
 state, then logged in *purely* inside the sandbox with no reused credentials — succeeded).
 The OAuth redirect goes to `platform.claude.com`, not a localhost callback, so it goes
@@ -707,7 +705,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
                   automatically. Omit entirely for a fully network-less sandbox.
   --env NAME      (sandbox-run.sh only) copy host environment variable NAME into the
                   sandbox (repeatable). The host environment is not inherited -- see below.
-  --scratch       Shorthand for --rw /scratch/$USER
+  --scratch       Shorthand for --rw /scratch/$USER/work (created if missing) -- NOT all of
+                  /scratch/$USER; see "Per-job state" below
   --claude        Per-job CLAUDE_CONFIG_DIR seeded with copies of your Claude Code config;
                   only the credentials file is shared with ~/.claude (see "Authenticating
                   Claude Code" above)
@@ -748,11 +747,34 @@ private tmpfs (`TMPDIR` points at it), and when stdin is not a terminal — Mode
 sandbox runs in its own session (`--new-session`) so it cannot inject keystrokes into the
 submitting terminal.
 
-**Everything else is opt-in, every time** — `$HOME` (beyond `$PWD`) and `/scratch/$USER` are
-not mounted at all (not even read-only) unless you pass `--rw`/`--ro`/`--scratch`; same for
-`.claude`, opencode's dirs, and any network
+**Everything else is opt-in, every time** — `$HOME` (beyond `$PWD`) and `/scratch/$USER/work`
+are not mounted at all (not even read-only) unless you pass `--rw`/`--ro`/`--scratch`; same
+for `.claude`, opencode's dirs, and any network
 access. This is deliberate: a sandbox that silently grants write access "because that's
 usually what people want" would undermine the default-deny model.
+
+### Per-job state on scratch
+
+Everything a wrapper creates for one run lives in a single directory,
+`/scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/` (mode 700): the
+`--claude`/`--opencode` config copies, the allowlist proxy's Unix socket and log, bwrap's
+empty credential-mask file, and under podman the per-job image store and runtime dir. It is
+removed whole when the run ends. **Nothing is written to `/tmp`.** `/scratch/$USER` is used
+because it is node-local, which a Unix socket requires (it can't be bound on NFS), and because
+the periodic scratch cleanup turns a crashed job's leftovers into a non-problem rather than
+something you find in your home directory later.
+
+Two things follow from that:
+- **`--scratch` binds `/scratch/$USER/work`, not `/scratch/$USER`.** Binding the whole tree
+  would expose every *other* concurrent job's state dir to this sandbox — same uid, so file
+  permissions don't help — including a sibling's proxy socket, which has a *different*
+  allowlist, and under podman its image store. bwrap additionally masks `.agentic-sandbox/`
+  with an empty tmpfs if some `--rw`/`--ro` root does contain it; podman can't (same reason
+  as the credential-masking caveat), so **never bind `/scratch/$USER` itself** — use
+  `--rw /scratch/$USER/<subdir>` for anything outside `work/`.
+- **A background keepalive touches the state dir hourly** while the wrapper runs, so a
+  session longer than the scratch retention window doesn't lose its socket or config copies
+  mid-run. It dies with the wrapper (and with a `SIGKILL`ed wrapper, at its next tick).
 
 **Adding mounts beyond the built-in shorthands** — `--ro PATH`/`--rw PATH` are the general
 escape hatch, repeatable, for anything the shorthands don't cover:
@@ -779,6 +801,10 @@ need a writable path nested inside something already read-only.
   sandbox (Mode B) are fine; packing several opencode jobs per user is not, until opencode's
   state can be pointed somewhere per-job. Claude Code has no equivalent problem.
 - **`--keep-id` needs a widened subuid/subgid range** (see the GPU section).
+- **Per-job state depends on `/scratch/$USER`** and on the hourly keepalive for runs longer
+  than the scratch retention window (see [Per-job state](#per-job-state-on-scratch)).
+  `sandbox-run.sh` falls back to `$TMPDIR` only on a machine with no writable `/scratch/$USER`
+  (i.e. not a cluster node) and says so; `podman-run.sh` requires it.
 - **Not tested**: fresh `claude auth login` combined with the loop/one-shot modes (only tested
   interactively so far), GPU-queue behavior beyond what's documented, any host/queue beyond
   the ones checked so far.

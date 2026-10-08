@@ -741,6 +741,38 @@ with `--no-cache` so the installers fetched current CLIs: `claude --version` →
 `opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
 published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
 
+### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
+
+Policy: the wrappers must not write to `/tmp` on the nodes. Constraints that shaped the
+layout: a Unix socket cannot be bound on NFS (so the proxy socket must be node-local); the
+same uid runs every job, so permissions cannot hide one job's files from another; podman
+cannot mask a path under an ancestor `-v` bind (confirmed earlier); and `/scratch/$USER` is
+swept by a periodic cron, which is a feature for crash debris and a hazard for long runs.
+
+Result: `/scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/` holds
+`cfg/` (config copies), `proxy/` (socket + log), bwrap's `empty` mask file, and under podman
+`podman/` (graphroot, runroot, xdg-runtime, storage.conf — moved from `podman-jobs/`). Mode
+700, removed whole in cleanup. `--scratch` now binds `/scratch/$USER/work` instead of
+`/scratch/$USER`: with the whole tree bound, every sibling job's state — notably a proxy
+socket with a *different* allowlist, and podman's per-job store — was reachable from inside
+(this was already true of `podman-jobs/` before this change). bwrap additionally mounts an
+empty tmpfs over `.agentic-sandbox/` after all binds if a bound root contains it, then binds
+this job's own `cfg/` dirs back on top; podman cannot, hence the documented rule never to
+bind `/scratch/$USER` itself.
+
+podman `--claude` now bind-mounts the real `.credentials.json` through, as bwrap does,
+instead of copying it in and back: no token copy on scratch, and no copy-back race between
+concurrent jobs. It relies on the same CLI fallback (rename-over fails with `EBUSY` on a
+mountpoint → in-place rewrite) that the forced-refresh test under bwrap confirmed.
+
+A keepalive subshell touches the state dir hourly against the cleanup cron. Two bugs found
+in it before it ever reached the cluster, both worth remembering: (1) a background subshell
+that inherits the wrapper's stdout keeps any `$(...)`/pipe around the wrapper open until its
+`sleep` ends — the podman smoke test hung for the full hour; stdio must be detached
+(`>/dev/null 2>&1 </dev/null`). (2) killing the subshell orphans its current `sleep 3600`;
+cleanup kills the children first (`pkill -P`). The loop also checks the wrapper is still
+alive each tick so a `SIGKILL`ed wrapper doesn't leave it behind.
+
 ### Cleanup bugs in both wrappers, found and fixed the same way
 
 **bwrap (`sandbox-run.sh`)**: two separate leaks, both found by testing "does anything

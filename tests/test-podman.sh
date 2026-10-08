@@ -37,7 +37,7 @@ else
 fi
 
 echo "=== 3. --scratch ==="
-OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c "test -d /scratch/$USER && echo ok" 2>&1 | tail -1)
+OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c "test -d /scratch/$USER/work && ! test -e /scratch/$USER/.agentic-sandbox && echo ok" 2>&1 | tail -1)
 check "--scratch mounted" "$OUT" "ok"
 
 echo "=== 4. opencode + Kimi K3 one-shot ==="
@@ -132,6 +132,22 @@ mkdir -p "$WORKDIR" 2>/dev/null
 OUT=$(stat -c '%U' "$WORKDIR/f.txt" 2>&1)
 check "keep-id + --rw \$HOME file owner" "$OUT" "$(whoami)"
 rm -rf "$WORKDIR"
+
+echo "=== 12. Per-job state: siblings hidden, credentials bound through, nothing left ==="
+FAKE="/scratch/$USER/.agentic-sandbox/fake-sibling-$$"
+mkdir -p "$FAKE/proxy" && echo "not-yours" > "$FAKE/proxy/proxy.log"
+OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c 'test -e /scratch/$USER/.agentic-sandbox && echo visible || echo hidden' 2>&1 | tail -1)
+check "--scratch: state parent not mounted" "$OUT" "hidden"
+rm -rf "$FAKE"
+CREDS="$HOME/.claude/.credentials.json"
+if [[ -f "$CREDS" ]]; then
+  SZ=$(stat -c %s "$CREDS"); B=$(md5sum < "$CREDS")
+  OUT=$("$PODMAN_RUN" --gpu --keep-id --claude -- bash -c 'stat -c %s "$CLAUDE_CONFIG_DIR/.credentials.json"' 2>&1 | tail -1)
+  check "keep-id --claude: real credentials file bound through (same size inside)" "$OUT" "$SZ"
+  check "host credentials untouched" "$(md5sum < "$CREDS")" "$B"
+fi
+check "per-job state dirs removed on exit" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-proxy.* /tmp/podman-sandbox-cfg.* 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
