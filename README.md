@@ -617,12 +617,21 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
   `claude`/`opencode` both run. Getting `claude`/`opencode` to actually run under
   `--keep-id` also required a small image fix — `/root` is `0700` by default, which blocks a
   non-root process from traversing into it at all, and both CLIs are installed there by the
-  native installers; the **lite** image opens read+traverse on `/root`
+  native installers; both images open read+traverse on `/root`
   and the two install trees specifically (`chmod o+rx /root && chmod -R o+rX /root/.local
-  /root/.opencode`), not a blanket loosening of `/root`. **`Dockerfile.pytorch` / the
-  published `agentic-sandbox-gpu` image does not have this fix yet**, so `--keep-id` with
-  `--claude`/`--opencode` fails there with `Permission denied`; use the default identity on
-  that image for now.
+  /root/.opencode`), not a blanket loosening of `/root`. (The pytorch image gained this on
+  2026-10-08; an `agentic-sandbox-gpu` pulled before then fails `--keep-id` with
+  `Permission denied` — `podman-run.sh` re-pulls on every run, so just run it again.)
+- **`CUDA_VISIBLE_DEVICES` is always `0` inside an LSF GPU job**, whichever physical GPU the
+  job actually holds — LSF renumbers the allocated GPUs from 0, while CDI device names
+  (`nvidia.com/gpu=<n>`) count the whole node. So never translate that variable into
+  per-GPU `--device` flags: a 1-GPU job holding `/dev/nvidia4` would ask for the node's GPU 0.
+  `--gpu` uses `nvidia.com/gpu=all` on purpose, and that is safe on a shared node because
+  LSF's device cgroup already fences the job to its allocation — confirmed live: a 1-GPU job
+  on an 8-GPU node saw exactly one GPU inside the container, and `nvidia-smi -i 1` on the host
+  reported "No devices were found". Inside the container the job's GPUs are numbered from 0
+  again. Don't pass `CUDA_VISIBLE_DEVICES` in yourself; if you request `--gpu` in a job that
+  has no GPU allocated, the wrapper exits with an error instead of attaching every GPU.
 - **No credential masking, unlike `sandbox-run.sh`** — **never `--rw`/`--ro` a path that is or
   contains your real `$HOME`.** `sandbox-run.sh` masks `.ssh`/`.aws`/`.git-credentials`/etc.
   even when `$HOME` is bound (see [Filesystem access](#filesystem-access)); `podman-run.sh`
@@ -765,8 +774,7 @@ need a writable path nested inside something already read-only.
   `Failed to execute statement` or a LiteLLM `UnknownError`. Sequential loops inside one
   sandbox (Mode B) are fine; packing several opencode jobs per user is not, until opencode's
   state can be pointed somewhere per-job. Claude Code has no equivalent problem.
-- **`--keep-id` needs a widened subuid/subgid range** (see the GPU section) and, on the
-  `agentic-sandbox-gpu`/`Dockerfile.pytorch` image, an image fix not yet applied.
+- **`--keep-id` needs a widened subuid/subgid range** (see the GPU section).
 - **Not tested**: fresh `claude auth login` combined with the loop/one-shot modes (only tested
   interactively so far), GPU-queue behavior beyond what's documented, any host/queue beyond
   the ones checked so far.

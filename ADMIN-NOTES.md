@@ -733,6 +733,14 @@ changing a container package's visibility — confirmed live: `PATCH
 /orgs/.../packages/container/...` 404s even though `GET` on the identical path succeeds).
 `podman-run.sh`'s default `--image` now points here instead of `agentic-sandbox-gpu`.
 
+**Rebuilt 2026-10-08** (`agentic-sandbox-gpu:latest`, digest `sha256:3a88ffe0…`): added the
+same `chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode` the lite image has had
+since 2026-09-10, so `--keep-id` can run both CLIs on this image too (previously
+`Permission denied`: `/root` is 0700 and the `/usr/local/bin` symlinks point into it). Built
+with `--no-cache` so the installers fetched current CLIs: `claude --version` → `2.1.294`,
+`opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
+published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
+
 ### Cleanup bugs in both wrappers, found and fixed the same way
 
 **bwrap (`sandbox-run.sh`)**: two separate leaks, both found by testing "does anything
