@@ -504,7 +504,8 @@ override into the wrapper the same way, since it's podman's own global config lo
 something the wrapper's invocation can override per-call.
 
 **Fixed**: `podman-run.sh` now gives every invocation its own graphroot/runroot under
-`/scratch/$USER/podman-jobs/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>` (`manual-<pid>` outside LSF),
+`/scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/podman` (`manual-<pid>`
+outside LSF; it was `podman-jobs/<job>` until the 2026-10-08 state-dir layout),
 written to a per-job `storage.conf` and handed to podman via `CONTAINERS_STORAGE_CONF`
 (originally `--root`/`--runroot` flags on `podman run`; switched to the environment variable so
 every podman call the script makes — including the `podman rm`/`podman unshare` in cleanup —

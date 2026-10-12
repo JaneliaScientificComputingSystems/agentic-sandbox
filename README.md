@@ -200,8 +200,10 @@ Same wrapper, same sandboxing — just run a shell instead of `claude`/`opencode
 command. `whoami` will say `root` and `$HOME` will be `/root`, with your `--scratch` mount and
 opencode's data dirs (if any) already in place at `/root/...` — but that "root" is your own uid
 in disguise (rootless podman maps container uid 0 to you), with exactly your permissions on
-every mount; see the identity/HOME gotcha below. The per-job `--claude`/`--opencode` config
-copies are at the same `/scratch/$USER/...` path inside and out.
+every mount; see the identity/HOME gotcha below. The per-job `--claude` config copy is at
+the same `/scratch/$USER/.agentic-sandbox/...` path inside and out (`CLAUDE_CONFIG_DIR` points
+at it); the per-job opencode config copy is mounted at opencode's default location,
+`/root/.config/opencode` here, `$HOME/.config/opencode` under `--keep-id`.
 
 **Same, but as your real identity instead of root** — add `--keep-id` (requires a
 `/etc/subuid`/`/etc/subgid` range wider than your real GID; see the `--keep-id` gotcha below
@@ -210,8 +212,8 @@ if it fails):
 "$SANDBOX"/podman-run.sh --gpu --keep-id --claude \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- /bin/bash
 ```
-`whoami` now reports your real account, opencode's data dirs mount at your real
-`$HOME/...` instead of `/root/...`, and `claude`/`opencode` invoked from inside this shell
+`whoami` now reports your real account, opencode's config copy and data dirs mount at your
+real `$HOME/...` instead of `/root/...`, and `claude`/`opencode` invoked from inside this shell
 work normally. **Don't forget `--allow`** — without it, `claude`/`opencode` will hang
 retrying with no useful error ("Request timed out... Retrying") since the sandbox has
 `--network=none` with zero exceptions by default; this is the single most common thing that
@@ -488,9 +490,9 @@ sandbox, it just works — the credentials file is the real one, not a copy.
 **Option 2 — fresh `claude auth login`, done entirely inside the sandbox.** Needs
 `~/.claude/.credentials.json` to already exist on the host under both wrappers, because a
 file can only be bound through if it exists — log in once outside first, or use an API key;
-the wrappers warn when this applies. Also
-was verified rigorously (logged out outside, confirmed the sandbox saw the same logged-out
-state, then logged in *purely* inside the sandbox with no reused credentials — succeeded).
+the wrappers warn when this applies. The flow itself was verified rigorously (logged out
+outside, confirmed the sandbox saw the same logged-out state, then logged in *purely* inside
+the sandbox with no reused credentials — succeeded).
 The OAuth redirect goes to `platform.claude.com`, not a localhost callback, so it goes
 straight to a manual "paste code here" prompt — open the URL in your own browser (outside the
 sandbox; it doesn't need the proxy at all) and paste the code back into the sandboxed
@@ -506,7 +508,8 @@ session — the key takes precedence. Neither wrapper passes your environment th
 `sandbox-run.sh --env ANTHROPIC_API_KEY ...` passes the value you exported, and nothing else;
 `podman-run.sh` does **not** forward host env vars into the container at all, so get the key
 in another way — e.g. a `chmod 600` file
-under `/scratch/$USER` and `-- bash -c 'export ANTHROPIC_API_KEY=$(cat /scratch/$USER/key); claude ...'`
+under `/scratch/$USER/work` (what `--scratch` binds) and
+`-- bash -c 'export ANTHROPIC_API_KEY=$(cat /scratch/$USER/work/key); claude ...'`
 with `--scratch`. Never put the key on the `bsub` command line: LSF stores that verbatim in
 `bjobs -l`/`bhist -l`.
 
@@ -542,8 +545,10 @@ vars. Nothing to `source` before running it.
 }
 ```
 opencode's own state lives under four XDG dirs (`~/.config/opencode`,
-`~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode`) — the `--opencode`
-shorthand in `sandbox-run.sh` binds all four read-write for you.
+`~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode`). The `--opencode`
+shorthand gives the sandbox a per-job **copy** of `~/.config/opencode` (its `opencode.json`
+accepts plugins and MCP servers, i.e. commands opencode would run as you outside the sandbox —
+edits made inside die with the job) and binds the three data dirs read-write.
 
 **⚠️ For an interactive session, always pass `-m litellm/kimi-k3` explicitly — don't just run
 bare `opencode`.** Without it, opencode defaults to its own hosted free model ("OpenCode
@@ -708,10 +713,9 @@ language runtime), that's when `--image`/your own Dockerfile comes in.
 ```
 `scripts/podman-run.sh` mirrors `sandbox-run.sh`'s flags (`--ro`/`--rw` → `-v ...:ro`/`-v
 ...:rw`, `--allow` → the identical proxy/relay mechanism, `--scratch`/`--claude`/`--opencode`
-shorthands) plus `--gpu` → `--device nvidia.com/gpu=all`. Inside an LSF job that is only the
-job's own GPUs: the job's device cgroup refuses the others. It is not one `--device` per entry
-in `$CUDA_VISIBLE_DEVICES` on purpose: LSF numbers a job's GPUs from 0, CDI numbers the whole
-node, and a node's CDI spec can be stale.
+shorthands) plus `--gpu` → `--device nvidia.com/gpu=all`, which inside an LSF job means only
+the job's own GPUs — see the `CUDA_VISIBLE_DEVICES` gotcha above for why `all` is right and
+per-index attach is wrong.
 
 **Sandboxing podman itself needs no host firewall access** — same namespace primitives as
 bwrap underneath: `-v host:container:ro/rw` for filesystem (default-deny by construction —
@@ -734,13 +738,16 @@ egress (bind-mount the proxy's socket in with `-v`, run the relay inside).
   (`user.max_user_namespaces` > 0) — some HPC sites disable this for security hardening.
   Check `cat /proc/sys/user/max_user_namespaces` on any new host/queue before assuming bwrap
   works there.
-- **Never run actual work directly on a login node** — hop to a real compute node first via
-  `bsub -Is` or `ssh <compute-node>`; `/scratch/$USER` doesn't even exist on login nodes.
+- **Never run actual work directly on a login node** — get a real compute node first via
+  `bsub -Is`; `/scratch/$USER` doesn't even exist on login nodes. Don't `ssh` to a compute
+  node instead: with no LSF job of yours on it, the hourly cleanup wipes your `/scratch/$USER`
+  there (see [Per-job state](#per-job-state-on-scratch)).
 - **⚠️ `bkill` reaping ≠ normal job completion reaping.** A background helper process (e.g.
   a proxy started with plain `&`) can survive well past its job showing
   `Successfully completed` — normal exit doesn't sweep the cgroup the way `bkill` does. Never
   rely on job completion alone to clean up a background process; `sandbox-run.sh` and
-  `podman-run.sh` both handle this for you now (`trap ... EXIT` for the host-side proxy,
+  `podman-run.sh` both handle this for you now (an EXIT trap for the host-side proxy and csub
+  broker, with TERM/INT/USR2 routed through it so `bkill` and walltime kills clean up too, and
   `--unshare-pid`/podman's own PID namespace for anything backgrounded *inside* the sandbox).
   Full incident writeup in `ADMIN-NOTES.md`.
 
@@ -817,9 +824,9 @@ Everything a wrapper creates for one run lives in a single directory,
 `--claude`/`--opencode` config copies, the allowlist proxy's Unix socket and log, bwrap's
 empty credential-mask file, and under podman the per-job image store and runtime dir. It is
 removed whole when the run ends. **Nothing is written to `/tmp`.** `/scratch/$USER` is used
-because it is node-local, which a Unix socket requires (it can't be bound on NFS), and because
-the periodic scratch cleanup turns a crashed job's leftovers into a non-problem rather than
-something you find in your home directory later.
+because it is node-local, where a Unix socket belongs (binding one on NFS works on this
+cluster but is fragile), and because the hourly scratch cleanup turns a crashed job's
+leftovers into a non-problem rather than something you find in your home directory later.
 
 Two things follow from that:
 - **`--scratch` binds `/scratch/$USER/work`, not `/scratch/$USER`.** Binding the whole tree
@@ -881,8 +888,10 @@ need a writable path nested inside something already read-only.
 - **A network request hangs forever, or `claude`/`opencode` retries indefinitely with
   `Request timed out`**: you didn't `--allow` that host, and your client doesn't fail fast on
   absent network — it just keeps retrying against a sandbox that has `--network=none` with
-  zero exceptions. Check the proxy's log (`<socket-path>.log`, next to the socket in `/tmp`)
-  for `DENY` lines, or just
+  zero exceptions. When the sandbox exits, the wrapper prints a one-line summary of every
+  host the proxy denied (`allowlist proxy denied N request(s): host (count), ...`) on stderr —
+  that is the list to compare against your `--allow` flags. (The full proxy log lives in the
+  per-job state dir and is removed with it; the summary is what survives.) Or just
   double-check your `--allow` list against what the client actually needs
   (`api.anthropic.com`/`claude.ai`/`platform.claude.com` for Claude Code,
   `litellm.int.janelia.org` for opencode+Kimi K3).

@@ -36,14 +36,13 @@
 #                    under an ancestor -v bind, so binding the whole tree would expose every
 #                    concurrent job's state to this one. Never bind /scratch/$USER itself.
 #   --claude        Run Claude Code with a per-job config directory (CLAUDE_CONFIG_DIR): a
-#                    throwaway copy of ~/.claude.json, ~/.claude/settings.json,
-#                    ~/.claude/CLAUDE.md and ~/.claude/.credentials.json, deleted on exit.
-#                    Only .credentials.json is copied back afterwards (if it is still valid
-#                    JSON, and the host copy was not changed by something else meanwhile), so
-#                    an existing login is reused and token refreshes / a fresh
-#                    `claude auth login` persist -- but edits to settings (hooks) or MCP
-#                    server entries made inside the container die with it. Those are shell
-#                    commands Claude Code would otherwise run unsandboxed in your next session.
+#                    throwaway copy of ~/.claude.json, ~/.claude/settings.json and
+#                    ~/.claude/CLAUDE.md, deleted on exit, with ~/.claude/.credentials.json
+#                    bind-mounted THROUGH to the real file (exactly as sandbox-run.sh does), so
+#                    an existing login is reused and token refreshes persist -- but edits to
+#                    settings (hooks) or MCP server entries made inside the container die with
+#                    it. Those are shell commands Claude Code would otherwise run unsandboxed in
+#                    your next session.
 #   --opencode      Same idea: a throwaway copy of ~/.config/opencode, mounted at opencode's
 #                    default location inside (~/.config/opencode of the in-container user), plus
 #                    RW binds on its data dirs (~/.local/share, ~/.local/state, ~/.cache)
@@ -483,6 +482,16 @@ wait_for_socket() {
   return 1
 }
 wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }
+# The proxy log goes away with the per-job state dir, so the one thing a user needs from it --
+# which hosts were refused, i.e. what is missing from --allow -- is printed to stderr at exit.
+summarize_proxy_denials() {
+  local log="$PROXY_DIR/proxy.log" n
+  [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
+  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  [[ "${n:-0}" -gt 0 ]] || return 0
+  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  true
+}
 CSUB_PID=""
 cleanup() {
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
@@ -494,6 +503,7 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  summarize_proxy_denials
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.

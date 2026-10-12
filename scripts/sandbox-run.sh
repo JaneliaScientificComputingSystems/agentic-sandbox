@@ -349,9 +349,20 @@ wait_for_socket() {
   return 1
 }
 wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }
+# The proxy log goes away with the per-job state dir, so the one thing a user needs from it --
+# which hosts were refused, i.e. what is missing from --allow -- is printed to stderr at exit.
+summarize_proxy_denials() {
+  local log="$PROXY_DIR/proxy.log" n
+  [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
+  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  [[ "${n:-0}" -gt 0 ]] || return 0
+  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  true
+}
 CSUB_PID=""
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  summarize_proxy_denials
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -364,6 +375,13 @@ cleanup() {
   true
 }
 trap cleanup EXIT
+# bash does NOT run EXIT traps when killed by an untrapped fatal signal -- exactly how `bkill`
+# and LSF walltime kills arrive (SIGUSR2/SIGTERM before SIGKILL). Route them through the EXIT
+# trap so the proxy, the csub broker and the per-job state dir are cleaned up on those paths
+# too; bwrap itself dies with the wrapper (--die-with-parent).
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 141' USR2
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
