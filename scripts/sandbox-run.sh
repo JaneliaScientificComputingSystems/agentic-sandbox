@@ -361,8 +361,14 @@ summarize_proxy_denials() {
 }
 CSUB_PID=""
 cleanup() {
+  # $? on entry is the script's exit status (the `exit $?` after bwrap, or 130/141/143 from the
+  # signal traps). The denied-host summary is a troubleshooting hint, so it is printed only
+  # when the sandboxed command did not succeed: a clean run must not grow an extra stderr line
+  # (tests and user pipelines take `2>&1 | tail -1`), and opencode denials in a successful run
+  # (its registry.npmjs.org / models.opencode.ai pings) are the allowlist working, not news.
+  local rc=$?
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  summarize_proxy_denials
+  [[ $rc -ne 0 ]] && summarize_proxy_denials
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.

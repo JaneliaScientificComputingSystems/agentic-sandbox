@@ -888,9 +888,11 @@ need a writable path nested inside something already read-only.
 - **A network request hangs forever, or `claude`/`opencode` retries indefinitely with
   `Request timed out`**: you didn't `--allow` that host, and your client doesn't fail fast on
   absent network — it just keeps retrying against a sandbox that has `--network=none` with
-  zero exceptions. When the sandbox exits, the wrapper prints a one-line summary of every
-  host the proxy denied (`allowlist proxy denied N request(s): host (count), ...`) on stderr —
-  that is the list to compare against your `--allow` flags. (The full proxy log lives in the
+  zero exceptions. When the sandboxed command exits non-zero, the wrapper prints a one-line
+  summary of every host the proxy denied (`allowlist proxy denied N request(s): host (count),
+  ...`) on stderr — that is the list to compare against your `--allow` flags. (Successful runs
+  stay quiet: opencode, for instance, pings `registry.npmjs.org` and `models.opencode.ai` on
+  every start and is simply refused, which is the allowlist working.) (The full proxy log lives in the
   per-job state dir and is removed with it; the summary is what survives.) Or just
   double-check your `--allow` list against what the client actually needs
   (`api.anthropic.com`/`claude.ai`/`platform.claude.com` for Claude Code,

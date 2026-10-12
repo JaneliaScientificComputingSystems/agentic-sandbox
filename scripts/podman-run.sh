@@ -494,6 +494,7 @@ summarize_proxy_denials() {
 }
 CSUB_PID=""
 cleanup() {
+  local rc=$?   # the script's exit status on entry; see the denied-host summary below
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
   # code, silently overriding whatever `exit N` triggered it -- bash only honors the original
   # N if the EXIT trap itself doesn't leave a nonzero status behind. Confirmed live: an
@@ -503,7 +504,8 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  summarize_proxy_denials
+  # Only when the sandboxed command did not succeed (same reasoning as in sandbox-run.sh).
+  [[ $rc -ne 0 ]] && summarize_proxy_denials
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
