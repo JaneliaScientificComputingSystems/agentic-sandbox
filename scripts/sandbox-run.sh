@@ -388,13 +388,20 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   CSUB_PID=$!
   wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
   # CSUB_MOUNTS: what this sandbox can see, in csub's "path:mode,..." form, unless preset.
+  # csub rejects overlapping mounts, so a path nested under another listed path is dropped
+  # (the outer one carries it): $PWD inside a --rw project root is the common case.
   if [[ -z "${CSUB_MOUNTS:-}" ]]; then
-    CSUB_MOUNTS="$PWD:rw"
-    for p in "${RW_BINDS[@]:-}"; do
-      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* && "$p" != "$PWD" ]] && CSUB_MOUNTS="$CSUB_MOUNTS,$p:rw"
-    done
-    for p in "${RO_BINDS[@]:-}"; do
-      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* && "$p" != "$PWD" ]] && CSUB_MOUNTS="$CSUB_MOUNTS,$p:ro"
+    _cands=("$PWD:rw")
+    for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+    for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+    CSUB_MOUNTS=""
+    for c in "${_cands[@]}"; do
+      cp="${c%:*}"; nested=0
+      for o in "${_cands[@]}"; do
+        op="${o%:*}"
+        [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
+      done
+      [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
     done
   fi
   BWRAP_ARGS+=(

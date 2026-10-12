@@ -582,13 +582,20 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   $CSUB_BROKER --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!
   wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+  # csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   if [[ -z "${CSUB_MOUNTS:-}" ]]; then
+    _cands=()
+    for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+    for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
     CSUB_MOUNTS=""
-    for p in "${RW_PATHS[@]:-}"; do
-      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$p:rw"
-    done
-    for p in "${RO_PATHS[@]:-}"; do
-      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$p:ro"
+    for c in "${_cands[@]:-}"; do
+      [[ -n "$c" ]] || continue
+      cp="${c%:*}"; nested=0
+      for o in "${_cands[@]}"; do
+        op="${o%:*}"
+        [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
+      done
+      [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
     done
   fi
   PODMAN_ARGS+=(
