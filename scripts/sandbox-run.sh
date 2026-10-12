@@ -116,6 +116,7 @@ WANT_OPENCODE=0
 CFG_BINDS=()      # the per-job cfg/ dirs: bound after the sibling-state tmpfs (see "Per-job state")
 LATE_BINDS=()     # binds that must come after CFG_BINDS (nested file binds over a per-job dir)
 EXTRA_SETENV=()
+PATH_PREPEND=""    # --claude/--opencode bind a CLI under $HOME; put its dir on PATH (see below)
 SANDBOX_CFG_ROOT=""
 
 # Everything from line 2 down to the line before `set -euo pipefail`.
@@ -140,6 +141,7 @@ while [[ $# -gt 0 ]]; do
       # way (e.g. the VS Code extension's bundled binary symlinked into ~/.local/bin) has no
       # ~/.local/share/claude at all.
       RO_TRY_BINDS+=("$HOME/.local/bin/claude" "$HOME/.local/share/claude")
+      PATH_PREPEND+="$HOME/.local/bin:"
       shift ;;
     --opencode)
       WANT_OPENCODE=1
@@ -147,6 +149,7 @@ while [[ $# -gt 0 ]]; do
       # under ~/.opencode/bin/opencode, separate from its four XDG state dirs above.
       # Read-only, same rationale.
       RO_TRY_BINDS+=("$HOME/.opencode")
+      PATH_PREPEND+="$HOME/.opencode/bin:"
       shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -243,6 +246,10 @@ done
 for ((i = 0; i < ${#EXTRA_SETENV[@]}; i += 2)); do
   BWRAP_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
 done
+# The CLI dirs bound by --claude/--opencode are only reachable by name if PATH names them. An
+# interactive shell's PATH usually does already; one from `bsub -env none` or another scrubbed
+# environment does not, and `exec: claude: not found` was the result.
+[[ -n "$PATH_PREPEND" ]] && BWRAP_ARGS+=(--setenv PATH "$PATH_PREPEND$PATH")
 # SSSD's NSS socket -- lets whoami/id/getent resolve UID->username on
 # AD/LDAP-joined hosts. Doesn't affect actual permission enforcement (that's
 # UID-number-based at the kernel level regardless), just name resolution.
