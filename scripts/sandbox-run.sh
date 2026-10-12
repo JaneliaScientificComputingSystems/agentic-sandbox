@@ -16,6 +16,14 @@
 #                         Omit entirely for a fully network-less sandbox.
 #   --env NAME            Pass host environment variable NAME into the sandbox (repeatable).
 #                         The host environment is NOT inherited by default -- see below.
+#   --csub                Let the sandboxed agent submit LSF jobs through csub
+#                         (https://github.com/saalfeldlab/csub): starts `csub-broker --serve`
+#                         OUTSIDE the sandbox, binds its Unix socket in at /run/csub.sock, binds
+#                         the csub client in read-only, and sets CSUB_TRANSPORT/CSUB_SOCKET/
+#                         CSUB_MOUNTS inside. The agent never holds bsub; the broker applies
+#                         the user's ~/.config/csub/broker.toml policy and the child jobs run
+#                         sandboxed again via these wrappers. Needs csub-broker on PATH (or
+#                         $CSUB_BROKER_CMD). See "csub" below.
 #   --scratch             Shorthand for --rw /scratch/$USER/work (created if missing).
 #                         Deliberately NOT all of /scratch/$USER -- see "Per-job state" below.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
@@ -76,6 +84,16 @@
 #     it wipes /scratch/<user> only on nodes where that user has NO running LSF job, so a
 #     job's state is safe for the job's whole lifetime and gone within an hour after.
 #
+# csub (--csub): the same bridge as --allow, for job submission instead of HTTP egress. The
+# broker is csub's own (`csub-broker --serve <socket>`), started by this wrapper outside the
+# sandbox and killed with it; only its socket crosses the boundary. Inside: CSUB_TRANSPORT=unix,
+# CSUB_SOCKET=/run/csub.sock, PYTHONPATH pointing at the read-only bind of the csub install's
+# site-packages (so the system python3 can `import csub`), a `csub` shim on PATH, and
+# CSUB_MOUNTS listing this sandbox's mounts as csub expects them ("path:rw,path:ro") -- taken
+# from $CSUB_MOUNTS if you set it, else derived from $PWD and the --rw/--ro paths that are not
+# under $HOME or /scratch (csub refuses home, and its policy forbids scratch as a root). Which
+# of those csub then accepts is the broker policy's business, reported per request.
+#
 # Examples:
 #   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
 #     opencode run "..." --model litellm/kimi-k3
@@ -92,6 +110,7 @@ RO_TRY_BINDS=()   # like RO_BINDS, but skipped silently if the path doesn't exis
 RW_TRY_BINDS=()
 ALLOW_HOSTS=()
 PASS_ENV=()
+WANT_CSUB=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 CFG_BINDS=()      # the per-job cfg/ dirs: bound after the sibling-state tmpfs (see "Per-job state")
@@ -108,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --rw) RW_BINDS+=("$2"); shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --env) PASS_ENV+=("$2"); shift 2 ;;
+    --csub) WANT_CSUB=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("/scratch/$USER/work"); shift ;;
     --claude)
       WANT_CLAUDE=1
@@ -313,22 +333,26 @@ done
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
-wait_for_proxy_socket() {
-  # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
-  # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
+wait_for_socket() {
+  # $1 = what, $2 = socket path, $3 = pid, $4 = log. Up to 10s; returns 1 if the process exits
+  # first. The socket lives in a fresh 0700 directory of our own, so a socket there can only be
+  # ours.
   for _ in $(seq 1 100); do
-    [[ -S "$1" ]] && return 0
-    if ! kill -0 "$2" 2>/dev/null; then
-      echo "sandbox-run.sh: allowlist proxy exited before creating $1 -- see $PROXY_DIR/proxy.log" >&2
+    [[ -S "$2" ]] && return 0
+    if ! kill -0 "$3" 2>/dev/null; then
+      echo "sandbox-run.sh: $1 exited before creating $2 -- see $4" >&2
       return 1
     fi
     sleep 0.1
   done
-  echo "sandbox-run.sh: allowlist proxy did not create $1 within 10s -- see $PROXY_DIR/proxy.log" >&2
+  echo "sandbox-run.sh: $1 did not create $2 within 10s -- see $4" >&2
   return 1
 }
+wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }
+CSUB_PID=""
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  [[ -n "$CSUB_PID" ]] && kill "$CSUB_PID" 2>/dev/null || true
   # The per-job config copies include ~/.claude.json (account details) -- never leave them.
   # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
   # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on
@@ -339,6 +363,50 @@ cleanup() {
 trap cleanup EXIT
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
+
+if [[ $WANT_CSUB -eq 1 ]]; then
+  CSUB_BROKER="${CSUB_BROKER_CMD:-$(command -v csub-broker || true)}"
+  if [[ -z "$CSUB_BROKER" ]]; then
+    echo "sandbox-run.sh: --csub needs csub-broker on PATH (or CSUB_BROKER_CMD set); install csub into a venv and activate it" >&2
+    exit 1
+  fi
+  # The client for inside the sandbox: the csub install's site-packages, bound read-only, plus
+  # a shim so plain `csub` works with the sandbox's own python3 (csub is pure Python).
+  CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
+  [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
+  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
+    echo "sandbox-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
+    exit 1
+  fi
+  CSUB_DIR="$JOB_DIR/csub"
+  mkdir -p "$CSUB_DIR/bin"
+  printf '%s\n' '#!/bin/sh' 'exec python3 -m csub.cli "$@"' > "$CSUB_DIR/bin/csub"
+  chmod 700 "$CSUB_DIR/bin/csub"
+  CSUB_SOCK="$CSUB_DIR/csub.sock"
+  $CSUB_BROKER --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
+  CSUB_PID=$!
+  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+  # CSUB_MOUNTS: what this sandbox can see, in csub's "path:mode,..." form, unless preset.
+  if [[ -z "${CSUB_MOUNTS:-}" ]]; then
+    CSUB_MOUNTS="$PWD:rw"
+    for p in "${RW_BINDS[@]:-}"; do
+      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* && "$p" != "$PWD" ]] && CSUB_MOUNTS="$CSUB_MOUNTS,$p:rw"
+    done
+    for p in "${RO_BINDS[@]:-}"; do
+      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* && "$p" != "$PWD" ]] && CSUB_MOUNTS="$CSUB_MOUNTS,$p:ro"
+    done
+  fi
+  BWRAP_ARGS+=(
+    --ro-bind "$CSUB_SOCK" /run/csub.sock
+    --ro-bind "$CSUB_SITE" "$CSUB_SITE"
+    --ro-bind "$CSUB_DIR/bin" /run/csub-bin
+    --setenv CSUB_TRANSPORT unix --setenv CSUB_SOCKET /run/csub.sock
+    --setenv CSUB_MOUNTS "$CSUB_MOUNTS"
+    --setenv PYTHONPATH "$CSUB_SITE${PYTHONPATH:+:$PYTHONPATH}"
+    --setenv PATH "/run/csub-bin:${PATH}"
+  )
+fi
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the

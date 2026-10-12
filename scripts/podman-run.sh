@@ -20,6 +20,12 @@
 #   --allow HOST    Allowed egress domain (repeatable). Starts the allowlist proxy + relay
 #                   automatically, same mechanism as sandbox-run.sh. Omit for --network=none
 #                   with no exceptions.
+#   --csub          Let the sandboxed agent submit LSF jobs through csub: starts
+#                    `csub-broker --serve` OUTSIDE the container, mounts its socket at
+#                    /run/csub.sock and the csub client read-only, sets CSUB_TRANSPORT/
+#                    CSUB_SOCKET/CSUB_MOUNTS/PYTHONPATH inside. Same mechanism and caveats as
+#                    sandbox-run.sh --csub (see its header). CSUB_MOUNTS is derived from the
+#                    --rw/--ro paths not under $HOME or /scratch unless you preset it.
 #   --gpu           Add --device nvidia.com/gpu=all. Under LSF the job's device cgroup lets
 #                    only the allocated GPUs through. In an LSF job with no GPU allocated
 #                    (CUDA_VISIBLE_DEVICES empty) this is an error.
@@ -73,8 +79,11 @@ exec 3<&0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
+RO_PATHS=()
+RW_PATHS=()
 ALLOW_HOSTS=()
 GPU=0
+WANT_CSUB=0
 KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
@@ -86,10 +95,11 @@ usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) IMAGE="$2"; shift 2 ;;
-    --ro) VOLUMES+=("-v" "$2:$2:ro"); shift 2 ;;
-    --rw) VOLUMES+=("-v" "$2:$2:rw"); shift 2 ;;
+    --ro) VOLUMES+=("-v" "$2:$2:ro"); RO_PATHS+=("$2"); shift 2 ;;
+    --rw) VOLUMES+=("-v" "$2:$2:rw"); RW_PATHS+=("$2"); shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
+    --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
@@ -457,20 +467,23 @@ fi
 PROXY_PID=""
 PROXY_DIR=""
 PROXY_SOCK=""
-wait_for_proxy_socket() {
-  # $1 = socket path, $2 = proxy pid. Up to 10s; returns 1 if the proxy exits first. The socket
-  # lives in a fresh 0700 directory of our own, so a socket at this path can only be ours.
+wait_for_socket() {
+  # $1 = what, $2 = socket path, $3 = pid, $4 = log. Up to 10s; returns 1 if the process exits
+  # first. The socket lives in a fresh 0700 directory of our own, so a socket there can only be
+  # ours.
   for _ in $(seq 1 100); do
-    [[ -S "$1" ]] && return 0
-    if ! kill -0 "$2" 2>/dev/null; then
-      echo "podman-run.sh: allowlist proxy exited before creating $1 -- see $PROXY_DIR/proxy.log" >&2
+    [[ -S "$2" ]] && return 0
+    if ! kill -0 "$3" 2>/dev/null; then
+      echo "podman-run.sh: $1 exited before creating $2 -- see $4" >&2
       return 1
     fi
     sleep 0.1
   done
-  echo "podman-run.sh: allowlist proxy did not create $1 within 10s -- see $PROXY_DIR/proxy.log" >&2
+  echo "podman-run.sh: $1 did not create $2 within 10s -- see $4" >&2
   return 1
 }
+wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }
+CSUB_PID=""
 cleanup() {
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
   # code, silently overriding whatever `exit N` triggered it -- bash only honors the original
@@ -481,6 +494,7 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
+  [[ -n "$CSUB_PID" ]] && kill "$CSUB_PID" 2>/dev/null || true
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
@@ -546,6 +560,46 @@ trap 'exit 130' INT
 trap 'exit 141' USR2
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
+
+if [[ $WANT_CSUB -eq 1 ]]; then
+  CSUB_BROKER="${CSUB_BROKER_CMD:-$(command -v csub-broker || true)}"
+  if [[ -z "$CSUB_BROKER" ]]; then
+    echo "podman-run.sh: --csub needs csub-broker on PATH (or CSUB_BROKER_CMD set); install csub into a venv and activate it" >&2
+    exit 1
+  fi
+  CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
+  [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
+  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
+    echo "podman-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
+    exit 1
+  fi
+  CSUB_DIR="$JOB_DIR/csub"
+  mkdir -p "$CSUB_DIR/bin"
+  printf '%s\n' '#!/bin/sh' 'exec python3 -m csub.cli "$@"' > "$CSUB_DIR/bin/csub"
+  chmod 755 "$CSUB_DIR/bin/csub"
+  CSUB_SOCK="$CSUB_DIR/csub.sock"
+  $CSUB_BROKER --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
+  CSUB_PID=$!
+  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+  if [[ -z "${CSUB_MOUNTS:-}" ]]; then
+    CSUB_MOUNTS=""
+    for p in "${RW_PATHS[@]:-}"; do
+      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$p:rw"
+    done
+    for p in "${RO_PATHS[@]:-}"; do
+      [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$p:ro"
+    done
+  fi
+  PODMAN_ARGS+=(
+    -v "$CSUB_SOCK:/run/csub.sock:ro"
+    -v "$CSUB_SITE:$CSUB_SITE:ro"
+    -v "$CSUB_DIR/bin/csub:/usr/local/bin/csub:ro"
+    -e CSUB_TRANSPORT=unix -e CSUB_SOCKET=/run/csub.sock
+    -e "CSUB_MOUNTS=$CSUB_MOUNTS"
+    -e "PYTHONPATH=$CSUB_SITE"
+  )
+fi
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
