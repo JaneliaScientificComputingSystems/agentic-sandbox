@@ -352,7 +352,10 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 CSUB_PID=""
 cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$CSUB_PID" ]] && kill "$CSUB_PID" 2>/dev/null || true
+  # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
+  # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
+  # and anything checking for leftovers right after us would see one.
+  [[ -n "$CSUB_PID" ]] && { kill "$CSUB_PID" 2>/dev/null; wait "$CSUB_PID" 2>/dev/null; } || true
   # The per-job config copies include ~/.claude.json (account details) -- never leave them.
   # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
   # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on

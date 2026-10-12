@@ -494,7 +494,10 @@ cleanup() {
   # line below must not be the accidental last word; the explicit `true` at the end is load
   # -bearing, not decorative.
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
-  [[ -n "$CSUB_PID" ]] && kill "$CSUB_PID" 2>/dev/null || true
+  # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
+  # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
+  # and anything checking for leftovers right after us would see one.
+  [[ -n "$CSUB_PID" ]] && { kill "$CSUB_PID" 2>/dev/null; wait "$CSUB_PID" 2>/dev/null; } || true
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
