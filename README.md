@@ -230,6 +230,7 @@ works exactly the same as the bwrap examples above; just swap `sandbox-run.sh` f
 - [Cloning this repo](#cloning-this-repo)
 - [Filesystem access](#filesystem-access)
 - [Network access](#network-access)
+- [Submitting cluster jobs from inside the sandbox (`--csub`)](#submitting-cluster-jobs-from-inside-the-sandbox---csub)
 - [The three operating modes](#the-three-operating-modes)
 - [Authenticating Claude Code inside the sandbox](#authenticating-claude-code-inside-the-sandbox)
 - [Using opencode with Kimi K3 via LiteLLM](#using-opencode-with-kimi-k3-via-litellm)
@@ -383,6 +384,58 @@ exercises all of this without a cluster or bwrap.
 `HTTPS_PROXY`/`HTTP_PROXY`), so the HTTP-only proxy isn't missing anything for this repo's
 two worked examples. If some other tool needs arbitrary TCP, a SOCKS5-equivalent would need
 to be added the same way.
+
+## Submitting cluster jobs from inside the sandbox (`--csub`)
+
+A sandboxed agent must not hold `bsub`: anything it submitted would run on the cluster outside
+any sandbox. The `--csub` flag on both wrappers closes that gap using
+[csub](https://github.com/saalfeldlab/csub) (Stephan Saalfeld's job broker) and the same
+bridge `--allow` already uses for HTTP egress:
+
+```
+compute node (your interactive job)                                   another compute node
+──────────────────────────────────────────────────────────────────     ───────────────────────────
+sandbox-run.sh / podman-run.sh --csub …                                 csub's job wrapper
+  ├─ csub-broker --serve <state dir>/csub/csub.sock   (OUTSIDE)  ──bsub──▶ ├─ csub-broker --serve …
+  └─ sandbox: agent runs `csub submit …` ─unix socket─▶ broker            └─ podman-run.sh … -- your command
+                                                                              └─ `csub submit …` again, if it wants
+```
+
+- The wrapper starts `csub-broker --serve` outside the sandbox, as you, on the node you are
+  on, and kills it when the sandbox exits. Only its Unix socket crosses the boundary, bound at
+  `/run/csub.sock`.
+- Inside, `csub` and `import csub` work with the sandbox's own `python3`: the csub install's
+  `site-packages` is bound read-only and a shim is put on `PATH`. `CSUB_TRANSPORT=unix`,
+  `CSUB_SOCKET`, and `CSUB_MOUNTS` are set; `CSUB_MOUNTS` lists this sandbox's mounts in csub's
+  `path:rw,path:ro` form, taken from `$CSUB_MOUNTS` if you preset it, else derived from `$PWD`
+  and the `--rw`/`--ro` paths that are not under `$HOME` or `/scratch` (csub refuses home, and
+  its policy cannot have `/scratch` as a root). Nested paths are dropped in favour of the outer
+  one, since csub rejects overlapping mounts.
+- The broker applies **your** `~/.config/csub/broker.toml` (allowed roots, images, hosts,
+  queues, limits) and the agent only ever gets a job id or a policy error back. Child jobs run
+  through these same wrappers (`sandbox = "podman"` or `"bwrap"` in the policy), and a child
+  can submit again: csub's job wrapper starts its own per-job broker on the child's node.
+
+```bash
+# one-time: csub in a venv (its broker must be on PATH when you start the sandbox), and a policy
+python3 -m venv ~/.venvs/csub && ~/.venvs/csub/bin/pip install git+https://github.com/saalfeldlab/csub
+cp /path/to/csub/deploy/broker.janelia.toml ~/.config/csub/broker.toml   # then edit allowed_roots etc.
+
+# in an interactive job, from a directory under one of your policy's allowed roots:
+export PATH=~/.venvs/csub/bin:$PATH
+sandbox-run.sh --csub --allow litellm.int.janelia.org --opencode -- opencode -m litellm/kimi-k3
+#   ... inside, the agent can run:  csub probe / csub submit --walltime 30 -- python train.py / csub status / csub kill
+```
+
+Verified live (2026-10-12), both wrappers: `csub probe`, `csub submit --wait` whose child ran
+in its own sandboxed container on another node, `csub status`, a policy rejection (mount
+under `$HOME` → `policy_violation`), and a child that submitted a grandchild from inside its
+own sandbox. No broker, socket, or state dir left behind. Under podman the child's
+`.csub/jobs/<id>/stdout` lands in your `cwd`, exactly as under bwrap.
+
+What `--csub` does not change: it is still csub's policy that decides what may run; `--csub`
+only provides the socket and the client. On a host that is not an LSF node (`bsub` absent),
+`--csub` fails at start; csub's own `csub relay` is the tool for that case.
 
 ## The three operating modes
 
@@ -706,6 +759,9 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
                   automatically. Omit entirely for a fully network-less sandbox.
   --env NAME      (sandbox-run.sh only) copy host environment variable NAME into the
                   sandbox (repeatable). The host environment is not inherited -- see below.
+  --csub          Start a csub broker outside the sandbox and give the agent `csub` inside, so
+                  it can submit sandboxed LSF jobs under your csub policy -- see "Submitting
+                  cluster jobs from inside the sandbox" above
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing) -- NOT all of
                   /scratch/$USER; see "Per-job state" below
   --claude        Per-job CLAUDE_CONFIG_DIR seeded with copies of your Claude Code config;

@@ -173,5 +173,21 @@ check "--rw /scratch/\$USER: siblings masked by tmpfs, own cfg still bound" "$OU
 rm -rf "$FAKE"
 check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 
+echo "=== 17. --csub: sandboxed submission through a csub broker (skipped without csub-broker) ==="
+# Needs csub installed (csub-broker on PATH) and a ~/.config/csub/broker.toml whose allowed
+# roots contain $CSUB_TEST_ROOT (a directory this account can write to, NOT under $HOME or
+# /scratch). Set CSUB_TEST_ROOT to run it; otherwise it is skipped, not failed.
+if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "${CSUB_TEST_ROOT:-/nonexistent}" ]]; then
+  CW="$CSUB_TEST_ROOT/test-bwrap-csub-$$"; mkdir -p "$CW"
+  OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c 'csub submit --walltime 5 --wait --name t17 -- sh -c "echo child-ok" 2>&1 | grep -c "child-ok"; echo "mounts=$CSUB_MOUNTS"' 2>&1 | tr '\n' ' ')
+  check "--csub: child job ran and its output came back" "$OUT" "1 mounts=$CW:rw "
+  OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c 'CSUB_MOUNTS=$HOME:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo $?')
+  check "--csub: policy rejection reaches the agent (rc 3)" "$OUT" "3"
+  check "--csub: no broker left behind" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
+  rm -rf "$CW"
+else
+  echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"
+fi
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

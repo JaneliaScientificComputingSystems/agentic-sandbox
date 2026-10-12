@@ -152,5 +152,16 @@ fi
 check "per-job state dirs removed on exit" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 
+echo "=== 13. --csub: sandboxed submission from inside the container (skipped without csub-broker) ==="
+if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "${CSUB_TEST_ROOT:-/nonexistent}" ]]; then
+  CW="$CSUB_TEST_ROOT/test-podman-csub-$$"; mkdir -p "$CW"
+  OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && csub submit --walltime 5 --wait --name t13 -- sh -c 'echo child-ok' 2>&1 | grep -c child-ok" 2>&1 | tail -1)
+  check "--csub: child job ran from inside the container" "$OUT" "1"
+  check "--csub: no broker left behind" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
+  rm -rf "$CW"
+else
+  echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"
+fi
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

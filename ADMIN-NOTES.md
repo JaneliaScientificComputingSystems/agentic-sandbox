@@ -741,6 +741,42 @@ with `--no-cache` so the installers fetched current CLIs: `claude --version` →
 `opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
 published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
 
+### `--csub`: the seam to Stephan Saalfeld's csub broker (2026-10-12)
+
+csub (saalfeldlab/csub) is a policy-checked job broker: a sandboxed client sends a JSON
+request, a broker running as the user outside the sandbox validates it against
+`~/.config/csub/broker.toml` and runs `bsub` on a wrapper that launches the child through
+`podman-run.sh` or `sandbox-run.sh`. Since its PR #7 the broker only runs on LSF hosts and the
+transport from a sandbox is a Unix socket served from outside (ssh survives only as `csub
+relay` for sandboxes on non-LSF hosts). What csub did not have was a way to start that broker
+for an *interactive* sandbox; `--csub` is that: the wrapper runs `csub-broker --serve
+$JOB_DIR/csub/csub.sock` outside, waits for the socket (same bounded wait as the proxy),
+binds it at `/run/csub.sock`, binds the csub install's `site-packages` read-only and sets
+`PYTHONPATH` so the sandbox's own `python3` imports it (csub is pure Python; on 3.9 it needs
+`tomli`, which compute nodes cannot fetch from PyPI — the wheel had to be carried in by hand),
+puts a `csub` shim on `PATH` (`/run/csub-bin` under bwrap, `/usr/local/bin/csub` under
+podman), and sets `CSUB_TRANSPORT=unix`, `CSUB_SOCKET`, `CSUB_MOUNTS`.
+
+`CSUB_MOUNTS` was the one non-obvious part: csub's client needs it to describe the sandbox's
+mounts, the broker rejects anything under `$HOME`, its policy cannot list `/scratch` as a root
+(the `scratch_root` placement check), and it rejects *overlapping* mounts — the first live run
+failed exactly there, with `$PWD` listed next to the `--rw` root containing it. The derivation
+now drops nested paths in favour of the outer one; `$CSUB_MOUNTS` preset on the host wins.
+
+Verified live from a `short` job as the test account with policy `allowed_roots =
+["/groups/scicompsys/scicompsys/Goran"]`, `sandbox = "podman"`, `max_pending_per_session = 5`:
+bwrap and podman parents each submitted a child that ran in its own container on another node
+(`hostname` inside = container id; `whoami` = the real user, `keep_id = true`), `--wait` and
+`status` worked, a `CSUB_MOUNTS=$HOME:rw` attempt came back `policy_violation` (rc 3), and a
+child submitted a grandchild from inside its own sandbox via csub's per-job broker. After each
+run: zero broker processes, zero state dirs, zero catatonit. The broker is killed in `cleanup`
+alongside the proxy; its socket and log live in the per-job state dir and go with it.
+
+Open on csub's side (reported to Stephan): no default pending cap (`0` = unlimited), `-n`
+without `span[hosts=1]`, csub's own per-job wrapper has only an EXIT trap so a `bkill`ed child
+leaks its broker, canonical-path rule for mounts, and no `CLAUDE.md` in the repo though
+referenced.
+
 ### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
 
 Policy: the wrappers must not write to `/tmp` on the nodes. Constraints that shaped the
