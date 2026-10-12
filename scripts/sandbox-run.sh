@@ -438,6 +438,8 @@ if [[ $WANT_CSUB -eq 1 ]]; then
       [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
     done
   fi
+  # PATH: bwrap takes the LAST --setenv, so this one must carry the --claude/--opencode CLI
+  # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(
     --ro-bind "$CSUB_SOCK" /run/csub.sock
     --ro-bind "$CSUB_SITE" "$CSUB_SITE"
@@ -445,7 +447,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     --setenv CSUB_TRANSPORT unix --setenv CSUB_SOCKET /run/csub.sock
     --setenv CSUB_MOUNTS "$CSUB_MOUNTS"
     --setenv PYTHONPATH "$CSUB_SITE${PYTHONPATH:+:$PYTHONPATH}"
-    --setenv PATH "/run/csub-bin:${PATH}"
+    --setenv PATH "/run/csub-bin:${PATH_PREPEND}${PATH}"
   )
 fi
 
