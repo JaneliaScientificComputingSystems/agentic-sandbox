@@ -597,6 +597,9 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   $CSUB_BROKER --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!
   wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+  CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
+  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER > "$CSUB_PROBE_JSON" 2>/dev/null || true
   # csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   if [[ -z "${CSUB_MOUNTS:-}" ]]; then
     _cands=()
@@ -623,10 +626,112 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   )
 fi
 
+
+# Environment description FOR THE AGENT, generated from this invocation's actual configuration
+# and bound read-only at /run/sandbox/README.md (also $SANDBOX_README). A sandboxed agent
+# cannot read this repo's README, and left to itself it probes around (confirmed live: an agent
+# spent three jobs guessing image names GHCR couldn't be asked for). With --claude a pointer is
+# appended to the per-job COPY of CLAUDE.md, so Claude Code reads it at session start; the copy
+# dies with the job, the real ~/.claude/CLAUDE.md is never touched.
+write_sandbox_readme() {
+  SANDBOX_README_FILE="$JOB_DIR/README.md"
+  {
+    echo "# This sandbox"
+    echo
+    echo "You are running inside a sandbox started by podman-run.sh (agentic-sandbox) on $(hostname),"
+    echo "LSF job ${LSB_JOBID:-none}, as user $USER. Everything below describes THIS session."
+    echo
+    echo "## Filesystem"
+    echo
+    _i=0; _v=("${VOLUMES[@]:-}")
+    while [[ $_i -lt ${#_v[@]} ]]; do
+      if [[ "${_v[$_i]}" == "-v" ]]; then
+        _spec="${_v[$((_i+1))]}"; _rest="${_spec#*:}"; _mode="${_rest##*:}"; _dest="${_rest%:*}"
+        [[ "$_mode" == "rw" ]] && echo "- $_dest (read-write)" || echo "- $_dest (read-only)"
+        _i=$((_i+2))
+      else _i=$((_i+1)); fi
+    done
+    echo "- Your working directory is whatever the image sets (often /work) and is NOT one of the mounts above; cd into a read-write mount before writing or submitting."
+    echo "- Not available: the home directory (unless listed above), other users' data, anything not listed."
+    echo "- Credential files directly under any listed directory (.ssh .aws .azure .kube .config/gcloud .docker,"
+    echo "  .git-credentials .npmrc .pypirc .netrc .env .env.local) appear EMPTY on purpose. Nothing is wrong; do not try to work around it."
+    echo
+    echo "## Network"
+    echo
+    if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+      echo "- Only these hosts are reachable, over HTTP(S) through a proxy already configured in http_proxy/https_proxy:"
+      for h in "${ALLOW_HOSTS[@]}"; do echo "  - $h (and its subdomains)"; done
+      echo "- Everything else (other hosts, raw TCP, ssh, package registries not listed) fails. Do not retry or look for a route; ask the user."
+    else
+      echo "- No network at all. Every connection attempt fails by design."
+    fi
+    echo
+    echo "## Environment"
+    echo
+    echo "- No host environment is passed into the container. If you need an API key or token, the user must have arranged it (a file in a mount, or the image); if it is not there, ask, do not search for it."
+    echo
+    echo "## Cluster jobs"
+    echo
+    if [[ $WANT_CSUB -eq 1 ]]; then
+      echo "- You cannot run bsub/bjobs/bkill. Use \`csub\` instead; it submits LSF jobs through a broker that enforces the user's policy."
+      echo "  Each child job runs inside its own sandbox (same mechanism as this one) and can itself call csub."
+      echo "- \`csub probe\` prints the policy. \`csub --json probe\` for machine-readable output (--json goes BEFORE the subcommand)."
+      echo "- \`csub submit --walltime <min> [--cpus N] [--mem 32G] [--gpus 1 -q <gpu queue>] [--image <image>] [--wait] -- <command>\`,"
+      echo "  then \`csub status\`, \`csub logs <id>\`, \`csub kill <id>\`. A child's output lands in <cwd>/.csub/jobs/<id>/stdout and stderr."
+      echo "- Jobs are refused with a policy_violation error when they ask for something the policy does not allow. Read the message and adjust; do not probe or guess."
+      if [[ -n "${CSUB_PROBE_JSON:-}" && -s "$CSUB_PROBE_JSON" ]]; then
+        python3 - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    p = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if not p.get("ok"):
+    sys.exit(0)
+lim = p.get("limits", {})
+print("- Policy summary (authoritative source: csub probe):")
+print(f"  - default image: {p.get('default_image')}")
+imgs = p.get("allowed_images") or []
+if imgs:
+    print("  - images you may name with --image (these are the ONLY ones; there is no registry to query):")
+    for i in imgs: print(f"    - {i}")
+roots = p.get("allowed_roots") or []
+if roots: print(f"  - jobs may mount paths under: {', '.join(roots)}; your cwd must be inside a read-write mount under one of these")
+hosts = p.get("allowed_hosts") or []
+print(f"  - hosts a job may --allow: {', '.join(hosts) if hosts else 'none'}")
+qs = p.get("queues") or {}
+if qs:
+    print("  - queues:")
+    for n, q in qs.items():
+        g = f", GPU queue, {q.get('slots_per_gpu')} slots per GPU" if q.get("gpu") else ""
+        print(f"    - {n}: {q.get('mem_per_slot_mb')} MB per slot, max walltime {q.get('max_walltime_min')} min{g}")
+print(f"  - limits: max {lim.get('max_slots')} slots, {lim.get('max_gpus')} GPUs, {lim.get('max_walltime_min')} min walltime, {lim.get('max_pending_per_session') or 'unlimited'} pending jobs per session, est. cost cap ${lim.get('max_estimated_cost_usd')} per job")
+print("  - memory is requested as slots: slots = max(cpus, ceil(mem / mem_per_slot)); the cluster ignores any other memory request")
+PY
+      fi
+    else
+      echo "- You cannot submit cluster jobs from here (no bsub, no csub). Run work in this sandbox or ask the user."
+    fi
+    echo
+    echo "## Tools"
+    echo
+    [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
+    [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; use \`-m litellm/kimi-k3\` or \`--model litellm/kimi-k3\` explicitly."
+    echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
+    echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
+  } > "$SANDBOX_README_FILE"
+  PODMAN_ARGS+=(-v "$SANDBOX_README_FILE:/run/sandbox/README.md:ro" -e SANDBOX_README=/run/sandbox/README.md)
+  if [[ $WANT_CLAUDE -eq 1 && -n "${CLAUDE_CFG:-}" ]]; then
+    printf '\n# Sandbox\n\nThis session runs inside a sandbox. Read %s FIRST: it lists exactly which directories you can write to, which hosts you can reach, and whether and how you can submit cluster jobs. Do not probe for other paths, hosts, or images; what is not listed there does not exist for you.\n' /run/sandbox/README.md >> "$CLAUDE_CFG/CLAUDE.md"
+  fi
+}
+
+write_sandbox_readme
+
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
-  # socket (it is created 0755), and no one else's socket can stand in for ours. It must stay on
-  # node-local storage -- a Unix socket cannot be bound on NFS.
+  # socket (it is created 0755), and no one else's socket can stand in for ours. Node-local on
+  # purpose: binding a Unix socket on NFS works here but is fragile.
   PROXY_DIR="$JOB_DIR/proxy"
   mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
