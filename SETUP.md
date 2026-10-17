@@ -115,14 +115,16 @@ chmod 600 ~/.config/opencode/opencode.json
 The wrappers give each sandbox a throwaway copy of this directory, so edits made inside never
 reach it.
 
-## 6. csub (letting a sandboxed agent submit cluster jobs)
+## 6. csub (optional: letting a sandboxed agent submit cluster jobs)
 
-[csub](https://github.com/saalfeldlab/csub) is Stephan Saalfeld's policy-checked job broker;
-the wrappers' `--csub` flag starts it for you. Install it in a venv and write a policy:
+Skip this unless an agent must submit jobs. [csub](https://github.com/saalfeldlab/csub) is Stephan
+Saalfeld's policy-checked job broker; the wrappers' `--csub` flag starts it for you. Clone it (for
+its sample policy) and install it in a venv:
 
 ```bash
+git clone https://github.com/saalfeldlab/csub ~/csub
 python3 -m venv ~/.venvs/csub
-~/.venvs/csub/bin/pip install git+https://github.com/saalfeldlab/csub
+~/.venvs/csub/bin/pip install ~/csub
 ```
 
 Compute nodes reach GitHub but not PyPI. On Python 3.9 csub needs `tomli`, so download that
@@ -131,14 +133,16 @@ wheel on a machine with internet, copy it into your home, and
 
 ```bash
 mkdir -p ~/.config/csub
-cp /path/to/csub-checkout/deploy/broker.janelia.toml ~/.config/csub/broker.toml
+cp ~/csub/deploy/broker.janelia.toml ~/.config/csub/broker.toml
 chmod 600 ~/.config/csub/broker.toml
 ```
 
 Edit the policy:
 
-- `allowed_roots`: directories jobs may mount. A directory you own under `/groups` or `/nrs`.
-  Never `$HOME` (csub refuses it) and never `/scratch` (the policy rejects it as a root).
+- `allowed_roots`: directories jobs may mount. Use the narrowest directory under `/groups` or `/nrs`
+  that holds the project, ideally one you created for agent work. A sandboxed agent can ask a child
+  job to mount any directory beneath a root, not only the ones you gave the sandbox, so everything
+  under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the policy rejects it).
 - `sandbox_scripts_dir`: this repo's `scripts/` directory; child jobs run through it.
 - `allowed_images`: list the concrete images rather than the default glob, so `csub probe` and
   the in-sandbox README can tell an agent exactly what exists:
