@@ -1,10 +1,12 @@
 #!/bin/bash
 # test-podman.sh -- regression suite for podman-run.sh (podman/GPU backend).
 #
-# Run from a real GPU LSF allocation (needs --gpu to work at all). User-agnostic: uses
-# $USER/$HOME/$(whoami) throughout, no hardcoded account names. --keep-id tests require a
-# /etc/subuid//etc/subgid range wider than the invoking account's real GID -- see
-# ADMIN-NOTES.md's "--userns=keep-id, revisited" section if those fail.
+# Run from a real GPU LSF allocation (needs --gpu to work at all), never on a login node, and
+# ONE AT A TIME with tests/test-bwrap.sh (both drive opencode against the same sqlite database
+# on NFS). User-agnostic: uses $USER/$HOME/$(whoami) throughout, no hardcoded account names.
+# --keep-id tests require a /etc/subuid//etc/subgid range wider than the invoking account's
+# real GID -- see ADMIN-NOTES.md's "--userns=keep-id, revisited" section if those fail. The
+# --csub test runs only when csub-broker is on PATH and CSUB_TEST_ROOT is set.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,6 +164,21 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
 else
   echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"
 fi
+
+echo "=== 14. In-sandbox README describes this session ==="
+OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c 'test -f "$SANDBOX_README" && echo file-ok; grep -c "no bsub, no csub" /run/sandbox/README.md; grep -c "/scratch/'"$USER"'/work (read-write)" /run/sandbox/README.md' 2>&1 | tail -3 | tr '\n' ',')
+check "README present, says no job submission, lists the --scratch mount" "$OUT" "file-ok,1,1,"
+
+echo "=== 15. Exit code of the sandboxed command propagates ==="
+"$PODMAN_RUN" --gpu -- sh -c 'exit 7' >/dev/null 2>&1; RC=$?
+check "exit 7 propagated" "$RC" "7"
+
+echo "=== 16. Denied-host summary on failure, quiet on success ==="
+OUT=$({ "$PODMAN_RUN" --gpu --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 7'; echo "rc=$?"; } 2>&1 \
+  | grep -E 'denied [0-9]+ request|^rc=' | sed 's/.*denied \([0-9]*\) request.*: \([a-z.]*\) .*/denied=\1 host=\2/' | tr '\n' ' ')
+check "summary printed and rc 7 propagated" "$OUT" "denied=1 host=denied.invalid rc=7 "
+OUT=$({ "$PODMAN_RUN" --gpu --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 0'; echo "rc=$?"; } 2>&1 | grep -cE 'denied [0-9]+ request')
+check "no summary when the command succeeds" "$OUT" "0"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

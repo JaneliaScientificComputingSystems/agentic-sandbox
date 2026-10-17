@@ -1,13 +1,16 @@
 #!/bin/bash
 # test-bwrap.sh -- regression suite for sandbox-run.sh (bwrap backend).
 #
-# Run from a compute node (needs a real LSF allocation for network/user-namespace behavior
-# to match production): cd into scripts/ first isn't required, this script locates
-# sandbox-run.sh relative to itself.
+# Run from a compute node inside an LSF job (never on a login node): network and
+# user-namespace behaviour must match production. The script locates sandbox-run.sh
+# relative to itself. Run it and tests/test-podman.sh ONE AT A TIME: both drive opencode
+# against the same sqlite database on NFS and the loser fails.
 #
 # User-agnostic: uses $USER/$HOME throughout, no hardcoded account names or paths. Some
 # tests require litellm.int.janelia.org / api.anthropic.com reachability and a working
-# `claude auth login` / LiteLLM key already set up for the invoking account.
+# `claude auth login` / LiteLLM key already set up for the invoking account. The --csub test
+# runs only when csub-broker is on PATH and CSUB_TEST_ROOT names a writable directory under
+# the csub policy's allowed roots; otherwise it is skipped.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -188,6 +191,38 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
 else
   echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"
 fi
+
+echo "=== 18. In-sandbox README describes this session ==="
+RD="/scratch/$USER/test-bwrap-readme-$$"; mkdir -p "$RD"
+OUT=$("$SANDBOX_RUN" --rw "$RD" --allow example.com -- bash -c 'test -f "$SANDBOX_README" && test "$SANDBOX_README" = /run/sandbox/README.md && echo file-ok; grep -c "example.com" /run/sandbox/README.md; grep -c "'"$RD"' (read-write)" /run/sandbox/README.md' 2>/dev/null | tr '\n' ',')
+check "README present, lists the --allow host and the --rw path" "$OUT" "file-ok,1,1,"
+BEFORE_MD=$(md5sum < "$HOME/.claude/CLAUDE.md" 2>/dev/null)
+OUT=$("$SANDBOX_RUN" --claude -- bash -c 'grep -c "/run/sandbox/README.md" "$CLAUDE_CONFIG_DIR/CLAUDE.md"' 2>/dev/null)
+check "--claude: pointer appended to the per-job CLAUDE.md copy" "$OUT" "1"
+check "real ~/.claude/CLAUDE.md untouched" "$(md5sum < "$HOME/.claude/CLAUDE.md" 2>/dev/null)" "$BEFORE_MD"
+rm -rf "$RD"
+
+echo "=== 19. Denied-host summary on failure, exit code propagated, quiet on success ==="
+OUT=$({ "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 7'; echo "rc=$?"; } 2>&1 \
+  | grep -E 'denied [0-9]+ request|^rc=' | sed 's/.*denied \([0-9]*\) request.*: \([a-z.]*\) .*/denied=\1 host=\2/' | tr '\n' ' ')
+check "summary printed and rc 7 propagated" "$OUT" "denied=1 host=denied.invalid rc=7 "
+OUT=$({ "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 0'; echo "rc=$?"; } 2>&1 | grep -cE 'denied [0-9]+ request')
+check "no summary when the command succeeds" "$OUT" "0"
+
+echo "=== 20. TERM to the wrapper's process group cleans up (the bkill/walltime path) ==="
+BEFORE_N=$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')
+setsid "$SANDBOX_RUN" --allow example.com -- sleep 120 >/dev/null 2>&1 &
+WP=$!; sleep 4
+kill -TERM -- "-$WP" 2>/dev/null
+wait "$WP" 2>/dev/null; RC=$?
+sleep 2
+check "wrapper exits 143 after TERM" "$RC" "143"
+check "no allowlist proxy left running" "$(pgrep -u "$USER" -f allowlist_proxy.py | wc -l | tr -d ' ')" "0"
+check "state dirs back to baseline" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "$BEFORE_N"
+
+echo "=== 21. --claude puts the CLI on PATH even from a scrubbed environment ==="
+OUT=$(env PATH=/usr/local/bin:/usr/bin:/bin "$SANDBOX_RUN" --claude -- sh -c 'command -v claude >/dev/null && echo claude-found' 2>/dev/null)
+check "claude resolvable with a scrubbed PATH" "$OUT" "claude-found"
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
