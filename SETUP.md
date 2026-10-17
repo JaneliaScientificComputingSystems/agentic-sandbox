@@ -127,9 +127,10 @@ python3 -m venv ~/.venvs/csub
 ~/.venvs/csub/bin/pip install ~/csub
 ```
 
-Compute nodes reach GitHub but not PyPI. On Python 3.9 csub needs `tomli`, so download that
-wheel on a machine with internet, copy it into your home, and
-`~/.venvs/csub/bin/pip install --no-index ~/tomli-*.whl`.
+Compute nodes reach GitHub but not PyPI directly: `pip install` in a plain shell there fails. (Through
+the wrappers' allowlist proxy it works, with `--allow pypi.org --allow files.pythonhosted.org`; verified
+under `podman-run.sh`.) On Python 3.9 csub needs `tomli`, so download that wheel on a machine with
+internet, copy it into your home, and `~/.venvs/csub/bin/pip install --no-index ~/tomli-*.whl`.
 
 ```bash
 mkdir -p ~/.config/csub
@@ -148,8 +149,13 @@ Edit the policy:
   the in-sandbox README can tell an agent exactly what exists:
   `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` and
   `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest`.
-- `allowed_hosts`, `limits`, `queues`: to taste. The Janelia file's slot and memory numbers mirror
-  the cluster's esub.
+- `readonly_roots`: directories you mount read-only, such as a dataset, a scorer or a venv. The broker
+  forces any mount under them read-only even if the client asks for `:rw`.
+- `[queues.<name>]`: every queue an agent may use needs a stanza, for example `gpu_short` (60-minute
+  limit, suited to short GPU trials): `mem_per_slot_mb = 15360`, `max_walltime_min = 60`, `gpu = true`,
+  `slots_per_gpu = 8`.
+- `allowed_hosts`, `limits`: to taste. The Janelia file's slot and memory numbers mirror the cluster's
+  esub.
 
 Check it, then make the broker findable whenever you start a `--csub` sandbox:
 

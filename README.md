@@ -94,9 +94,13 @@ The sandbox is identical in the three ways to run it; only the submission differ
   interactive session.
 - **Code in.** Copy or `git clone` it into the work directory. Use git to review what the agent
   changed afterwards.
-- **Dependencies.** Install them beforehand, outside the sandbox, into a venv under a path you bind
-  `--ro`. Inside you reach only the hosts you `--allow`, and compute nodes can't reach PyPI
-  directly.
+- **Dependencies.** Install them beforehand into a venv under a path you bind `--ro`, so the agent
+  can't change it. A venv records the interpreter that built it, so build it with the Python the
+  sandbox will use. For podman, inside the image (verified with the gpu image):
+  `podman-run.sh --keep-id --rw /groups/lab/venv --allow pypi.org --allow files.pythonhosted.org -- bash -c
+  'python3 -m venv --system-site-packages /groups/lab/venv && /groups/lab/venv/bin/pip install PKG'`.
+  `--system-site-packages` keeps torch and the rest of the image. For bwrap, build it with the host's
+  `python3` (not tested).
 - **Git.** Credentials (`~/.ssh`, `.git-credentials`) aren't bound, so the agent can commit locally
   but can't push or clone private repos. Push from outside after reviewing.
 - **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
@@ -231,6 +235,12 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   and fails with a bare `Forbidden`. One-shot `opencode run ... --model litellm/kimi-k3` is unaffected.
   Run **one opencode sandbox per account at a time**: its sqlite database on NFS is bound into every
   `--opencode` sandbox, and two concurrent ones race on it.
+- **Unattended `opencode run` (Mode A/B).** opencode asks before reading outside its working
+  directory and cannot ask in a batch job, so the read is auto-rejected and the model may give up and
+  exit 0. The sandbox is the boundary, so allow it: `export
+  OPENCODE_CONFIG_CONTENT='{"permission":{"external_directory":"allow"}}'` and pass `--env
+  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh` (tested under bwrap, not podman). An agent that gives up
+  still exits 0, so check for the output you expect, not the exit code.
 - **The Kimi K3 safeguard.** Requests to `kimi-k3` pass through a gateway guardrail (an LLM-as-judge
   for harmful content and jailbreaks) whatever the client. A refusal is either the gateway's
   `GuardrailRaisedException`/400 naming the check (`content_harm`) or the model declining in prose;
@@ -253,7 +263,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **Your podman jobs can share a node.** Each invocation has its own image store and runtime dir keyed
   on job id, array index and pid; a pulled image is reused through a read-only shared store, which the
   wrapper never resets. Request the queue's normal CPU-to-GPU ratio; `bsub -gpu` needs an explicit GPU
-  queue.
+  queue. Check `bqueues` before choosing one: on 2026-10-17 `gpu_l4` had about 218,000 jobs pending
+  from a single array, while `gpu_short` (60-minute limit, for short test jobs) dispatched at once.
 
 ## What it does and does not protect against
 
