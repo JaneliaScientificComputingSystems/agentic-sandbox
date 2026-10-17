@@ -9,6 +9,7 @@ all of this is in place.
 ```bash
 git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git
 SANDBOX="$PWD/agentic-sandbox/scripts"        # the README's examples use this variable
+# a new job shell starts without it: put the line above in your shell startup file
 ```
 
 Run the wrappers from a work directory, not from inside the checkout: the directory you invoke
@@ -77,7 +78,8 @@ claude auth login      # browser flow; paste the code back
 That writes `~/.claude/.credentials.json`, which the wrappers bind through into every `--claude`
 sandbox, so logins and token refreshes persist. A fresh `claude auth login` *inside* a sandbox
 also works, but only if that file already exists on the host; otherwise the login is lost with
-the job. The wrappers warn when that applies.
+the job. The wrappers warn when that applies. The OAuth redirect goes to `platform.claude.com` and
+lands on a paste-the-code prompt, so open the URL in your own browser, outside the sandbox.
 
 Alternative, an API key: `export ANTHROPIC_API_KEY=...` and pass it with
 `sandbox-run.sh --env ANTHROPIC_API_KEY`. For podman, which forwards no environment, put the key
