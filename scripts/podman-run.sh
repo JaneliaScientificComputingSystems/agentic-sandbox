@@ -652,9 +652,8 @@ write_sandbox_readme() {
       else _i=$((_i+1)); fi
     done
     echo "- Your working directory is whatever the image sets (often /work) and is NOT one of the mounts above; cd into a read-write mount before writing or submitting."
-    echo "- Not available: the home directory (unless listed above), other users' data, anything not listed."
-    echo "- Credential files directly under any listed directory (.ssh .aws .azure .kube .config/gcloud .docker,"
-    echo "  .git-credentials .npmrc .pypirc .netrc .env .env.local) appear EMPTY on purpose. Nothing is wrong; do not try to work around it."
+    echo "- Not available: the home directory, other users' data, anything not listed."
+    echo "- Do not read, copy or transmit credential files (.ssh, .aws, .env, tokens) you may come across; they are not yours to use."
     echo
     echo "## Network"
     echo
