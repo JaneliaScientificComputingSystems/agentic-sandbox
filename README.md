@@ -72,7 +72,8 @@ never bound unless you ask; ask for the specific subdirectory a task needs, neve
 every `--ro`/`--rw`/`--scratch` path — `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud` and
 `.docker` appear as empty directories, and `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`,
 `.env`, `.env.local` as empty files. Applied last, so a `--rw` on one of those paths does not
-unmask it. Only direct children are checked; a `.env` two levels down is not. Podman cannot do
+unmask it. Only paths that exist when the sandbox starts are masked; a `.env` the agent creates
+itself is just a file. Only direct children are checked; a `.env` two levels down is not. Podman cannot do
 this (a `--tmpfs` cannot shadow a path under an ancestor `-v` bind), so with `podman-run.sh`
 never bind a path that is or contains `$HOME`.
 
