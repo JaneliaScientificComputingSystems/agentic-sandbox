@@ -897,3 +897,34 @@ What it *did* affect, before the fix:
 both directly via `bwrap` and through the wrapper: `whoami`/`id` correctly resolve to real
 usernames and group names, not just raw UID/GID numbers.
 
+
+### README restructured; verification record (2026-10-16)
+
+`README.md` was rewritten as a use document (339 lines, from 905): quick start, a flag chooser,
+one "how it works" section, `--csub`, an image table, a consolidated security model with explicit
+non-protections, testing, troubleshooting. One-time setup moved to `SETUP.md`, behaviour changes
+to `CHANGELOG.md`. The dated "confirmed live" statements it used to carry are recorded here so
+nothing is lost:
+
+- `$HOME` stopped being bound by default on 2026-09-10 (previously always, read-only).
+- `--keep-id` verified end to end on 2026-09-10 once HPC widened the account's subuid/subgid range
+  to 131072; a standard 65536-wide range fails with "potentially insufficient UIDs or GIDs".
+- podman creates `/scratch/$USER/podman-run` and `podman-storage` itself on a node it has never
+  run on; no manual `mkdir`.
+- A file written from the default (container-root) identity to a `--rw` path lands owned by the
+  real user (test 11b); `--keep-id` changes only the identity seen from inside.
+- `agentic-sandbox-gpu:latest` rebuilt 2026-10-08 with the `/root` chmod; `claude --version`
+  2.1.294, `opencode --version` 1.18.35; `--keep-id` CLIs verified against the published tag.
+- LSF cgroup GPU fencing: a 1-GPU job on an 8-GPU `gpu_l4` node sees one GPU inside a
+  `gpu=all` container; `nvidia-smi -i 1` on the host reports no device; `CUDA_VISIBLE_DEVICES`
+  is `0` in every 1-GPU job (2026-10-08).
+- Two concurrent podman jobs pinned to one node ran to completion with isolated state (2026-10-08).
+- Running from the checkout: the wrapper re-binds `scripts/` read-only (PR #5, test 13).
+- Fresh `claude auth login` inside the sandbox verified rigorously (logged out outside first).
+- Kimi K3 refusals observed in both shapes on the same prompt: gateway `GuardrailRaisedException`
+  (`content_harm`, September) and model prose (October). On 2026-10-16 three attempts were all
+  model prose; whether the gateway guardrail is still attached to the test key is unverified.
+- `--csub` verified 2026-10-12 and again 2026-10-16: probe, submit with wait, status, policy
+  rejection (rc 3), grandchild; nothing left behind.
+- The in-sandbox `/run/sandbox/README.md` verified 2026-10-16 under both wrappers with `--csub`
+  and `--claude`; the `CLAUDE.md` pointer lands in the per-job copy only.

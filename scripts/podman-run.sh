@@ -460,7 +460,7 @@ fi
 # sequential, overridable syscalls the way bwrap does, so "later argument wins" (which is
 # what makes sandbox-run.sh's fix work) does not hold here. Leaving this masked-but-broken
 # would be worse than no masking at all -- it looks protected in `df -h` while the real data
-# stays fully exposed. See "Filesystem access" in README.md for the actual mitigation
+# stays fully exposed. See "How the sandbox works" in README.md for the actual mitigation
 # (never --rw/--ro a path containing $HOME -- scope to the specific subdirectory you need).
 
 PROXY_PID=""
@@ -692,7 +692,10 @@ print("- Policy summary (authoritative source: csub probe):")
 print(f"  - default image: {p.get('default_image')}")
 imgs = p.get("allowed_images") or []
 if imgs:
-    print("  - images you may name with --image (these are the ONLY ones; there is no registry to query):")
+    if any("*" in i or "?" in i for i in imgs):
+        print("  - --image must match one of these PATTERNS; there is no registry to query, so if you need an image other than the default, ask the user for its exact name rather than guessing:")
+    else:
+        print("  - images you may name with --image (these are the ONLY ones; there is no registry to query):")
     for i in imgs: print(f"    - {i}")
 roots = p.get("allowed_roots") or []
 if roots: print(f"  - jobs may mount paths under: {', '.join(roots)}; your cwd must be inside a read-write mount under one of these")
