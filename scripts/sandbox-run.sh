@@ -418,12 +418,6 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   printf '%s\n' '#!/bin/sh' 'exec python3 -m csub.cli "$@"' > "$CSUB_DIR/bin/csub"
   chmod 700 "$CSUB_DIR/bin/csub"
   CSUB_SOCK="$CSUB_DIR/csub.sock"
-  $CSUB_BROKER --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
-  CSUB_PID=$!
-  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
-  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
-  CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER > "$CSUB_PROBE_JSON" 2>/dev/null || true
   # CSUB_MOUNTS: what this sandbox can see, in csub's "path:mode,..." form, unless preset.
   # csub rejects overlapping mounts, so a path nested under another listed path is dropped
   # (the outer one carries it): $PWD inside a --rw project root is the common case.
@@ -441,6 +435,32 @@ if [[ $WANT_CSUB -eq 1 ]]; then
       [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
     done
   fi
+  # Envelope: with a csub that has --envelope-mount/--envelope-host (csub #13), bound every
+  # request to this sandbox's own mounts and hosts, so a client cannot claim a directory it
+  # cannot see (CSUB_MOUNTS and --cwd are otherwise limited only by the policy's allowed_roots).
+  # CSUB_ENVELOPE=off skips it, =on refuses to start without it; default: apply it if csub can.
+  CSUB_ENV_ARGS=()
+  if [[ "${CSUB_ENVELOPE:-auto}" != off ]]; then
+    if $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+      IFS=, read -ra _em <<< "$CSUB_MOUNTS"
+      for m in "${_em[@]:-}"; do [[ -n "$m" ]] && CSUB_ENV_ARGS+=(--envelope-mount "$m"); done
+      for h in "${ALLOW_HOSTS[@]:-}"; do [[ -n "$h" ]] && CSUB_ENV_ARGS+=(--envelope-host "$h"); done
+      if [[ ${#CSUB_ENV_ARGS[@]} -eq 0 ]]; then
+        echo "sandbox-run.sh: --csub: no mounts or hosts to bound requests to; envelope not applied" >&2
+      fi
+    elif [[ "${CSUB_ENVELOPE:-auto}" == on ]]; then
+      echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=on but this csub-broker has no --envelope-mount (needs csub with #13)" >&2
+      exit 1
+    else
+      echo "sandbox-run.sh: --csub: this csub has no --envelope-mount; requests are bounded by the policy only (see csub #13)" >&2
+    fi
+  fi
+  $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
+  CSUB_PID=$!
+  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+  CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
+  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
   # PATH: bwrap takes the LAST --setenv, so this one must carry the --claude/--opencode CLI
   # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(

@@ -3,6 +3,14 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## Unreleased
+
+- **`--csub` bounds client-claimed mounts to the sandbox.** With a csub that has
+  `--envelope-mount`/`--envelope-host` (csub #13), both wrappers start the broker with this
+  sandbox's own mounts and `--allow` hosts as an envelope, so `CSUB_MOUNTS`/`--cwd` can no longer
+  name a directory under `allowed_roots` that the sandbox cannot see. Older csub: warning, policy
+  only. `CSUB_ENVELOPE=off` skips it, `=on` refuses to start without it.
+
 ## 2026-10-16
 
 - Every sandbox now contains `/run/sandbox/README.md` (also `$SANDBOX_README`): a generated

@@ -160,6 +160,14 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
   OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && csub submit --walltime 5 --wait --name t13 -- sh -c 'echo child-ok' 2>&1 | grep -c child-ok" 2>&1 | tail -1)
   check "--csub: child job ran from inside the container" "$OUT" "1"
   check "--csub: no broker left behind" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
+  if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
+    DECOY="$CSUB_TEST_ROOT/test-podman-decoy-$$"; mkdir -p "$DECOY"
+    OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?" 2>&1 | tail -1)
+    check "--csub: claiming a directory the container lacks is refused (envelope, rc 3)" "$OUT" "3"
+    rm -rf "$DECOY"
+  else
+    echo "SKIP: this csub has no --envelope-mount (needs csub #13)"
+  fi
   rm -rf "$CW"
 else
   echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"

@@ -187,6 +187,16 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
   OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c 'CSUB_MOUNTS=$HOME:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo $?')
   check "--csub: policy rejection reaches the agent (rc 3)" "$OUT" "3"
   check "--csub: no broker left behind" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
+  if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
+    # A directory under the same allowed root that the sandbox does not mount: the policy would
+    # accept the claim, the envelope must not (rc 3; without the envelope this exits 0).
+    DECOY="$CSUB_TEST_ROOT/test-bwrap-decoy-$$"; mkdir -p "$DECOY"
+    OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c "CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?")
+    check "--csub: claiming a directory the sandbox lacks is refused (envelope, rc 3)" "$OUT" "3"
+    rm -rf "$DECOY"
+  else
+    echo "SKIP: this csub has no --envelope-mount (needs csub #13)"
+  fi
   rm -rf "$CW"
 else
   echo "SKIP: csub-broker not on PATH or CSUB_TEST_ROOT unset"
