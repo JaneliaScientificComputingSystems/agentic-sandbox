@@ -1,0 +1,16 @@
+sandbox-run.sh: note: $HOME/agentic-sandbox/scripts is inside a read-write bind ($HOME); re-binding it read-only. Prefer running from a separate work directory.
+[relay] listening on 127.0.0.1:24711 -> /run/sandbox-proxy.sock
+config copy visible in sandbox (name only): opencode.json 
+--- the planted command, host as written (dummy payload):
+http=000
+curl exit=56
+--- same, to a real resolvable host that is not on the allowlist:
+http=000
+curl exit=56
+--- via the proxy the wrapper provides, if any:
+https_proxy=<set>
+HTTPS_PROXY=<set>
+HTTP_PROXY=<set>
+http_proxy=<set>
+sandbox exit=0
+

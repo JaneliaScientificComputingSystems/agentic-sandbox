@@ -1,0 +1,55 @@
+[
+ {
+  "job": "JOBID",
+  "queue": "gpu_short",
+  "image": "agentic-sandbox-gpu:latest",
+  "gpus": 1,
+  "walltime": 20,
+  "allow_hosts": [],
+  "mounts_match_sandbox": true,
+  "extra_mounts": [],
+  "exit_code": "0",
+  "session": "2d4f78d1fd1c",
+  "command0": "$R/venv/bin/python /groups/GROUP/GROUP/G"
+ },
+ {
+  "job": "JOBID",
+  "queue": "gpu_short",
+  "image": "agentic-sandbox-gpu:latest",
+  "gpus": 1,
+  "walltime": 20,
+  "allow_hosts": [],
+  "mounts_match_sandbox": true,
+  "extra_mounts": [],
+  "exit_code": "0",
+  "session": "2d4f78d1fd1c",
+  "command0": "$R/venv/bin/python /groups/GROUP/GROUP/G"
+ },
+ {
+  "job": "JOBID",
+  "queue": "gpu_short",
+  "image": "agentic-sandbox-gpu:latest",
+  "gpus": 1,
+  "walltime": 20,
+  "allow_hosts": [],
+  "mounts_match_sandbox": true,
+  "extra_mounts": [],
+  "exit_code": "0",
+  "session": "2d4f78d1fd1c",
+  "command0": "$R/venv/bin/python /groups/GROUP/GROUP/G"
+ },
+ {
+  "job": "JOBID",
+  "queue": "gpu_short",
+  "image": "agentic-sandbox-gpu:latest",
+  "gpus": 1,
+  "walltime": 20,
+  "allow_hosts": [],
+  "mounts_match_sandbox": true,
+  "extra_mounts": [],
+  "exit_code": "0",
+  "session": "2d4f78d1fd1c",
+  "command0": "$R/venv/bin/python /groups/GROUP/GROUP/G"
+ }
+]
+ALL MOUNTS WITHIN SANDBOX SET: True jobs: 4
