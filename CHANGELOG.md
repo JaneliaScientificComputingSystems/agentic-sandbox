@@ -9,7 +9,8 @@ the evidence behind each.
   `--envelope-mount`/`--envelope-host` (csub #13), both wrappers start the broker with this
   sandbox's own mounts and `--allow` hosts as an envelope, so `CSUB_MOUNTS`/`--cwd` can no longer
   name a directory under `allowed_roots` that the sandbox cannot see. Older csub: warning, policy
-  only. `CSUB_ENVELOPE=off` skips it, `=on` refuses to start without it.
+  only. `CSUB_ENVELOPE=off` skips it, `=on` refuses to start without it. A child job that names an
+  `agent` needs that agent's hosts in `--allow`, or the envelope refuses it.
 
 ## 2026-10-16
 

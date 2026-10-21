@@ -99,8 +99,8 @@ running anything below.
 **Step 1. Data** (`scripts/prepare_data.py`). On a machine with internet and numpy and pillow in a venv, run it:
 it downloads BBBC038 (83 MB), keeps the 334 grayscale 256x256 fluorescence images and writes `train.npz`
 (200), `val.npz` (64) and `test.npz` (70). Put `train.npz` and `val.npz` in `$R/data/` and `test.npz` in a
-directory the csub policy refuses, such as `~/holdout/`. Anything under `allowed_roots` could be reached by a
-widened mount claim; a hidden set must live outside it.
+directory the csub policy refuses, such as `~/holdout/`. Without csub's envelope, anything under `allowed_roots` could be reached by a
+widened mount claim; a hidden set must live outside it either way.
 
 **Step 2. Layout** (`scripts/setup.sh`). Creates `$R/{project,eval,data,venv,logs,final}`. `project/` gets the
 baseline `train.py` (`train_baseline.py`) and `TASK.md`, rendered from `TASK.md.in` with your `$R`; `eval/` gets
@@ -160,8 +160,9 @@ used `gpu_short` and exited 0.
 - **The key is exposed to the agent by design.** It must be, to reach its model. The network allowlist and a
   narrow key are the protection; there is no way to hide it from the process that uses it.
 - **Policy was broader than the sandbox.** `allowed_roots` covered more than the four mounted paths, and a
-  sandboxed client can claim any directory under it (the mount-claim issue reported to csub's maintainer).
-  The audit shows this run did not.
+  sandboxed client can claim any directory under it. csub #12 closed this for child jobs; the top-level
+  sandbox needs csub #13 (an envelope from the sandbox's own mounts) and the matching wrapper change, and
+  this run used neither. The audit shows this run did not widen its claims.
 - **The proxy log is deleted at exit**, so a denied connection from a real attempt would leave no trace except
   the transcript. A durable boundary log would fix that.
 - Results come from a 334-image subset and a simplified metric (F1 at IoU 0.5 and 0.75). Baseline numbers come

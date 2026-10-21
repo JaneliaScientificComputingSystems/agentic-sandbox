@@ -141,9 +141,10 @@ chmod 600 ~/.config/csub/broker.toml
 Edit the policy:
 
 - `allowed_roots`: directories jobs may mount. Use the narrowest directory under `/groups` or `/nrs`
-  that holds the project, ideally one you created for agent work. A sandboxed agent can ask a child
-  job to mount any directory beneath a root, not only the ones you gave the sandbox, so everything
-  under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the policy rejects it).
+  that holds the project, ideally one you created for agent work. Without a csub that has the
+  envelope flags (csub #12 for child jobs, #13 for the top-level sandbox), a sandboxed agent can ask
+  a job to mount any directory beneath a root, not only the ones you gave the sandbox, so everything
+  under it is in reach. The wrappers pass the envelope flags when csub supports them. Never `$HOME` (csub refuses it) and never `/scratch` (the policy rejects it).
 - `sandbox_scripts_dir`: this repo's `scripts/` directory; child jobs run through it.
 - `allowed_images`: list the concrete images rather than the default glob, so `csub probe` and
   the in-sandbox README can tell an agent exactly what exists:
@@ -163,6 +164,10 @@ Check it, then make the broker findable whenever you start a `--csub` sandbox:
 echo '{"protocol":1,"op":"probe"}' | ~/.venvs/csub/bin/csub-broker     # expect "ok":true
 export PATH=~/.venvs/csub/bin:$PATH
 ```
+
+The envelope covers hosts as well as mounts: a job that names an `agent` (policy `[agents]`) gets
+that agent's hosts added, and the broker then refuses it unless the sandbox's own `--allow` list
+includes them. Add the agent's hosts to `--allow` if its child jobs should run it.
 
 ## 7. The images (podman)
 
