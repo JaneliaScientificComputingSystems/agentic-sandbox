@@ -351,6 +351,15 @@ roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy witho
 - **`csub: policy_violation: mount ... home directory`**: `CSUB_MOUNTS` includes something under
   `$HOME`; work from a directory under an allowed root. `csub --json probe` (`--json` before the
   subcommand) shows the policy.
+- **`--csub: nothing to bound child jobs to`** (at start): the sandbox has no mount outside `$HOME`
+  and `/scratch` and no `--allow` host, so the broker's envelope would be empty. Add the `--rw`/`--ro`
+  path or `--allow` host the child jobs may use, or `CSUB_ENVELOPE=off` for a policy-only broker.
+- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`**: a preset `CSUB_MOUNTS`
+  names a path the sandbox does not have, or asks rw where it is ro. Unset it, or add the path with
+  `--rw`/`--ro`.
+- **`csub: policy_violation: ... not allowed in the parent`** (from a child's submission): the child
+  job claimed a mount or host outside this sandbox's envelope. That is the envelope working; give the
+  top-level sandbox the mount or `--allow` host if the child really needs it.
 - **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
   policy or the `--allow` list, outside the sandbox.
 

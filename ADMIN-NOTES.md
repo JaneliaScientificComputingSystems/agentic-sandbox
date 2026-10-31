@@ -762,7 +762,8 @@ podman), and sets `CSUB_TRANSPORT=unix`, `CSUB_SOCKET`, `CSUB_MOUNTS`.
 mounts, the broker rejects anything under `$HOME`, its policy cannot list `/scratch` as a root
 (the `scratch_root` placement check), and it rejects *overlapping* mounts — the first live run
 failed exactly there, with `$PWD` listed next to the `--rw` root containing it. The derivation
-now drops nested paths in favour of the outer one; `$CSUB_MOUNTS` preset on the host wins.
+now drops nested paths in favour of the outer one. (A `$CSUB_MOUNTS` preset on the host used to
+win outright; since the envelope below it may only narrow the derived list.)
 
 Verified live from a `short` job as the test account with policy `allowed_roots =
 ["<a group directory the test account owns>"]`, `sandbox = "podman"`, `max_pending_per_session = 5`:
@@ -777,6 +778,39 @@ Open on csub's side (reported to Stephan): no default pending cap (`0` = unlimit
 without `span[hosts=1]`, csub's own per-job wrapper has only an EXIT trap so a `bkill`ed child
 leaks its broker, canonical-path rule for mounts, and no `CLAUDE.md` in the repo though
 referenced.
+
+### `--csub` envelope: closing the mount-claim gap (2026-10-31)
+
+Until csub #12/#13, the broker checked a client's `CSUB_MOUNTS` and `--cwd` against the policy's
+`allowed_roots` only, so a sandboxed agent could have a child job mount any directory under a
+root, not just what the sandbox saw (boundary probes, 2026-10-16). #12 (merged 2026-10-19)
+bounds a child's requests to its parent job's mounts and hosts; #13 (merged 2026-10-26) adds `--envelope-mount PATH[:ro|rw]` / `--envelope-host HOST` so the top-level
+broker can be bounded the same way. Both wrappers now pass the sandbox's derived mounts and its
+`--allow` hosts as that envelope. A job that names an `agent` (policy `[agents]`) gets the agent's
+hosts added before the envelope check, so those hosts must be in `--allow`.
+
+Three things learned while reviewing the first version of the wrapper change:
+
+- csub reads *no* `--envelope-*` flags as *no envelope*, not as an envelope that allows nothing.
+  `podman-run.sh --csub --scratch` with no other mount and no `--allow` therefore started a
+  policy-only broker behind a warning. Both wrappers now refuse to start in that case (and with a
+  csub that lacks the flags); `CSUB_ENVELOPE=off` is the explicit opt-out. A bare `--envelope`
+  flag in csub would let that combination run bounded; not requested yet.
+- A preset `$CSUB_MOUNTS` fed the envelope, so a preset wider than the binds widened it. The list
+  is now always derived from the binds; a preset may only narrow it (same path or below, not rw
+  where the sandbox has ro) and anything else is refused before a broker starts.
+- `podman-run.sh` installed its EXIT trap after the config copies (incl. `~/.claude.json`) and
+  after two realistic exits (no command, `--gpu` with no GPU allocated), leaving the copies on
+  `/scratch`. An early trap now follows the per-job `mkdir`, those checks run before anything is
+  created, and `podman rm -f --all` in cleanup is guarded on `CONTAINERS_STORAGE_CONF` so it can
+  never address the shared store.
+
+Verified live 2026-10-31 as the test account against csub main (`e253aa5`): test-bwrap.sh 36/0,
+test-podman.sh 31/0, including decoy-directory claims refused with rc 3, the empty-envelope and
+wider-preset refusals (rc 1, no broker started), `CSUB_ENVELOPE=off` probing a policy-only
+broker, an `--agent opencode` child accepted with `--allow litellm.int.janelia.org` and refused
+without it ("host ... is not allowed in the parent job"), and no state dir or broker left after
+the early exits.
 
 ### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
 

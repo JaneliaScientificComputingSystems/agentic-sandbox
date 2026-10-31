@@ -160,9 +160,9 @@ used `gpu_short` and exited 0.
 - **The key is exposed to the agent by design.** It must be, to reach its model. The network allowlist and a
   narrow key are the protection; there is no way to hide it from the process that uses it.
 - **Policy was broader than the sandbox.** `allowed_roots` covered more than the four mounted paths, and a
-  sandboxed client can claim any directory under it. csub #12 closed this for child jobs; the top-level
-  sandbox needs csub #13 (an envelope from the sandbox's own mounts) and the matching wrapper change, and
-  this run used neither. The audit shows this run did not widen its claims.
+  sandboxed client can claim any directory under it. csub #12 closed this for child jobs and #13 for the
+  top-level sandbox (an envelope from the sandbox's own mounts and hosts, which the wrappers now pass);
+  this run predates both. The audit shows this run did not widen its claims.
 - **The proxy log is deleted at exit**, so a denied connection from a real attempt would leave no trace except
   the transcript. A durable boundary log would fix that.
 - Results come from a 334-image subset and a simplified metric (F1 at IoU 0.5 and 0.75). Baseline numbers come
