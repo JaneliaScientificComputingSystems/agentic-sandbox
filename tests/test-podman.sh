@@ -153,6 +153,13 @@ if [[ -f "$CREDS" ]]; then
 fi
 check "per-job state dirs removed on exit" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
+# Early exits must not leave the cfg/ copies (~/.claude.json) behind either: --gpu in an LSF
+# job with no GPU allocated is the common one, and a missing command the other.
+OUT=$(env -u CUDA_VISIBLE_DEVICES "$PODMAN_RUN" --gpu --claude -- true >/dev/null 2>&1; echo $?)
+check "--gpu with no GPU allocated exits 1" "$OUT" "1"
+OUT=$("$PODMAN_RUN" --claude >/dev/null 2>&1; echo $?)
+check "no command exits 1" "$OUT" "1"
+check "early exits leave no per-job state" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 echo "=== 13. --csub: sandboxed submission from inside the container (skipped without csub-broker) ==="
 if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "${CSUB_TEST_ROOT:-/nonexistent}" ]]; then
@@ -164,6 +171,16 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
     DECOY="$CSUB_TEST_ROOT/test-podman-decoy-$$"; mkdir -p "$DECOY"
     OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?" 2>&1 | tail -1)
     check "--csub: claiming a directory the container lacks is refused (envelope, rc 3)" "$OUT" "3"
+    # Nothing to put in the envelope (only /scratch mounted, no --allow): csub would read that as
+    # "no envelope" and accept any claim under allowed_roots, so the wrapper must refuse to start
+    # (rc 1) instead of warning. CSUB_ENVELOPE=off is the explicit way to accept a policy-only broker.
+    OUT=$("$PODMAN_RUN" --csub --scratch -- true >/dev/null 2>&1; echo $?)
+    check "--csub: empty envelope refused at start (rc 1)" "$OUT" "1"
+    OUT=$(CSUB_ENVELOPE=off "$PODMAN_RUN" --csub --scratch -- bash -c 'csub probe >/dev/null 2>&1 && echo probe-ok' 2>/dev/null | tail -1)
+    check "--csub: CSUB_ENVELOPE=off starts a policy-only broker" "$OUT" "probe-ok"
+    OUT=$(CSUB_MOUNTS="$CW:rw,$DECOY:rw" "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo $?)
+    check "--csub: preset CSUB_MOUNTS wider than the container is refused (rc 1)" "$OUT" "1"
+    check "--csub: no broker left behind after refusals" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
     rm -rf "$DECOY"
   else
     echo "SKIP: this csub has no --envelope-mount (needs csub #13)"

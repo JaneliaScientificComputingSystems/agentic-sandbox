@@ -89,10 +89,13 @@
 # sandbox and killed with it; only its socket crosses the boundary. Inside: CSUB_TRANSPORT=unix,
 # CSUB_SOCKET=/run/csub.sock, PYTHONPATH pointing at the read-only bind of the csub install's
 # site-packages (so the system python3 can `import csub`), a `csub` shim on PATH, and
-# CSUB_MOUNTS listing this sandbox's mounts as csub expects them ("path:rw,path:ro") -- taken
-# from $CSUB_MOUNTS if you set it, else derived from $PWD and the --rw/--ro paths that are not
-# under $HOME or /scratch (csub refuses home, and its policy forbids scratch as a root). Which
-# of those csub then accepts is the broker policy's business, reported per request.
+# CSUB_MOUNTS listing this sandbox's mounts as csub expects them ("path:rw,path:ro"), derived
+# from $PWD and the --rw/--ro paths that are not under $HOME or /scratch (csub refuses home, and
+# its policy forbids scratch as a root); a preset $CSUB_MOUNTS may only narrow that list. Which
+# of those csub then accepts is the broker policy's business, reported per request. The same
+# mounts and the --allow hosts bound every request as the broker's envelope (csub #13): a child
+# job cannot claim what this sandbox cannot see. Without anything to put in the envelope, or
+# with a csub that lacks it, the wrapper refuses to start; CSUB_ENVELOPE=off overrides that.
 #
 # Examples:
 #   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
@@ -174,6 +177,18 @@ chmod 700 "$SANDBOX_STATE_PARENT"
 JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
 mkdir -p "$JOB_DIR"
 chmod 700 "$JOB_DIR"
+# Removed on every exit from here on: the cfg/ copies below include ~/.claude.json (account
+# details), so no exit between here and the full cleanup() further down may leave them behind.
+# cleanup() replaces this trap once there is a proxy or broker to stop as well.
+early_cleanup() { rm -rf "$JOB_DIR"; true; }
+trap early_cleanup EXIT
+# bash does NOT run EXIT traps when killed by an untrapped fatal signal -- exactly how `bkill`
+# and LSF walltime kills arrive (SIGUSR2/SIGTERM before SIGKILL). Route them through the EXIT
+# trap so the proxy, the csub broker and the per-job state dir are cleaned up on those paths
+# too; bwrap itself dies with the wrapper (--die-with-parent).
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 141' USR2
 new_cfg_root() {
   [[ -n "$SANDBOX_CFG_ROOT" ]] && return 0
   SANDBOX_CFG_ROOT="$JOB_DIR/cfg"
@@ -387,14 +402,9 @@ cleanup() {
   [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]] && rm -rf "$JOB_DIR"
   true
 }
+# Replaces early_cleanup (installed right after the per-job dir was made); the signal traps set
+# up there keep routing through whichever EXIT trap is current.
 trap cleanup EXIT
-# bash does NOT run EXIT traps when killed by an untrapped fatal signal -- exactly how `bkill`
-# and LSF walltime kills arrive (SIGUSR2/SIGTERM before SIGKILL). Route them through the EXIT
-# trap so the proxy, the csub broker and the per-job state dir are cleaned up on those paths
-# too; bwrap itself dies with the wrapper (--die-with-parent).
-trap 'exit 143' TERM
-trap 'exit 130' INT
-trap 'exit 141' USR2
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
@@ -418,42 +428,70 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   printf '%s\n' '#!/bin/sh' 'exec python3 -m csub.cli "$@"' > "$CSUB_DIR/bin/csub"
   chmod 700 "$CSUB_DIR/bin/csub"
   CSUB_SOCK="$CSUB_DIR/csub.sock"
-  # CSUB_MOUNTS: what this sandbox can see, in csub's "path:mode,..." form, unless preset.
-  # csub rejects overlapping mounts, so a path nested under another listed path is dropped
-  # (the outer one carries it): $PWD inside a --rw project root is the common case.
-  if [[ -z "${CSUB_MOUNTS:-}" ]]; then
-    _cands=("$PWD:rw")
-    for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-    for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
-    CSUB_MOUNTS=""
-    for c in "${_cands[@]}"; do
-      cp="${c%:*}"; nested=0
-      for o in "${_cands[@]}"; do
-        op="${o%:*}"
-        [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
-      done
-      [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
+  # CSUB_MOUNTS: what this sandbox can see, in csub's "path:mode,..." form, always derived from
+  # $PWD and the --rw/--ro binds that are not under $HOME or /scratch (csub refuses home, and its
+  # policy forbids scratch as a root). csub rejects overlapping mounts, so a path nested under
+  # another listed path is dropped (the outer one carries it): $PWD inside a --rw project root
+  # is the common case.
+  _cands=("$PWD:rw")
+  for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+  for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  DERIVED_MOUNTS=""
+  for c in "${_cands[@]}"; do
+    cp="${c%:*}"; nested=0
+    for o in "${_cands[@]}"; do
+      op="${o%:*}"
+      [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
     done
-  fi
-  # Envelope: with a csub that has --envelope-mount/--envelope-host (csub #13), bound every
-  # request to this sandbox's own mounts and hosts, so a client cannot claim a directory it
-  # cannot see (CSUB_MOUNTS and --cwd are otherwise limited only by the policy's allowed_roots).
-  # CSUB_ENVELOPE=off skips it, =on refuses to start without it; default: apply it if csub can.
-  CSUB_ENV_ARGS=()
-  if [[ "${CSUB_ENVELOPE:-auto}" != off ]]; then
-    if $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
-      IFS=, read -ra _em <<< "$CSUB_MOUNTS"
-      for m in "${_em[@]:-}"; do [[ -n "$m" ]] && CSUB_ENV_ARGS+=(--envelope-mount "$m"); done
-      for h in "${ALLOW_HOSTS[@]:-}"; do [[ -n "$h" ]] && CSUB_ENV_ARGS+=(--envelope-host "$h"); done
-      if [[ ${#CSUB_ENV_ARGS[@]} -eq 0 ]]; then
-        echo "sandbox-run.sh: --csub: no mounts or hosts to bound requests to; envelope not applied" >&2
+    [[ $nested -eq 0 && ",$DERIVED_MOUNTS," != *",$c,"* ]] && DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$c"
+  done
+  # A preset $CSUB_MOUNTS may only NARROW that list: every entry must be one of the derived
+  # mounts or a path under one, and not rw where the sandbox has it ro. It is checked here, not
+  # left to the broker, because the same list becomes the envelope below -- an envelope wider
+  # than the sandbox would let child jobs reach what the sandbox itself cannot, which is the one
+  # thing the envelope exists to prevent. (Bare "path" means rw, as in csub.)
+  if [[ -n "${CSUB_MOUNTS:-}" ]]; then
+    IFS=, read -ra _pre <<< "$CSUB_MOUNTS"
+    IFS=, read -ra _der <<< "$DERIVED_MOUNTS"
+    for e in "${_pre[@]}"; do
+      [[ -n "$e" ]] || continue
+      ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      ok=0
+      for d in "${_der[@]}"; do
+        dp="${d%:*}"; dm="${d##*:}"
+        [[ "$ep" == "$dp" || "$ep" == "$dp/"* ]] || continue
+        [[ "$em" == ro || "$dm" == rw ]] && { ok=1; break; }
+      done
+      if [[ $ok -eq 0 ]]; then
+        echo "sandbox-run.sh: --csub: CSUB_MOUNTS entry '$e' is not within this sandbox's mounts ($DERIVED_MOUNTS). A preset CSUB_MOUNTS may only narrow them; add the path with --rw/--ro instead." >&2
+        exit 1
       fi
-    elif [[ "${CSUB_ENVELOPE:-auto}" == on ]]; then
-      echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=on but this csub-broker has no --envelope-mount (needs csub with #13)" >&2
+    done
+  else
+    CSUB_MOUNTS="$DERIVED_MOUNTS"
+  fi
+  # Envelope (--envelope-mount/--envelope-host, csub #13): every broker request is bounded by
+  # this sandbox's own mounts and --allow hosts, so a client cannot claim a directory it cannot
+  # see (CSUB_MOUNTS and --cwd are otherwise limited only by the policy's allowed_roots). Two
+  # cases would leave the broker bounded by the policy alone, and both are refused rather than
+  # warned about -- nobody reads a warning in an unattended run: a csub without the flags, and an
+  # envelope with nothing in it (csub reads "no --envelope-* flags" as "no envelope", not as "an
+  # envelope that allows nothing"). CSUB_ENVELOPE=off accepts a policy-only broker explicitly.
+  CSUB_ENV_ARGS=()
+  if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
+    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+      echo "sandbox-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
-    else
-      echo "sandbox-run.sh: --csub: this csub has no --envelope-mount; requests are bounded by the policy only (see csub #13)" >&2
     fi
+    IFS=, read -ra _em <<< "$CSUB_MOUNTS"
+    for m in "${_em[@]:-}"; do [[ -n "$m" ]] && CSUB_ENV_ARGS+=(--envelope-mount "$m"); done
+    for h in "${ALLOW_HOSTS[@]:-}"; do [[ -n "$h" ]] && CSUB_ENV_ARGS+=(--envelope-host "$h"); done
+    if [[ ${#CSUB_ENV_ARGS[@]} -eq 0 ]]; then
+      echo "sandbox-run.sh: --csub: nothing to bound child jobs to (no mounts outside \$HOME and /scratch, no --allow hosts), and csub treats an empty envelope as no envelope. Add the --rw/--ro path or --allow host the child jobs may use, or set CSUB_ENVELOPE=off to run the broker bounded by the policy only." >&2
+      exit 1
+    fi
+  else
+    echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
   $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!

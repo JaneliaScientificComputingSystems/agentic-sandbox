@@ -141,10 +141,12 @@ chmod 600 ~/.config/csub/broker.toml
 Edit the policy:
 
 - `allowed_roots`: directories jobs may mount. Use the narrowest directory under `/groups` or `/nrs`
-  that holds the project, ideally one you created for agent work. Without a csub that has the
-  envelope flags (csub #12 for child jobs, #13 for the top-level sandbox), a sandboxed agent can ask
-  a job to mount any directory beneath a root, not only the ones you gave the sandbox, so everything
-  under it is in reach. The wrappers pass the envelope flags when csub supports them. Never `$HOME` (csub refuses it) and never `/scratch` (the policy rejects it).
+  that holds the project, ideally one you created for agent work. The wrappers start the broker
+  with the sandbox's mounts and hosts as its envelope (csub #12 for child jobs, #13 for the top-level
+  sandbox), so a job can only mount what the sandbox already sees; without the envelope
+  (`CSUB_ENVELOPE=off`), a sandboxed agent can ask a job to mount any directory beneath a root, so
+  everything under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the policy
+  rejects it).
 - `sandbox_scripts_dir`: this repo's `scripts/` directory; child jobs run through it.
 - `allowed_images`: list the concrete images rather than the default glob, so `csub probe` and
   the in-sandbox README can tell an agent exactly what exists:

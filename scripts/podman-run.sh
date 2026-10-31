@@ -25,7 +25,10 @@
 #                    /run/csub.sock and the csub client read-only, sets CSUB_TRANSPORT/
 #                    CSUB_SOCKET/CSUB_MOUNTS/PYTHONPATH inside. Same mechanism and caveats as
 #                    sandbox-run.sh --csub (see its header). CSUB_MOUNTS is derived from the
-#                    --rw/--ro paths not under $HOME or /scratch unless you preset it.
+#                    --rw/--ro paths not under $HOME or /scratch (a preset may only narrow it),
+#                    and with the --allow hosts bounds every request as the broker's envelope;
+#                    with nothing to put in it the wrapper refuses to start (CSUB_ENVELOPE=off
+#                    overrides).
 #   --gpu           Add --device nvidia.com/gpu=all. Under LSF the job's device cgroup lets
 #                    only the allocated GPUs through. In an LSF job with no GPU allocated
 #                    (CUDA_VISIBLE_DEVICES empty) this is an error.
@@ -109,6 +112,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 CMD=("$@")
+if [[ ${#CMD[@]} -eq 0 ]]; then
+  echo "No command given after --" >&2; usage; exit 1
+fi
+if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  # Checked before anything is created: this is the most common early exit.
+  echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
+       "the job has no GPU allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
+  exit 1
+fi
 
 # --claude/--opencode: the harness CONFIG is copied into a per-job directory. Claude's copy is
 # mounted at the same path inside the container and pointed to via CLAUDE_CONFIG_DIR, so its
@@ -140,6 +152,21 @@ JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDE
 mkdir -p "$JOB_DIR"
 chmod 700 "$JOB_DIR"
 JOB_STORAGE_DIR="$JOB_DIR/podman"
+# Removed on every exit from here on. The cfg/ copies below include ~/.claude.json (account
+# details), so an exit between here and the full cleanup() further down (a failed image pull,
+# say) must not leave them on /scratch. Plain rm is enough on those paths: nothing has run
+# against the per-job store yet, so there is no container, pause process or subuid-owned
+# layer to tear down. cleanup() replaces this trap once there can be.
+early_cleanup() { rm -rf "$JOB_DIR"; true; }
+trap early_cleanup EXIT
+# bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
+# how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
+# without these, a walltime kill leaks the container, the pause process, and the per-job
+# /scratch store until the cleanup cron. Trapping the signal to `exit` routes it through the
+# EXIT trap.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 141' USR2
 
 SANDBOX_CFG_ROOT=""
 CLAUDE_CFG=""
@@ -191,9 +218,6 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
     VOLUMES+=("-v" "$OPENCODE_CFG:/root/.config/opencode:rw")
     for d in .local/share/opencode .local/state/opencode .cache/opencode; do VOLUMES+=("-v" "$HOME/$d:/root/$d:rw"); done
   fi
-fi
-if [[ ${#CMD[@]} -eq 0 ]]; then
-  echo "No command given after --" >&2; usage; exit 1
 fi
 
 # Per-job podman storage and runtime paths ($JOB_DIR/podman, see the state-dir comment above),
@@ -433,12 +457,8 @@ if [[ $GPU -eq 1 ]]; then
   # count the whole node, and a node's CDI spec can map names to the wrong /dev/nvidiaN when it
   # was generated before device minors changed. Either way a per-GPU --device can hand the
   # container a node the job may not open. The job's device cgroup lets only the allocated GPUs
-  # through, so `all` inside it is exactly the job's GPUs.
-  if [[ -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
-         "the job has no GPU allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
-    exit 1
-  fi
+  # through, so `all` inside it is exactly the job's GPUs. (An LSF job with no GPU allocated
+  # was already refused right after argument parsing.)
   PODMAN_ARGS+=(--device nvidia.com/gpu=all)
 fi
 if [[ $KEEP_ID -eq 1 ]]; then
@@ -513,8 +533,12 @@ cleanup() {
 
   # Remove this job's own containers before tearing down the storage config they're addressed
   # through -- a container that outlives this cleanup becomes unreachable once storage.conf is
-  # gone. Scoped to CONTAINERS_STORAGE_CONF, so this can never touch a sibling job's containers.
-  podman rm -f --all --time 10 >/dev/null 2>&1 || true
+  # gone. Scoped to CONTAINERS_STORAGE_CONF, so this can never touch a sibling job's containers;
+  # the guard keeps it that way should this ever run before the export (the --all would then hit
+  # the user's SHARED store and remove every container they own on the node).
+  if [[ -n "${CONTAINERS_STORAGE_CONF:-}" ]]; then
+    podman rm -f --all --time 10 >/dev/null 2>&1 || true
+  fi
 
   # The watchdog below should already have reaped any lingering catatonit for this job by the
   # time we get here; this is just a last-chance sweep before removing the storage dir.
@@ -564,15 +588,10 @@ cleanup() {
   fi
   true
 }
+# Replaces early_cleanup (installed right after the per-job dir was made): from here on an exit
+# may have a container, a pause process or a populated per-job store to tear down. The signal
+# traps set up there keep routing through whichever EXIT trap is current.
 trap cleanup EXIT
-# bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
-# how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
-# without these, a walltime kill leaks the container, the pause process, and the per-job
-# /scratch store until the cleanup cron. Trapping the signal to `exit` routes it through the
-# EXIT trap above.
-trap 'exit 143' TERM
-trap 'exit 130' INT
-trap 'exit 141' USR2
 
 RELAY_PORT=$((20000 + RANDOM % 20000))
 
@@ -594,41 +613,66 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   printf '%s\n' '#!/bin/sh' 'exec python3 -m csub.cli "$@"' > "$CSUB_DIR/bin/csub"
   chmod 755 "$CSUB_DIR/bin/csub"
   CSUB_SOCK="$CSUB_DIR/csub.sock"
-  # csub rejects overlapping mounts, so a path nested under another listed path is dropped.
-  if [[ -z "${CSUB_MOUNTS:-}" ]]; then
-    _cands=()
-    for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-    for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
-    CSUB_MOUNTS=""
-    for c in "${_cands[@]:-}"; do
-      [[ -n "$c" ]] || continue
-      cp="${c%:*}"; nested=0
-      for o in "${_cands[@]}"; do
-        op="${o%:*}"
-        [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
-      done
-      [[ $nested -eq 0 && ",$CSUB_MOUNTS," != *",$c,"* ]] && CSUB_MOUNTS="${CSUB_MOUNTS:+$CSUB_MOUNTS,}$c"
+  # CSUB_MOUNTS: what this container can see, in csub's "path:mode,..." form, always derived from
+  # the --rw/--ro paths not under $HOME or /scratch (no $PWD here: the container's cwd is not the
+  # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
+  _cands=()
+  for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+  for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  DERIVED_MOUNTS=""
+  for c in "${_cands[@]:-}"; do
+    [[ -n "$c" ]] || continue
+    cp="${c%:*}"; nested=0
+    for o in "${_cands[@]}"; do
+      op="${o%:*}"
+      [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
     done
-  fi
-  # Envelope: with a csub that has --envelope-mount/--envelope-host (csub #13), bound every
-  # request to this sandbox's own mounts and hosts, so a client cannot claim a directory it
-  # cannot see (CSUB_MOUNTS and --cwd are otherwise limited only by the policy's allowed_roots).
-  # CSUB_ENVELOPE=off skips it, =on refuses to start without it; default: apply it if csub can.
-  CSUB_ENV_ARGS=()
-  if [[ "${CSUB_ENVELOPE:-auto}" != off ]]; then
-    if $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
-      IFS=, read -ra _em <<< "$CSUB_MOUNTS"
-      for m in "${_em[@]:-}"; do [[ -n "$m" ]] && CSUB_ENV_ARGS+=(--envelope-mount "$m"); done
-      for h in "${ALLOW_HOSTS[@]:-}"; do [[ -n "$h" ]] && CSUB_ENV_ARGS+=(--envelope-host "$h"); done
-      if [[ ${#CSUB_ENV_ARGS[@]} -eq 0 ]]; then
-        echo "podman-run.sh: --csub: no mounts or hosts to bound requests to; envelope not applied" >&2
+    [[ $nested -eq 0 && ",$DERIVED_MOUNTS," != *",$c,"* ]] && DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$c"
+  done
+  # A preset $CSUB_MOUNTS may only NARROW that list (see sandbox-run.sh for the reasoning: the
+  # same list becomes the envelope, and an envelope wider than the sandbox defeats it).
+  if [[ -n "${CSUB_MOUNTS:-}" ]]; then
+    IFS=, read -ra _pre <<< "$CSUB_MOUNTS"
+    IFS=, read -ra _der <<< "$DERIVED_MOUNTS"
+    for e in "${_pre[@]}"; do
+      [[ -n "$e" ]] || continue
+      ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      ok=0
+      for d in "${_der[@]:-}"; do
+        [[ -n "$d" ]] || continue
+        dp="${d%:*}"; dm="${d##*:}"
+        [[ "$ep" == "$dp" || "$ep" == "$dp/"* ]] || continue
+        [[ "$em" == ro || "$dm" == rw ]] && { ok=1; break; }
+      done
+      if [[ $ok -eq 0 ]]; then
+        echo "podman-run.sh: --csub: CSUB_MOUNTS entry '$e' is not within this container's mounts (${DERIVED_MOUNTS:-none}). A preset CSUB_MOUNTS may only narrow them; add the path with --rw/--ro instead." >&2
+        exit 1
       fi
-    elif [[ "${CSUB_ENVELOPE:-auto}" == on ]]; then
-      echo "podman-run.sh: --csub: CSUB_ENVELOPE=on but this csub-broker has no --envelope-mount (needs csub with #13)" >&2
+    done
+  else
+    CSUB_MOUNTS="$DERIVED_MOUNTS"
+  fi
+  # Envelope (--envelope-mount/--envelope-host, csub #13): every broker request is bounded by
+  # this container's own mounts and --allow hosts. A csub without the flags, or an envelope with
+  # nothing in it (which csub reads as "no envelope"), would leave the broker bounded by the
+  # policy alone; both are refused unless CSUB_ENVELOPE=off accepts that explicitly. The empty
+  # case is easy to hit here -- `--csub --scratch` with no other mount and no --allow -- and
+  # was previously a warning that an unattended run never reads.
+  CSUB_ENV_ARGS=()
+  if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
+    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+      echo "podman-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
-    else
-      echo "podman-run.sh: --csub: this csub has no --envelope-mount; requests are bounded by the policy only (see csub #13)" >&2
     fi
+    IFS=, read -ra _em <<< "$CSUB_MOUNTS"
+    for m in "${_em[@]:-}"; do [[ -n "$m" ]] && CSUB_ENV_ARGS+=(--envelope-mount "$m"); done
+    for h in "${ALLOW_HOSTS[@]:-}"; do [[ -n "$h" ]] && CSUB_ENV_ARGS+=(--envelope-host "$h"); done
+    if [[ ${#CSUB_ENV_ARGS[@]} -eq 0 ]]; then
+      echo "podman-run.sh: --csub: nothing to bound child jobs to (no --rw/--ro outside \$HOME and /scratch, no --allow hosts), and csub treats an empty envelope as no envelope. Add the --rw/--ro path or --allow host the child jobs may use, or set CSUB_ENVELOPE=off to run the broker bounded by the policy only." >&2
+      exit 1
+    fi
+  else
+    echo "podman-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
   $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!

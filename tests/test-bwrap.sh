@@ -193,6 +193,14 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
     DECOY="$CSUB_TEST_ROOT/test-bwrap-decoy-$$"; mkdir -p "$DECOY"
     OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c "CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?")
     check "--csub: claiming a directory the sandbox lacks is refused (envelope, rc 3)" "$OUT" "3"
+    # A preset CSUB_MOUNTS on the host may narrow the envelope, never widen it: wider is refused
+    # by the wrapper itself (rc 1, before any broker starts), narrower is what the agent sees.
+    OUT=$(cd "$CW" && CSUB_MOUNTS="$CW:rw,$DECOY:rw" "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo $?)
+    check "--csub: preset CSUB_MOUNTS wider than the sandbox is refused (rc 1)" "$OUT" "1"
+    mkdir -p "$CW/sub"
+    OUT=$(cd "$CW" && CSUB_MOUNTS="$CW/sub:ro" "$SANDBOX_RUN" --csub -- bash -c 'echo "$CSUB_MOUNTS"' 2>/dev/null)
+    check "--csub: preset CSUB_MOUNTS narrower than the sandbox is kept" "$OUT" "$CW/sub:ro"
+    check "--csub: no broker left behind after refusals" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
     rm -rf "$DECOY"
   else
     echo "SKIP: this csub has no --envelope-mount (needs csub #13)"

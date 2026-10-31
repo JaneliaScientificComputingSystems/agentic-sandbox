@@ -5,12 +5,16 @@ the evidence behind each.
 
 ## Unreleased
 
-- **`--csub` bounds client-claimed mounts to the sandbox.** With a csub that has
-  `--envelope-mount`/`--envelope-host` (csub #13), both wrappers start the broker with this
-  sandbox's own mounts and `--allow` hosts as an envelope, so `CSUB_MOUNTS`/`--cwd` can no longer
-  name a directory under `allowed_roots` that the sandbox cannot see. Older csub: warning, policy
-  only. `CSUB_ENVELOPE=off` skips it, `=on` refuses to start without it. A child job that names an
-  `agent` needs that agent's hosts in `--allow`, or the envelope refuses it.
+- **`--csub` bounds client-claimed mounts to the sandbox.** Both wrappers start the broker with
+  this sandbox's own mounts and `--allow` hosts as an envelope (`--envelope-mount`/`--envelope-host`,
+  csub #13), so `CSUB_MOUNTS`/`--cwd` can no longer name a directory under `allowed_roots` that the
+  sandbox cannot see. **`--csub` now refuses to start** when the envelope would be empty (no mount
+  outside `$HOME`/`/scratch` and no `--allow`; csub treats that as no envelope) or when csub lacks
+  the flags; `CSUB_ENVELOPE=off` accepts a policy-only broker explicitly. A preset `CSUB_MOUNTS` may
+  only narrow the derived list, never widen it. A child job that names an `agent` needs that agent's
+  hosts in `--allow`, or the envelope refuses it.
+- **Early exits leave no per-job state.** The per-job dir (with its `~/.claude.json` copy) is now
+  removed on every exit path, including a usage error or `--gpu` with no GPU allocated.
 
 ## 2026-10-16
 

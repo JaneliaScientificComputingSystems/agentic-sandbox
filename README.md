@@ -188,13 +188,17 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
 - Inside, `csub` and `import csub` work with the sandbox's own `python3` (csub's `site-packages` is
   bound read-only, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
   `CSUB_MOUNTS` comes from `$PWD` and the `--rw`/`--ro` paths not under `$HOME` or `/scratch` (nested
-  ones dropped), or from `$CSUB_MOUNTS` if you preset it.
+  ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
+  does not.
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again.
-- **The agent controls `CSUB_MOUNTS` inside the sandbox**, and the broker accepts any directory under
-  your policy's `allowed_roots`, so a child job can mount directories the sandbox itself can't see.
-  Keep `allowed_roots` as narrow as the project.
+- **The agent controls `CSUB_MOUNTS` inside the sandbox**, but the broker is started with this
+  sandbox's mounts and `--allow` hosts as its envelope (csub #13), so a child job cannot mount a
+  directory the sandbox itself can't see, or reach a host it can't. With nothing to put in the
+  envelope (podman with only `/scratch` mounted and no `--allow`, say) or a csub without it, the
+  wrapper refuses to start; `CSUB_ENVELOPE=off` accepts a broker bounded by the policy alone. Keep
+  `allowed_roots` as narrow as the project either way.
 - Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). Without `bsub` on the host,
   `--csub` fails at start; csub's `csub relay` is the tool for that case.
 
