@@ -26,7 +26,21 @@ import sys
 from typing import Optional, Tuple
 
 
+# Header section limits: a client that never sends the blank line, or sends headers forever,
+# must not hold a connection and its buffers open indefinitely.
+MAX_HEADER_BYTES = 64 * 1024
+MAX_HEADER_LINES = 200
+HEADER_TIMEOUT = 30.0
+
+
 async def pipe(reader, writer):
+    """Copy until EOF, then half-close the far side so it sees the EOF too.
+
+    Closing outright on the first EOF would cut off a response still in
+    flight the other way (an HTTP client that shuts down its send side after
+    the request, for one). The caller closes both ends once both directions
+    are done.
+    """
     try:
         while True:
             data = await reader.read(65536)
@@ -34,10 +48,28 @@ async def pipe(reader, writer):
                 break
             writer.write(data)
             await writer.drain()
-    except (ConnectionResetError, BrokenPipeError):
-        pass
-    finally:
+        if writer.can_write_eof():
+            writer.write_eof()
+    except (ConnectionResetError, BrokenPipeError, OSError):
         writer.close()
+
+
+async def read_headers(reader) -> bytes:
+    """The header lines after the request line, up to and including the blank line.
+
+    Raises ValueError when the section is too long or too slow (the caller
+    answers 400 and closes).
+    """
+    headers = b""
+    lines = 0
+    while True:
+        line = await asyncio.wait_for(reader.readline(), HEADER_TIMEOUT)
+        headers += line
+        lines += 1
+        if line in (b"\r\n", b"\n", b""):
+            return headers
+        if len(headers) > MAX_HEADER_BYTES or lines > MAX_HEADER_LINES:
+            raise ValueError("header section too large")
 
 
 def normalize_host(host: str) -> str:
@@ -100,8 +132,9 @@ async def _reject(writer, status: bytes):
 
 async def handle_client(reader, writer, allowlist):
     peer = writer.get_extra_info("peername")
+    remote_writer = None
     try:
-        first_line = await reader.readline()
+        first_line = await asyncio.wait_for(reader.readline(), HEADER_TIMEOUT)
         if not first_line:
             writer.close()
             return
@@ -112,13 +145,14 @@ async def handle_client(reader, writer, allowlist):
             return
         method, target = parts[0], parts[1]
 
+        try:
+            headers = await read_headers(reader)
+        except (ValueError, asyncio.TimeoutError, asyncio.LimitOverrunError) as e:
+            print(f"[allowlist_proxy] BAD headers from peer={peer}: {e}", file=sys.stderr)
+            await _reject(writer, b"400 Bad Request")
+            return
+
         if method == "CONNECT":
-            headers = b""
-            while True:
-                line = await reader.readline()
-                headers += line
-                if line in (b"\r\n", b""):
-                    break
             hp = split_hostport(target, 443)
             if hp is None:
                 print(f"[allowlist_proxy] BAD CONNECT target {target!r} (peer={peer})", file=sys.stderr)
@@ -142,16 +176,13 @@ async def handle_client(reader, writer, allowlist):
                 pipe(remote_reader, writer),
             )
         else:
-            # Plain HTTP: read headers, find Host:, forward raw bytes.
-            headers = first_line
+            # Plain HTTP: find Host: in the headers already read, forward raw bytes.
             hostport = None
-            while True:
-                line = await reader.readline()
-                headers += line
+            for line in headers.splitlines(keepends=True):
                 if line.lower().startswith(b"host:"):
                     hostport = line.split(b":", 1)[1].strip().decode("latin1")
-                if line in (b"\r\n", b""):
                     break
+            headers = first_line + headers
             hp = split_hostport(hostport, 80) if hostport else None
             if hp is None:
                 print(f"[allowlist_proxy] DENY HTTP bad/missing Host {hostport!r} (peer={peer})", file=sys.stderr)
@@ -177,6 +208,8 @@ async def handle_client(reader, writer, allowlist):
     except Exception as e:
         print(f"[allowlist_proxy] error: {e}", file=sys.stderr)
     finally:
+        if remote_writer is not None:
+            remote_writer.close()
         writer.close()
 
 

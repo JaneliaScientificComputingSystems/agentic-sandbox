@@ -78,7 +78,9 @@ set -euo pipefail
 # redirected file, whatever it actually is) reachable via `<&3` when launching podman.
 exec 3<&0
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Physical path, so running the script through a symlink still finds allowlist_proxy.py and
+# relay.py next to it.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
 RO_PATHS=()
@@ -97,8 +99,12 @@ usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) IMAGE="$2"; shift 2 ;;
-    --ro) VOLUMES+=("-v" "$2:$2:ro"); RO_PATHS+=("$2"); shift 2 ;;
-    --rw) VOLUMES+=("-v" "$2:$2:rw"); RW_PATHS+=("$2"); shift 2 ;;
+    --ro|--rw)
+      # Canonical, existing path: a relative or symlinked argument would otherwise be mounted
+      # under one name and compared (csub envelope) under another.
+      p="$(realpath -e -- "$2" 2>/dev/null)" || { echo "podman-run.sh: $1 $2: no such path" >&2; exit 1; }
+      if [[ "$1" == --ro ]]; then VOLUMES+=("-v" "$p:$p:ro"); RO_PATHS+=("$p"); else VOLUMES+=("-v" "$p:$p:rw"); RW_PATHS+=("$p"); fi
+      shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
     --csub) WANT_CSUB=1; shift ;;
@@ -149,7 +155,9 @@ SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
 mkdir -p "$SANDBOX_STATE_PARENT"
 chmod 700 "$SANDBOX_STATE_PARENT"
 JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
-mkdir -p "$JOB_DIR"
+# Plain mkdir: the tag is unique by construction, so an existing dir is debris from a reused pid
+# or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
+mkdir "$JOB_DIR" || { echo "podman-run.sh: per-job state dir $JOB_DIR already exists; remove it (podman unshare rm -rf) if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
 JOB_STORAGE_DIR="$JOB_DIR/podman"
 # Removed on every exit from here on. The cfg/ copies below include ~/.claude.json (account
@@ -617,8 +625,9 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # the --rw/--ro paths not under $HOME or /scratch (no $PWD here: the container's cwd is not the
   # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   _cands=()
-  for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-  for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+  for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+  for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
   DERIVED_MOUNTS=""
   for c in "${_cands[@]:-}"; do
     [[ -n "$c" ]] || continue
@@ -680,14 +689,19 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
   echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  # Only the csub package (and tomli, which it needs on a python without tomllib, i.e. the
+  # image's 3.10) go into the container, under a directory of their own -- not the whole host
+  # venv site-packages: that put a python-3.9 venv's pip, setuptools and friends ahead of the
+  # image's own packages on PYTHONPATH for every python in the container.
   PODMAN_ARGS+=(
     -v "$CSUB_SOCK:/run/csub.sock:ro"
-    -v "$CSUB_SITE:$CSUB_SITE:ro"
+    -v "$CSUB_SITE/csub:/opt/csub-lib/csub:ro"
     -v "$CSUB_DIR/bin/csub:/usr/local/bin/csub:ro"
     -e CSUB_TRANSPORT=unix -e CSUB_SOCKET=/run/csub.sock
     -e "CSUB_MOUNTS=$CSUB_MOUNTS"
-    -e "PYTHONPATH=$CSUB_SITE"
+    -e "PYTHONPATH=/opt/csub-lib"
   )
+  [[ -d "$CSUB_SITE/tomli" ]] && PODMAN_ARGS+=(-v "$CSUB_SITE/tomli:/opt/csub-lib/tomli:ro")
 fi
 
 
@@ -810,9 +824,10 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     -v "$SCRIPT_DIR/relay.py:/opt/relay.py:ro"
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
+  # The relay is waited for (up to 5s of connect attempts via bash's /dev/tcp), not slept on.
   podman run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
-    sleep 1
+    for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/'"$RELAY_PORT"') 2>/dev/null && break; sleep 0.1; done
     export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"'
     export HTTP_PROXY=http://127.0.0.1:'"$RELAY_PORT"' HTTPS_PROXY=http://127.0.0.1:'"$RELAY_PORT"'
     export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost

@@ -134,6 +134,12 @@ async def e2e():
               await talk(sock, b"GET / HTTP/1.1\r\n\r\n"), "HTTP/1.1 400 Bad Request")
         check("e2e CONNECT with bad port rejected",
               await talk(sock, connect("localhost:99999")), "HTTP/1.1 400 Bad Request")
+        check("e2e oversized header section rejected",
+              await talk(sock, b"GET / HTTP/1.1\r\nHost: localhost\r\n" + (b"X-Pad: " + b"a" * 1000 + b"\r\n") * 70 + b"\r\n"),
+              "HTTP/1.1 400 Bad Request")
+        check("e2e too many header lines rejected",
+              await talk(sock, b"GET / HTTP/1.1\r\nHost: localhost\r\n" + b"X-A: b\r\n" * 250 + b"\r\n"),
+              "HTTP/1.1 400 Bad Request")
         check("e2e CONNECT to IPv6 literal not on allowlist denied",
               await talk(sock, connect(f"[::1]:{port}")), "HTTP/1.1 403 Forbidden")
     finally:

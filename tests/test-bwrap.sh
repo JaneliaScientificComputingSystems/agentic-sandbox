@@ -242,5 +242,24 @@ echo "=== 21. --claude puts the CLI on PATH even from a scrubbed environment ===
 OUT=$(env PATH=/usr/local/bin:/usr/bin:/bin "$SANDBOX_RUN" --claude -- sh -c 'command -v claude >/dev/null && echo claude-found' 2>/dev/null)
 check "claude resolvable with a scrubbed PATH" "$OUT" "claude-found"
 
+echo "=== 22. Working directory, paths and descriptors ==="
+OUT=$(cd "$HOME" && "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
+check "refuses to run from \$HOME (rc 1)" "$OUT" "1"
+# The trailing `:` keeps bash from exec'ing ls directly, so ls lists bash's descriptors, not its own.
+OUT=$(exec 7</dev/null; "$SANDBOX_RUN" -- bash -c 'ls /proc/$$/fd; :' 2>&1 | tr "\n" " ")
+check "inherited descriptors are closed (only 0-2 inside)" "$OUT" "0 1 2 "
+LINKDIR="/scratch/$USER/test-bwrap-link-$$"; mkdir -p "$LINKDIR/sub"; ln -sf "$SANDBOX_RUN" "$LINKDIR/sb"
+OUT=$(cd "$LINKDIR" && ./sb --allow example.invalid --rw sub -- bash -c 'test -w sub && echo link-ok' 2>/dev/null)
+check "runs through a symlink with --allow (proxy found) and a relative --rw" "$OUT" "link-ok"
+OUT=$("$SANDBOX_RUN" --rw "$LINKDIR/does-not-exist" -- true 2>&1; echo "rc=$?")
+check "nonexistent --rw path refused" "${OUT##*rc=}" "1"
+OUT=$("$SANDBOX_RUN" -- bash -c 'test -e "$HOME/.ssh" && echo vivified || echo clean')
+check "unbound \$HOME: no empty mask placeholders" "$OUT" "clean"
+if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+  OUT=$("$SANDBOX_RUN" --ro "$HOME" -- bash -c 'stat -c %s "$HOME/.claude/.credentials.json"' 2>/dev/null)
+  check "without --claude, ~/.claude/.credentials.json is masked (size 0)" "$OUT" "0"
+fi
+rm -rf "$LINKDIR"
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))

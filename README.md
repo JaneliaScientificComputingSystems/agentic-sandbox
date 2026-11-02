@@ -293,9 +293,8 @@ It is **not** stopped from:
   the proxy doesn't inspect content.
 - **Credentials deeper than direct children**, e.g. a `.env` in a subdirectory; and, with podman, any
   credentials under a bound path (no masking: never bind `$HOME`).
-- **Inheriting file descriptors** (bwrap): descriptors your launching shell had open beyond 0–2 are
-  visible inside. Launch from a clean shell.
-- **Making syscalls the kernel allows an unprivileged user** (bwrap installs no seccomp filter).
+- **Making syscalls the kernel allows an unprivileged user** (bwrap installs no seccomp filter, and
+  the cluster's bwrap 0.6 predates `--disable-userns`, so nested user namespaces stay available).
 - Anything multi-node: one sandbox, one host. No MPI, Ray, DDP, Spark or Dask across nodes.
 - Your own mistakes in Mode C: a human is present and the sandbox limits damage but doesn't review.
 
@@ -369,5 +368,11 @@ roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy witho
 - One opencode sandbox per account at a time; `--keep-id` needs a widened subuid/subgid range.
 - Per-job state needs a writable `/scratch/$USER`; `sandbox-run.sh` falls back to `$TMPDIR` only off
   the cluster and says so, `podman-run.sh` requires it.
+- A `TERM` sent to the wrapper's pid alone is acted on only after the sandboxed command exits (bash
+  runs traps between foreground commands). `bkill` and LSF walltime kills signal the whole process
+  group, so bwrap or podman gets it too and cleanup runs promptly; a bare `kill <wrapper-pid>` does
+  not. Kill the process group (`kill -- -<pgid>`) when doing it by hand.
+- `sandbox-run.sh` refuses to run from `$HOME` or a directory above it (the working directory is
+  bound read-write). Run it from a project directory.
 - Not tested: a fresh `claude auth login` combined with the one-shot or loop modes.
 

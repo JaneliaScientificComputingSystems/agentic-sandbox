@@ -15,6 +15,23 @@ the evidence behind each.
   hosts in `--allow`, or the envelope refuses it.
 - **Early exits leave no per-job state.** The per-job dir (with its `~/.claude.json` copy) is now
   removed on every exit path, including a usage error or `--gpu` with no GPU allocated.
+- **`sandbox-run.sh` refuses to run from `$HOME`** (or a directory above it): `$PWD` is bound
+  read-write and that would expose the whole home directory. Use `--rw "$HOME"` from a project
+  directory if you really mean it.
+- **More credential paths masked** under a visible `$HOME`/`$PWD`/bound root: `.gnupg`, `.config/gh`,
+  `.config/git/credentials`, `.pgpass`, `.vault-token`, `.cache/huggingface/token`, shell history
+  files, and the other harness's credentials (`~/.claude/.credentials.json` without `--claude`,
+  opencode's `auth.json` and `~/.config/opencode` without `--opencode`). Masks under `$HOME` are
+  applied only when `$HOME` is actually visible inside, so an unbound home no longer shows empty
+  `~/.ssh`-style placeholders.
+- **Inherited file descriptors are closed** before bwrap starts (only 0-2 pass through); the README
+  no longer lists this as a limitation.
+- **Paths are canonical.** `--ro`/`--rw` arguments are resolved with `realpath` and must exist; the
+  working directory is its physical path; the wrappers can be run through a symlink.
+- `--csub`: the host's `PYTHONPATH` is no longer passed into a bwrap sandbox; under podman only the
+  csub package (plus `tomli`) is mounted, at `/opt/csub-lib`, instead of the whole host venv.
+- The in-sandbox relay is waited for instead of slept on, and no longer prints a banner on the
+  command's stderr. The proxy bounds header reads (64 KiB, 200 lines, 30 s) and honours half-closes.
 
 ## 2026-10-16
 

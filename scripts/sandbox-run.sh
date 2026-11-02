@@ -106,7 +106,12 @@
 #     claude
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Physical paths throughout: the script's own directory (so running it through a symlink still
+# finds allowlist_proxy.py and relay.py next to it, and the read-only re-bind below shadows the
+# real directory), and the working directory (bwrap binds and csub's envelope compare paths
+# literally, and csub realpaths its side).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+cd -P . || exit 1
 RO_BINDS=()
 RW_BINDS=()
 RO_TRY_BINDS=()   # like RO_BINDS, but skipped silently if the path doesn't exist on the host
@@ -127,12 +132,16 @@ usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ro) RO_BINDS+=("$2"); shift 2 ;;
-    --rw) RW_BINDS+=("$2"); shift 2 ;;
+    --ro|--rw)
+      # Canonical, existing path: a relative or symlinked argument would otherwise be bound under
+      # one name and compared (masking, script-dir shadowing, csub envelope) under another.
+      p="$(realpath -e -- "$2" 2>/dev/null)" || { echo "sandbox-run.sh: $1 $2: no such path" >&2; exit 1; }
+      if [[ "$1" == --ro ]]; then RO_BINDS+=("$p"); else RW_BINDS+=("$p"); fi
+      shift 2 ;;
     --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
     --env) PASS_ENV+=("$2"); shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
-    --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("/scratch/$USER/work"); shift ;;
+    --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
       WANT_CLAUDE=1
       # The CLI's own install location, not just its credential/session state -- without
@@ -160,6 +169,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 CMD=("$@")
+# $PWD is always bound read-write. From $HOME, or from a directory above it, that is the whole
+# home directory, and the masks below cover only its well-known direct children. Refuse; a
+# deliberate home-wide sandbox is `--rw "$HOME"` from a project directory, where the header's
+# warning applies knowingly.
+HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+if [[ "$PWD" == "$HOME_P" || "$HOME_P" == "$PWD/"* ]]; then
+  echo "sandbox-run.sh: refusing to run from $PWD: the working directory is bound read-write and would expose your whole home directory. cd into a project directory first." >&2
+  exit 1
+fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
@@ -175,7 +193,9 @@ if ! mkdir -p "$SANDBOX_STATE_PARENT" 2>/dev/null; then
 fi
 chmod 700 "$SANDBOX_STATE_PARENT"
 JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
-mkdir -p "$JOB_DIR"
+# Plain mkdir: the tag is unique by construction, so an existing dir is debris from a reused pid
+# or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
+mkdir "$JOB_DIR" || { echo "sandbox-run.sh: per-job state dir $JOB_DIR already exists; remove it if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
 # Removed on every exit from here on: the cfg/ copies below include ~/.claude.json (account
 # details), so no exit between here and the full cleanup() further down may leave them behind.
@@ -316,12 +336,38 @@ done
 # its parent ended up read-only bound (confirmed live: --tmpfs on a
 # nonexistent ~/.azure under a read-only $HOME failed with "Can't mkdir:
 # Read-only file system").
-SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker)
-SENSITIVE_HOME_FILES=(.git-credentials .npmrc .pypirc .netrc .env .env.local)
+SENSITIVE_HOME_DIRS=(.ssh .aws .azure .kube .config/gcloud .docker .gnupg .config/gh)
+SENSITIVE_HOME_FILES=(.git-credentials .config/git/credentials .npmrc .pypirc .netrc .pgpass
+                      .vault-token .cache/huggingface/token .env .env.local
+                      .bash_history .zsh_history .python_history)
+# The agent harnesses' own credentials and config, masked only when that harness is NOT the one
+# running: --claude binds the real credentials file through into its per-job config dir and
+# --opencode binds its data dir read-write, so each needs its own; the other one's token is just
+# another secret in $HOME. (.config/git/credentials, not .config/git: the latter also holds the
+# user's identity, which commits need.)
+[[ $WANT_CLAUDE -eq 1 ]] || SENSITIVE_HOME_FILES+=(.claude/.credentials.json)
+if [[ $WANT_OPENCODE -eq 0 ]]; then
+  SENSITIVE_HOME_FILES+=(.local/share/opencode/auth.json)
+  SENSITIVE_HOME_DIRS+=(.config/opencode)
+fi
+# $HOME is a mask root only when it is actually visible inside (equal to, or under, a bound
+# root). Masking an unbound $HOME made bwrap create empty ~/.ssh, ~/.aws, ... mountpoints in the
+# sandbox's root tmpfs: harmless, but it told the agent which of those the user has.
+HOME_VISIBLE=0
+for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do
+  [[ -n "$root" ]] || continue
+  [[ "$HOME_P" == "$root" || "$HOME_P" == "$root/"* ]] && { HOME_VISIBLE=1; break; }
+done
 declare -A MASK_ROOTS_SEEN=()
 MASK_ROOTS=()
-for root in "$PWD" "$HOME" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
+for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
   [[ -n "$root" && -d "$root" ]] || continue
+  [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
+  MASK_ROOTS_SEEN[$root]=1
+  MASK_ROOTS+=("$root")
+done
+for root in "$HOME_P" "$HOME"; do
+  [[ $HOME_VISIBLE -eq 1 && -d "$root" ]] || continue
   [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
   MASK_ROOTS_SEEN[$root]=1
   MASK_ROOTS+=("$root")
@@ -434,8 +480,8 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # another listed path is dropped (the outer one carries it): $PWD inside a --rw project root
   # is the common case.
   _cands=("$PWD:rw")
-  for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-  for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
+  for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
   DERIVED_MOUNTS=""
   for c in "${_cands[@]}"; do
     cp="${c%:*}"; nested=0
@@ -507,7 +553,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     --ro-bind "$CSUB_DIR/bin" /run/csub-bin
     --setenv CSUB_TRANSPORT unix --setenv CSUB_SOCKET /run/csub.sock
     --setenv CSUB_MOUNTS "$CSUB_MOUNTS"
-    --setenv PYTHONPATH "$CSUB_SITE${PYTHONPATH:+:$PYTHONPATH}"
+    --setenv PYTHONPATH "$CSUB_SITE"
     --setenv PATH "/run/csub-bin:${PATH_PREPEND}${PATH}"
   )
 fi
@@ -616,6 +662,19 @@ PY
 
 write_sandbox_readme
 
+# bwrap passes every open descriptor through to the sandboxed process, and a launching shell or
+# LSF job script usually has a few open beyond 0-2 (a redirected log, a lock file, bash's own
+# fd for a sourced script). Close them in a subshell right before exec'ing bwrap: 0-2 stay, and
+# the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
+run_bwrap() {
+  local fd
+  for fd in /proc/self/fd/*; do
+    fd="${fd##*/}"
+    if [[ "$fd" -gt 2 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
+  done
+  exec bwrap "$@"
+}
+
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
   # socket (it is created 0755), and no one else's socket can stand in for ours. Node-local on
@@ -634,22 +693,24 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     --ro-bind "$SCRIPT_DIR/relay.py" /opt/sandbox-relay.py
     --ro-bind "$PROXY_SOCK" /run/sandbox-proxy.sock
   )
+  # The relay is waited for, not slept on: up to 5s of connect attempts to its port (bash's
+  # /dev/tcp, so nothing beyond bash is needed inside), then the command runs either way -- a
+  # relay that never came up shows as connection refused on the first request, as before.
   INNER_CMD=(
     /bin/bash -c
-    'python3 /opt/sandbox-relay.py 127.0.0.1 '"$RELAY_PORT"' /run/sandbox-proxy.sock & sleep 1; export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"' HTTP_PROXY=http://127.0.0.1:'"$RELAY_PORT"' HTTPS_PROXY=http://127.0.0.1:'"$RELAY_PORT"' no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost; exec "$@"'
+    'python3 /opt/sandbox-relay.py 127.0.0.1 '"$RELAY_PORT"' /run/sandbox-proxy.sock & for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/'"$RELAY_PORT"') 2>/dev/null && break; sleep 0.1; done; export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"' HTTP_PROXY=http://127.0.0.1:'"$RELAY_PORT"' HTTPS_PROXY=http://127.0.0.1:'"$RELAY_PORT"' no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost; exec "$@"'
     bash
     "${CMD[@]}"
   )
-  # Deliberately NOT exec'd here: exec would replace this script's own
-  # process image, which would skip the `trap cleanup EXIT` below and leak
-  # the host-side allowlist_proxy.py process. Run it as a normal foreground
-  # child instead, so the trap fires once it returns, and propagate its exit
-  # code explicitly.
-  bwrap "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}"
+  # bwrap runs in a subshell (run_bwrap exec's it there), NOT exec'd from this shell: exec would
+  # replace this script's own process image, which would skip the `trap cleanup EXIT` and leak
+  # the host-side allowlist_proxy.py process. The subshell is a normal foreground child, so the
+  # trap fires once it returns, and its exit code is propagated explicitly.
+  (run_bwrap "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}")
   exit $?
 else
-  # Not exec'd either (was `exec bwrap` before): the EXIT trap must run to delete the per-job
-  # config copies and the empty mask file. Exit code is propagated.
-  bwrap "${BWRAP_ARGS[@]}" -- "${CMD[@]}"
+  # Same shape: the EXIT trap must run to delete the per-job config copies and the empty mask
+  # file. Exit code is propagated.
+  (run_bwrap "${BWRAP_ARGS[@]}" -- "${CMD[@]}")
   exit $?
 fi
