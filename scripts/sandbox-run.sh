@@ -24,6 +24,14 @@
 #                         the user's ~/.config/csub/broker.toml policy and the child jobs run
 #                         sandboxed again via these wrappers. Needs csub-broker on PATH (or
 #                         $CSUB_BROKER_CMD). See "csub" below.
+#   --gpu                 Expose the LSF-allocated GPU(s) inside the sandbox: each entry of
+#                         $CUDA_VISIBLE_DEVICES is mapped (nvidia-smi -> PCI bus id -> driver
+#                         minor) to its /dev/nvidiaN node, which is bound in together with
+#                         /dev/nvidiactl, /dev/nvidia-uvm and /dev/nvidia-uvm-tools. Only the
+#                         job's own GPUs get a device node. CUDA_VISIBLE_DEVICES is passed in.
+#                         An error if no GPU is allocated. Driver libraries come from the
+#                         read-only /usr and /lib64 binds, and the PCI identity NVML needs from
+#                         read-only /sys/{devices,module}; needs nvidia-smi on the host.
 #   --scratch             Shorthand for --rw /scratch/$USER/work (created if missing).
 #                         Deliberately NOT all of /scratch/$USER -- see "Per-job state" below.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
@@ -119,6 +127,7 @@ RW_TRY_BINDS=()
 ALLOW_HOSTS=()
 PASS_ENV=()
 WANT_CSUB=0
+WANT_GPU=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 CFG_BINDS=()      # the per-job cfg/ dirs: bound after the sibling-state tmpfs (see "Per-job state")
@@ -150,6 +159,7 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "sandbox-run.sh: --env takes a variable NAME (got '$2'); export the value first" >&2; exit 1; }
       PASS_ENV+=("$2"); shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
+    --gpu) WANT_GPU=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
       WANT_CLAUDE=1
@@ -191,6 +201,40 @@ if [[ "$PWD" == "$HOME_P" || "$HOME_P" == "${PWD%/}/"* ]]; then
 fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
+fi
+
+# --gpu: resolve the job's GPUs to device nodes now, before anything is created, so the common
+# mistake (no GPU allocated) exits with nothing to clean up. Each CUDA_VISIBLE_DEVICES entry
+# (index or GPU-UUID) -> PCI bus id -> driver device minor (the N in /dev/nvidiaN). Not
+# `--device nvidia.com/gpu=all` as podman does: bwrap has no CDI, so nodes are bound one by one.
+GPU_BINDS=()
+if [[ $WANT_GPU -eq 1 ]]; then
+  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "sandbox-run.sh: --gpu, but CUDA_VISIBLE_DEVICES is empty -- no GPU is allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
+    exit 1
+  fi
+  command -v nvidia-smi >/dev/null || { echo "sandbox-run.sh: --gpu needs nvidia-smi on the host" >&2; exit 1; }
+  IFS=',' read -ra _gpus <<< "$CUDA_VISIBLE_DEVICES"
+  for g in "${_gpus[@]}"; do
+    bus="$(nvidia-smi -i "$g" --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null)" \
+      || { echo "sandbox-run.sh: --gpu: nvidia-smi cannot find GPU '$g' (from CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2; exit 1; }
+    bus="$(echo "${bus#00000000:}" | tr 'A-F' 'a-f')"
+    info="/proc/driver/nvidia/gpus/0000:$bus/information"
+    minor="$(awk '/Device Minor/ {print $3}' "$info" 2>/dev/null)"
+    [[ -n "$minor" && -e "/dev/nvidia$minor" ]] \
+      || { echo "sandbox-run.sh: --gpu: could not resolve GPU '$g' to a /dev/nvidiaN node (read $info)" >&2; exit 1; }
+    echo "sandbox-run.sh: --gpu: $g -> /dev/nvidia$minor" >&2
+    GPU_BINDS+=(--dev-bind "/dev/nvidia$minor" "/dev/nvidia$minor")
+  done
+  # NVML/CUDA read the GPU's PCI identity from sysfs; without it nvidia-smi fails with "GPU access
+  # blocked by the operating system" even with every device node present (verified live). Only the
+  # two subtrees it needs, read-only (bisected; PyTorch too): not /sys/bus, /sys/dev, /sys/fs
+  # (cgroups), /sys/kernel, /sys/firmware.
+  for d in devices module; do GPU_BINDS+=(--ro-bind "/sys/$d" "/sys/$d"); done
+  for n in nvidiactl nvidia-uvm nvidia-uvm-tools; do
+    if [[ -e /dev/$n ]]; then GPU_BINDS+=(--dev-bind "/dev/$n" "/dev/$n")
+    elif [[ $n != nvidia-uvm-tools ]]; then echo "sandbox-run.sh: --gpu: /dev/$n is missing on this host" >&2; exit 1; fi
+  done
 fi
 
 # Per-job state directory (see "Per-job state" in the header). Created here, before the bwrap
@@ -274,6 +318,11 @@ BWRAP_ARGS=(
   --proc /proc --dev /dev --unshare-net --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
+# After --dev /dev (mounts apply in order): the GPU device nodes, and the job's device numbering.
+if [[ ${#GPU_BINDS[@]} -gt 0 ]]; then
+  BWRAP_ARGS+=("${GPU_BINDS[@]}")
+  EXTRA_SETENV+=(CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES")
+fi
 # Own terminal session unless a human is actually at a terminal (Mode C): with a controlling
 # tty shared with the parent shell, a sandboxed process can queue keystrokes into it with the
 # TIOCSTI ioctl and have them run outside the sandbox after it exits. setsid() would break

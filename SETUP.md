@@ -20,6 +20,7 @@ run from the checkout, the wrapper re-binds its own directory read-only and says
 
 `sandbox-run.sh` needs only `bwrap` and `python3`, both present on the cluster nodes, and
 unprivileged user namespaces (`/proc/sys/user/max_user_namespaces` > 0), which are enabled here.
+`--gpu` additionally needs `nvidia-smi` on the host (inside an LSF GPU job); nothing else.
 
 ## 3. Podman (GPU jobs)
 

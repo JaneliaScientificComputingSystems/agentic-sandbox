@@ -5,6 +5,11 @@ the evidence behind each.
 
 ## Unreleased
 
+- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from
+  `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
+  `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is passed in. An error
+  in a job with no GPU allocated. No CUDA toolkit comes with it: bind a venv/conda env or use podman
+  for an image.
 - **`podman-run.sh --shm-size SIZE`**, and `/dev/shm` is **8g by default with `--gpu`** (it was
   podman's 64 MB, which PyTorch DataLoader workers fill at once: "unable to allocate shared
   memory(shm)"). Without `--gpu` and without the flag nothing changes. csub child jobs that run

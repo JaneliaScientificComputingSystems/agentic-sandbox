@@ -742,6 +742,52 @@ with `--no-cache` so the installers fetched current CLIs: `claude --version` →
 `opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
 published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
 
+### bwrap `--gpu` (2026-11-03)
+
+Recipe taken from `AFzoo/scripts/env/bwrap-gpu.sh` (which runs `bwrap --bind / /`), reimplemented against
+this wrapper's selective binds. Verified on an 8-GPU L4 node, 2-GPU job (`CUDA_VISIBLE_DEVICES=0,1`,
+which map to `/dev/nvidia2` and `/dev/nvidia0`; index != minor, hence the lookup): `/dev` inside holds
+only those two plus `nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`. Bisected the one non-obvious
+requirement: with every node present and a fresh `--proc`, `nvidia-smi` still fails ("GPU access
+blocked by the operating system") until `/sys/devices` and `/sys/module` are visible. Subset test (raw
+bwrap, same device binds, fresh `--proc`; `nvidia-smi -L` and PyTorch `cuda.is_available()` + a CUDA
+tensor op from the AFzoo protenix env, torch 2.10): `devices`+`module` works for both; `bus devices`,
+`devices` alone and nothing all fail with the same NVML/`cudaGetDeviceCount` error. So `/sys/bus` and
+`/sys/dev` are NOT required, so the wrapper binds only `/sys/devices` and `/sys/module` (trimmed
+2026-11-03 after this test; re-verified end to end with `--gpu`). An earlier draft bound `/sys/dev`
+"for CUDA's device lookups"; that was never tested and is wrong. `/sys/fs`, `/sys/kernel`, `/sys/firmware` are not needed and stay unbound.
+Unshared net/pid/ipc/uts do not matter. One node, one driver, L4 only.
+
+Exposure of the sysfs binds: read-only; shows hardware inventory (all 8 GPUs' PCI entries, NICs/MACs
+under `/sys/devices`, DMI product/BIOS strings, module parameters). The other GPUs cannot be opened
+(no device node, LSF device cgroup). Compared with podman: not run on this node (no
+`/run/user/$UID`); the CDI spec (`/etc/cdi/nvidia.yaml`) lists per GPU `/dev/nvidiaN`,
+`/dev/dri/cardN`, `/dev/dri/renderDN` plus ~100 library mounts and a `nvidia-cdi-hook`. Note CDI
+name `0` is `/dev/nvidia3` on that spec (names are not minors, as `podman-run.sh` already says).
+Rootless podman's `/sys` is normally a read-only bind of the host's whole `/sys` (from knowledge, not
+verified here), i.e. wider than bwrap's.
+
+`module load cuda/<ver>` on the host, then `sandbox-run.sh --gpu`: works unchanged. Toolkits are in
+`/usr/local/cuda-*` (under the existing `/usr` bind); `PATH` is passed through, `CUDA_HOME` and
+`LD_LIBRARY_PATH` are not (`--env` them for dynamic `libcudart`). Verified with cuda/13.0:
+`nvcc -arch=sm_89` build and run inside saw 2 devices and `cudaMalloc` succeeded; same binary
+without `--gpu`: "no CUDA-capable device is detected". Install gaps on this node: cuda/12.4 has no
+`cuda_runtime.h` (fails identically on the host), `/usr/local/cuda` (default alternative) has no
+`bin/`; 13.0 and 11.8 are complete.
+
+With `--csub` (2026-11-03): `--gpu` adds no mounts or hosts, so `CSUB_MOUNTS` and the envelope are
+unchanged. csub at `e253aa5` did not allow GPU children under bwrap: `resolve.py` refused
+`gpus > 0` when the policy had `sandbox = "bwrap"` ("GPU jobs need podman"), and
+`wrapper.py:sandbox_run_line` added `--gpu` only for podman. Local csub branch `bwrap-gpu` (not
+pushed) drops the refusal and passes `--gpu` for both backends; the unit tests (230) pass with a short
+`--basetemp` (pytest's default under a long home path fails `AF_UNIX path too long`). The broker also
+needs `sandbox_scripts_dir` pointing at this checkout (the default
+`~/.local/share/csub/agentic-sandbox/scripts` did not exist: `broker_misconfigured`). Verified live
+from a `--csub` sandbox in `/nrs/das/...`: `csub submit --walltime 5 --gpus 1 -q gpu_short --wait --
+nvidia-smi -L` ran as LSF job 155187444 "via bwrap" on a different GPU (UUID differs from the
+parent's) and printed one L4, exit 0. The child's own `sandbox-run.sh --gpu` took its allocation
+from the job's `CUDA_VISIBLE_DEVICES`.
+
 ### `--csub`: the seam to Stephan Saalfeld's csub broker (2026-10-12)
 
 csub (saalfeldlab/csub) is a policy-checked job broker: a sandboxed client sends a JSON
