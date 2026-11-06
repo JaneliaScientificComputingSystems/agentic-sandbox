@@ -31,6 +31,10 @@
 #                          ~/.claude/CLAUDE.md, with only ~/.claude/.credentials.json bound
 #                          through to the real file (CLAUDE_CONFIG_DIR points at it). See
 #                          "Config isolation" below.
+#   --claude-history[-rw]  With --claude: make this project's past Claude sessions visible
+#                          (~/.claude/projects/<cwd>) so `claude --resume` works. Read-only;
+#                          -rw also lets new transcripts persist, at the cost of letting the
+#                          agent edit old ones. Only the current directory's history is bound.
 #   --opencode             Same idea for opencode: a throwaway copy of ~/.config/opencode
 #                          (OPENCODE_CONFIG/OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is
 #                          left alone, so git/gh config still resolve) plus RW binds on its data dirs
@@ -121,6 +125,7 @@ PASS_ENV=()
 WANT_CSUB=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
+CLAUDE_HISTORY=""   # "", ro or rw: --claude-history[-rw]
 CFG_BINDS=()      # the per-job cfg/ dirs: bound after the sibling-state tmpfs (see "Per-job state")
 LATE_BINDS=()     # binds that must come after CFG_BINDS (nested file binds over a per-job dir)
 EXTRA_SETENV=()
@@ -164,6 +169,8 @@ while [[ $# -gt 0 ]]; do
       RO_TRY_BINDS+=("$HOME/.local/bin/claude" "$HOME/.local/share/claude")
       PATH_PREPEND+="$HOME/.local/bin:"
       shift ;;
+    --claude-history) CLAUDE_HISTORY=ro; shift ;;
+    --claude-history-rw) CLAUDE_HISTORY=rw; shift ;;
     --opencode)
       WANT_OPENCODE=1
       # Same reasoning as --claude above: opencode's own installer puts the actual binary
@@ -240,6 +247,18 @@ if [[ $WANT_CLAUDE -eq 1 ]]; then
     echo "sandbox-run.sh: warning: no ~/.claude/.credentials.json -- a \`claude auth login\` done inside the sandbox will NOT persist past this run. Log in once outside the sandbox first, or pass --env ANTHROPIC_API_KEY." >&2
   fi
   EXTRA_SETENV+=(CLAUDE_CONFIG_DIR "$CLAUDE_CFG")
+  if [[ -n "$CLAUDE_HISTORY" ]]; then
+    # Only THIS project's transcripts (Claude keys them by cwd, non-alphanumerics -> '-'), not
+    # all of ~/.claude/projects.
+    HIST_DIR="$HOME/.claude/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')"
+    [[ $CLAUDE_HISTORY == rw ]] && mkdir -p "$HIST_DIR"
+    if [[ -d "$HIST_DIR" ]]; then
+      if [[ $CLAUDE_HISTORY == rw ]]; then HB=--bind; else HB=--ro-bind; fi
+      LATE_BINDS+=("$HB" "$HIST_DIR" "$CLAUDE_CFG/projects/${HIST_DIR##*/}")
+    else
+      echo "sandbox-run.sh: warning: --claude-history: no past sessions at $HIST_DIR" >&2
+    fi
+  fi
 fi
 if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
