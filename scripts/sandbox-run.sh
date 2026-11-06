@@ -321,7 +321,15 @@ for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind-try "$p"
 for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind "$p"; done
 for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind-try "$p"; done
 while IFS=$'\t' read -r _ _ _flag _path; do
-  [[ -n "$_path" ]] && BWRAP_ARGS+=("$_flag" "$_path" "$_path")
+  [[ -n "$_path" ]] || continue
+  if [[ "$_flag" == --ro-bind-try && -L "$_path" ]]; then
+    # bwrap: "Can't mount on symlink destination" -- recreate the link inside instead, and bind
+    # its canonical target (skipped if already covered, e.g. ~/.local/share/claude).
+    _t="$(realpath -e -- "$_path" 2>/dev/null)" || continue
+    BWRAP_ARGS+=(--ro-bind-try "$_t" "$_t" --symlink "$_t" "$_path")
+  else
+    BWRAP_ARGS+=("$_flag" "$_path" "$_path")
+  fi
 done < <(printf '%s' "$_bind_lines" | sort -t$'\t' -k1,1n -k2,2n)
 
 # This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
