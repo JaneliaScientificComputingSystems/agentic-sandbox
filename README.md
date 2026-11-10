@@ -128,8 +128,9 @@ overrides it for that subtree only.
 appear as empty directories, and `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`, `.env`,
 `.env.local` as empty files. Applied last, so a `--rw` on one of those paths doesn't unmask it. Only
 paths that exist at start are masked, and only direct children: a `.env` two levels down is readable.
-Podman can't do this (a `--tmpfs` can't shadow a path under an ancestor `-v` bind), so with
-`podman-run.sh` never bind a path that is or contains `$HOME`.
+Podman can't do this (a `--tmpfs` can't shadow a path under an ancestor `-v` bind), so
+`podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME` (a subdirectory is fine),
+and on one that contains `/scratch/$USER/.agentic-sandbox`.
 
 **Network, default-deny.** Without `--allow` there is no network. `scripts/allowlist_proxy.py` runs
 outside the sandbox on a Unix socket and allows `CONNECT`/HTTP to the listed hostnames and their
@@ -185,8 +186,8 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
 
 - The wrapper starts `csub-broker --serve` outside the sandbox, as you, and stops it at exit; only its
   socket crosses the boundary, at `/run/csub.sock`.
-- Inside, `csub` and `import csub` work with the sandbox's own `python3` (csub's `site-packages` is
-  bound read-only, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
+- Inside, `csub` and `import csub` work with the sandbox's own `python3` (the csub package is
+  bound read-only on `PYTHONPATH`, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
   `CSUB_MOUNTS` comes from `$PWD` and the `--rw`/`--ro` paths not under `$HOME` or `/scratch` (nested
   ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
   does not.
@@ -292,7 +293,7 @@ It is **not** stopped from:
 - **Using a listed host over any port**, not just HTTPS (a `CONNECT` tunnel to its ssh port works);
   the proxy doesn't inspect content.
 - **Credentials deeper than direct children**, e.g. a `.env` in a subdirectory; and, with podman, any
-  credentials under a bound path (no masking: never bind `$HOME`).
+  credentials under a bound path (no masking, which is why binding `$HOME` is refused).
 - **Making syscalls the kernel allows an unprivileged user** (bwrap installs no seccomp filter, and
   the cluster's bwrap 0.6 predates `--disable-userns`, so nested user namespaces stay available).
 - Anything multi-node: one sandbox, one host. No MPI, Ray, DDP, Spark or Dask across nodes.
@@ -330,7 +331,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
 `tests/test-bwrap.sh` and `tests/test-podman.sh` are live suites: run them from a compute node (podman:
 a GPU job), **one at a time** (they share opencode's database). Some need a Claude login and a LiteLLM
 key; the `--csub` tests need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` under your policy's allowed
-roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy without a cluster.
+roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy without a cluster, and runs on every push (GitHub
+Actions).
 
 ## Troubleshooting
 

@@ -66,9 +66,9 @@
 # real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
 # here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
 # covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
-# PODMAN_ARGS below for the full story). Never --rw/--ro a path that IS or CONTAINS $HOME --
-# .ssh/.aws/.git-credentials/etc. will be fully exposed, read-write, no exceptions. Scope
-# --rw/--ro to the specific subdirectory you actually need instead.
+# PODMAN_ARGS below for the full story). So --rw/--ro on a path that IS or CONTAINS
+# $HOME is refused (.ssh/.aws/.git-credentials/etc. would be fully exposed), as is one that
+# contains /scratch/$USER/.agentic-sandbox. Scope --rw/--ro to the subdirectory you need.
 set -euo pipefail
 
 # Save the real stdin before anything backgrounds `podman run` (needed below, for the
@@ -96,16 +96,43 @@ ENV_ARGS=()
 # Everything from line 2 down to the blank comment line before `set -euo pipefail`.
 usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
 
+# An option that takes a value must have one (otherwise: bash's own "unbound variable").
+need_arg() { [[ $# -ge 2 ]] || { echo "podman-run.sh: $1 needs an argument" >&2; exit 1; }; }
+
+# There is no credential masking under podman (see the header), so the mounts that masking would
+# have had to cover are refused outright instead of documented as "never do this":
+#   - $HOME, or anything above it: .ssh, .aws, tokens, shell rc files, all exposed;
+#   - /scratch/$USER or anything above it, or anything inside .agentic-sandbox: every concurrent
+#     job's state dir (config copies, a proxy socket with a different allowlist).
+# A subdirectory of $HOME is fine. Checked on the canonical path.
+HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
+SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
+STATE_PARENT_P="$(realpath -m -- "$SANDBOX_STATE_PARENT" 2>/dev/null || echo "$SANDBOX_STATE_PARENT")"
+refuse_wide_mount() {
+  # $1 = flag, $2 = canonical path. "${2%/}/" so that / is a prefix of everything.
+  local pre="${2%/}/"
+  if [[ "$2" == "$HOME_P" || "$HOME_P" == "$pre"* ]]; then
+    echo "podman-run.sh: $1 $2: refusing to mount your home directory (or a directory above it). There is no credential masking under podman; mount the specific subdirectory you need." >&2
+    exit 1
+  fi
+  if [[ "$2" == "$STATE_PARENT_P" || "$STATE_PARENT_P" == "$pre"* || "$2" == "$STATE_PARENT_P/"* ]]; then
+    echo "podman-run.sh: $1 $2: refusing to mount a directory that contains (or is inside) $SANDBOX_STATE_PARENT, where every concurrent job's state lives. Use --scratch, or a subdirectory of /scratch/$USER." >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --image) IMAGE="$2"; shift 2 ;;
+    --image) need_arg "$@"; IMAGE="$2"; shift 2 ;;
     --ro|--rw)
+      need_arg "$@"
       # Canonical, existing path: a relative or symlinked argument would otherwise be mounted
       # under one name and compared (csub envelope) under another.
       p="$(realpath -e -- "$2" 2>/dev/null)" || { echo "podman-run.sh: $1 $2: no such path" >&2; exit 1; }
+      refuse_wide_mount "$1" "$p"
       if [[ "$1" == --ro ]]; then VOLUMES+=("-v" "$p:$p:ro"); RO_PATHS+=("$p"); else VOLUMES+=("-v" "$p:$p:rw"); RW_PATHS+=("$p"); fi
       shift 2 ;;
-    --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
+    --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
@@ -121,6 +148,29 @@ CMD=("$@")
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
+# A path given as both --rw and --ro would be two mounts on one destination, which podman
+# rejects with an error that names neither flag.
+for p in "${RO_PATHS[@]:-}"; do
+  for q in "${RW_PATHS[@]:-}"; do
+    [[ -n "$p" && "$p" == "$q" ]] && { echo "podman-run.sh: $p is given as both --ro and --rw; pick one" >&2; exit 1; }
+  done
+done
+# This wrapper, allowlist_proxy.py and relay.py run on the HOST. If their directory is inside a
+# read-write mount, an agent could edit them and have the edit run unsandboxed on the next
+# invocation, so it is mounted read-only on top (podman orders mounts by destination depth, so
+# the deeper mount wins, as the credentials file over its config dir does). When the directory
+# IS the read-write mount there is nothing deeper to add, so that is refused.
+for q in "${RW_PATHS[@]:-}"; do
+  [[ -n "$q" ]] || continue
+  if [[ "$SCRIPT_DIR" == "$q" ]]; then
+    echo "podman-run.sh: --rw $q is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
+    exit 1
+  elif [[ "$SCRIPT_DIR" == "${q%/}/"* ]]; then
+    echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount ($q); mounting it read-only. Prefer running from a separate work directory." >&2
+    VOLUMES+=("-v" "$SCRIPT_DIR:$SCRIPT_DIR:ro")
+    break
+  fi
+done
 if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   # Checked before anything is created: this is the most common early exit.
   echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
@@ -151,7 +201,6 @@ fi
 # every element of an LSF array job shares the same $LSB_JOBID, a `brequeue`d job reuses it,
 # and a job script calling this wrapper twice is one LSB_JOBID as well. "manual" outside LSF.
 # /scratch/$USER is required here (podman's per-job store needs node-local storage anyway).
-SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
 mkdir -p "$SANDBOX_STATE_PARENT"
 chmod 700 "$SANDBOX_STATE_PARENT"
 JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
@@ -361,7 +410,9 @@ REPAIR
 # every sibling job reads through additionalimagestores. Skipped for a purely local image
 # (localhost/...), which has no registry to check against.
 if [[ "$IMAGE" != localhost/* ]]; then
-  podman pull "$IMAGE" || true
+  # stdout to stderr: `podman pull` prints the image ID on stdout, which would otherwise be the
+  # first line of the sandboxed command's output.
+  podman pull "$IMAGE" >&2 || true
 fi
 
 # Give this invocation its own storage root/runroot via a per-job storage.conf, handed to
@@ -625,7 +676,6 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # the --rw/--ro paths not under $HOME or /scratch (no $PWD here: the container's cwd is not the
   # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   _cands=()
-  HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
   for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
   for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
   DERIVED_MOUNTS=""
@@ -796,7 +846,7 @@ PY
     echo "## Tools"
     echo
     [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
-    [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; use \`-m litellm/kimi-k3\` or \`--model litellm/kimi-k3\` explicitly."
+    [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; name the model explicitly: \`--model ${SANDBOX_OPENCODE_MODEL:-litellm/kimi-k3}\` (or \`-m\`)."
     echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
     echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
   } > "$SANDBOX_README_FILE"

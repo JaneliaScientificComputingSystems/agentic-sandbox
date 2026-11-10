@@ -1,0 +1,21 @@
+# The allowlist proxy's tests need no cluster, no bwrap and no network (see tests/test-proxy.py).
+# The wrapper suites (tests/test-bwrap.sh, tests/test-podman.sh) need an LSF node and stay manual.
+name: test-proxy
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-proxy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 tests/test-proxy.py
+      - run: bash -n scripts/sandbox-run.sh scripts/podman-run.sh

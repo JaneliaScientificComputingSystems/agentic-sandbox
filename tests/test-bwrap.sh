@@ -245,6 +245,12 @@ check "claude resolvable with a scrubbed PATH" "$OUT" "claude-found"
 echo "=== 22. Working directory, paths and descriptors ==="
 OUT=$(cd "$HOME" && "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
 check "refuses to run from \$HOME (rc 1)" "$OUT" "1"
+OUT=$(cd / && "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
+check "refuses to run from / (rc 1)" "$OUT" "1"
+OUT=$("$SANDBOX_RUN" --rw 2>&1 | tail -1)
+check "option without its argument is a usage error" "$OUT" "sandbox-run.sh: --rw needs an argument"
+OUT=$("$SANDBOX_RUN" --env FOO=bar -- true >/dev/null 2>&1; echo $?)
+check "--env NAME=value refused (rc 1)" "$OUT" "1"
 # The trailing `:` keeps bash from exec'ing ls directly, so ls lists bash's descriptors, not its own.
 OUT=$(exec 7</dev/null; "$SANDBOX_RUN" -- bash -c 'ls /proc/$$/fd; :' 2>&1 | tr "\n" " ")
 check "inherited descriptors are closed (only 0-2 inside)" "$OUT" "0 1 2 "

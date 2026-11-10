@@ -109,34 +109,53 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-echo "=== 11. Matrix: with/without --keep-id x with/without --rw \$HOME ==="
+echo "=== 11. Matrix: with/without --keep-id x with/without a directory under \$HOME mounted ==="
+# Only a throwaway subdirectory of \$HOME is ever mounted: \$HOME itself is refused by the
+# wrapper (no credential masking under podman), which 11e checks.
 
 echo "--- 11a. no --keep-id, no HOME mapping ---"
 OUT=$("$PODMAN_RUN" --gpu -- bash -c 'echo whoami=$(whoami); ls "$HOME" 2>&1' 2>&1 | tail -2)
 echo "$OUT"
 
-echo "--- 11b. no --keep-id, WITH --rw \$HOME: in-container identity stays root, but bind-mount"
+echo "--- 11b. no --keep-id, WITH --rw <dir under \$HOME>: in-container identity stays root, but bind-mount"
 echo "    writes ALREADY land with real ownership -- rootless podman's default mapping already"
 echo "    writes bind-mounted files as your real host identity; --keep-id changes in-container"
 echo "    identity (whoami/\$HOME), not this. See ADMIN-NOTES.md's keep-id section."
 WORKDIR="$HOME/test-podman-nohome-$$"
 mkdir -p "$WORKDIR" 2>/dev/null
-"$PODMAN_RUN" --gpu --rw "$HOME" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1
+"$PODMAN_RUN" --gpu --rw "$WORKDIR" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1
 OUT=$(stat -c '%U' "$WORKDIR/f.txt" 2>&1)
-check "no-keep-id + --rw \$HOME file owner (already correct without --keep-id)" "$OUT" "$(whoami)"
+check "no-keep-id + --rw under \$HOME file owner (already correct without --keep-id)" "$OUT" "$(whoami)"
 rm -rf "$WORKDIR"
 
 echo "--- 11c. WITH --keep-id, no HOME mapping: real identity, \$HOME not exposed ---"
 OUT=$("$PODMAN_RUN" --gpu --keep-id -- bash -c 'echo whoami=$(whoami); ls "$HOME" 2>&1' 2>&1 | tail -2)
 echo "$OUT"
 
-echo "--- 11d. WITH --keep-id, WITH --rw \$HOME: real identity, real ownership on write ---"
+echo "--- 11d. WITH --keep-id, WITH --rw <dir under \$HOME>: real identity, real ownership on write ---"
 WORKDIR="$HOME/test-podman-keepid-home-$$"
 mkdir -p "$WORKDIR" 2>/dev/null
-"$PODMAN_RUN" --gpu --keep-id --rw "$HOME" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1
+"$PODMAN_RUN" --gpu --keep-id --rw "$WORKDIR" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1
 OUT=$(stat -c '%U' "$WORKDIR/f.txt" 2>&1)
-check "keep-id + --rw \$HOME file owner" "$OUT" "$(whoami)"
+check "keep-id + --rw under \$HOME file owner" "$OUT" "$(whoami)"
 rm -rf "$WORKDIR"
+
+echo "--- 11e. mounts with no masking to protect them are refused; usage errors are usage errors ---"
+OUT=$("$PODMAN_RUN" --rw "$HOME" -- true >/dev/null 2>&1; echo $?)
+check "--rw \$HOME refused (rc 1)" "$OUT" "1"
+OUT=$("$PODMAN_RUN" --ro "$(dirname "$HOME")" -- true >/dev/null 2>&1; echo $?)
+check "--ro on the parent of \$HOME refused (rc 1)" "$OUT" "1"
+OUT=$("$PODMAN_RUN" --rw "/scratch/$USER" -- true >/dev/null 2>&1; echo $?)
+check "--rw /scratch/\$USER refused (rc 1)" "$OUT" "1"
+OUT=$("$PODMAN_RUN" --rw 2>&1 | tail -1)
+check "option without its argument is a usage error" "$OUT" "podman-run.sh: --rw needs an argument"
+# The wrapper's own directory inside a read-write mount: mounted read-only on top.
+COPY="/scratch/$USER/test-podman-selfmount-$$"; mkdir -p "$COPY"; cp -R "$SCRIPT_DIR/../scripts" "$COPY/scripts"
+OUT=$("$COPY/scripts/podman-run.sh" --gpu --rw "$COPY" -- bash -c "touch $COPY/ok && echo parent-rw; touch $COPY/scripts/x 2>/dev/null && echo scripts-WRITABLE || echo scripts-ro" 2>/dev/null | tr '\n' ',')
+check "script dir inside an --rw mount is read-only inside" "$OUT" "parent-rw,scripts-ro,"
+OUT=$("$COPY/scripts/podman-run.sh" --rw "$COPY/scripts" -- true >/dev/null 2>&1; echo $?)
+check "--rw on the script dir itself refused (rc 1)" "$OUT" "1"
+rm -rf "$COPY"
 
 echo "=== 12. Per-job state: siblings hidden, credentials bound through, nothing left ==="
 FAKE="/scratch/$USER/.agentic-sandbox/fake-sibling-$$"
@@ -194,7 +213,9 @@ echo "=== 14. In-sandbox README describes this session ==="
 OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c 'test -f "$SANDBOX_README" && echo file-ok; grep -c "no bsub, no csub" /run/sandbox/README.md; grep -c "/scratch/'"$USER"'/work (read-write)" /run/sandbox/README.md' 2>&1 | tail -3 | tr '\n' ',')
 check "README present, says no job submission, lists the --scratch mount" "$OUT" "file-ok,1,1,"
 
-echo "=== 15. Exit code of the sandboxed command propagates ==="
+echo "=== 15. Exit code of the sandboxed command propagates; stdout is the command's alone ==="
+OUT=$("$PODMAN_RUN" --gpu -- echo only-line 2>/dev/null)
+check "nothing but the command's output on stdout (no image ID from the pull)" "$OUT" "only-line"
 "$PODMAN_RUN" --gpu -- sh -c 'exit 7' >/dev/null 2>&1; RC=$?
 check "exit 7 propagated" "$RC" "7"
 

@@ -22,6 +22,7 @@ Usage:
     python3 allowlist_proxy.py /run/agent-proxy.sock litellm.int.janelia.org example.com
 """
 import asyncio
+import re
 import sys
 from typing import Optional, Tuple
 
@@ -72,6 +73,14 @@ async def read_headers(reader) -> bytes:
             raise ValueError("header section too large")
 
 
+# What a host may look like at all. The client (the sandboxed process) chooses this string, it is
+# written to the log, and the wrappers print denied hosts from the log to the user's terminal --
+# so anything outside this set (control characters, escape sequences) is refused before it is
+# logged or resolved, and reported with repr().
+HOSTNAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+IPV6_RE = re.compile(r"[0-9A-Fa-f:.]+")
+
+
 def normalize_host(host: str) -> str:
     """Lower-case, strip whitespace and a trailing dot (FQDN form)."""
     return host.strip().lower().rstrip(".")
@@ -95,8 +104,9 @@ def host_allowed(host: str, allowlist: list) -> bool:
 def split_hostport(hostport: str, default_port: int) -> Optional[Tuple[str, int]]:
     """Split "host", "host:port" or "[v6]:port" into (host, port).
 
-    Returns None when the port is not a valid TCP port. The host is returned
-    without brackets, ready for asyncio.open_connection().
+    Returns None when the host is not a plain hostname / IP literal or the
+    port is not a valid TCP port. The host is returned without brackets,
+    ready for asyncio.open_connection().
     """
     hostport = hostport.strip()
     if hostport.startswith("["):
@@ -106,12 +116,16 @@ def split_hostport(hostport: str, default_port: int) -> Optional[Tuple[str, int]
         portstr = rest[1:] if rest.startswith(":") else ""
         if rest and not rest.startswith(":"):
             return None
+        if not IPV6_RE.fullmatch(host):
+            return None
     else:
         host, sep, portstr = hostport.rpartition(":")
         if not sep:
             host, portstr = hostport, ""
         elif ":" in host:
             # Bare IPv6 literal with no brackets: ambiguous, refuse.
+            return None
+        if not HOSTNAME_RE.fullmatch(host):
             return None
     if not host:
         return None

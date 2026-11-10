@@ -87,8 +87,8 @@
 # csub (--csub): the same bridge as --allow, for job submission instead of HTTP egress. The
 # broker is csub's own (`csub-broker --serve <socket>`), started by this wrapper outside the
 # sandbox and killed with it; only its socket crosses the boundary. Inside: CSUB_TRANSPORT=unix,
-# CSUB_SOCKET=/run/csub.sock, PYTHONPATH pointing at the read-only bind of the csub install's
-# site-packages (so the system python3 can `import csub`), a `csub` shim on PATH, and
+# CSUB_SOCKET=/run/csub.sock, PYTHONPATH pointing at a read-only bind of the csub package alone
+# (/run/csub-lib, so the system python3 can `import csub`), a `csub` shim on PATH, and
 # CSUB_MOUNTS listing this sandbox's mounts as csub expects them ("path:rw,path:ro"), derived
 # from $PWD and the --rw/--ro paths that are not under $HOME or /scratch (csub refuses home, and
 # its policy forbids scratch as a root); a preset $CSUB_MOUNTS may only narrow that list. Which
@@ -130,16 +130,25 @@ SANDBOX_CFG_ROOT=""
 # Everything from line 2 down to the line before `set -euo pipefail`.
 usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
 
+# An option that takes a value must have one: without this a trailing `--rw` died with bash's
+# own "unbound variable" instead of a usage error.
+need_arg() { [[ $# -ge 2 ]] || { echo "sandbox-run.sh: $1 needs an argument" >&2; exit 1; }; }
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ro|--rw)
+      need_arg "$@"
       # Canonical, existing path: a relative or symlinked argument would otherwise be bound under
       # one name and compared (masking, script-dir shadowing, csub envelope) under another.
       p="$(realpath -e -- "$2" 2>/dev/null)" || { echo "sandbox-run.sh: $1 $2: no such path" >&2; exit 1; }
       if [[ "$1" == --ro ]]; then RO_BINDS+=("$p"); else RW_BINDS+=("$p"); fi
       shift 2 ;;
-    --allow) ALLOW_HOSTS+=("$2"); shift 2 ;;
-    --env) PASS_ENV+=("$2"); shift 2 ;;
+    --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
+    --env)
+      need_arg "$@"
+      # A NAME, looked up in this shell's environment -- not NAME=value.
+      [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "sandbox-run.sh: --env takes a variable NAME (got '$2'); export the value first" >&2; exit 1; }
+      PASS_ENV+=("$2"); shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
@@ -174,7 +183,9 @@ CMD=("$@")
 # deliberate home-wide sandbox is `--rw "$HOME"` from a project directory, where the header's
 # warning applies knowingly.
 HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
-if [[ "$PWD" == "$HOME_P" || "$HOME_P" == "$PWD/"* ]]; then
+# "${PWD%/}/" so that / itself counts as "above $HOME" ("$PWD/" would be "//" there and match
+# nothing): from / the bind is the entire filesystem.
+if [[ "$PWD" == "$HOME_P" || "$HOME_P" == "${PWD%/}/"* ]]; then
   echo "sandbox-run.sh: refusing to run from $PWD: the working directory is bound read-write and would expose your whole home directory. cd into a project directory first." >&2
   exit 1
 fi
@@ -460,8 +471,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     echo "sandbox-run.sh: --csub needs csub-broker on PATH (or CSUB_BROKER_CMD set); install csub into a venv and activate it" >&2
     exit 1
   fi
-  # The client for inside the sandbox: the csub install's site-packages, bound read-only, plus
-  # a shim so plain `csub` works with the sandbox's own python3 (csub is pure Python).
+  # The client for inside the sandbox: the csub package (and tomli, which it needs on a python
+  # without tomllib) bound read-only under /run/csub-lib, plus a shim so plain `csub` works with
+  # the sandbox's own python3 (csub is pure Python). Only those two, not the install's whole
+  # site-packages: that put every other package of the csub venv on PYTHONPATH for every python
+  # in the sandbox, ahead of the python's own.
   CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
   [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
   CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
@@ -481,7 +495,12 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # is the common case.
   _cands=("$PWD:rw")
   for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-  for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  # A path given as both --rw and --ro is read-write inside (the --rw bind is applied later), and
+  # csub rejects the same path listed twice, so only the rw entry is kept.
+  for p in "${RO_BINDS[@]:-}"; do
+    [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] || continue
+    [[ " ${_cands[*]} " == *" $p:rw "* ]] || _cands+=("$p:ro")
+  done
   DERIVED_MOUNTS=""
   for c in "${_cands[@]}"; do
     cp="${c%:*}"; nested=0
@@ -549,13 +568,14 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(
     --ro-bind "$CSUB_SOCK" /run/csub.sock
-    --ro-bind "$CSUB_SITE" "$CSUB_SITE"
+    --ro-bind "$CSUB_SITE/csub" /run/csub-lib/csub
     --ro-bind "$CSUB_DIR/bin" /run/csub-bin
     --setenv CSUB_TRANSPORT unix --setenv CSUB_SOCKET /run/csub.sock
     --setenv CSUB_MOUNTS "$CSUB_MOUNTS"
-    --setenv PYTHONPATH "$CSUB_SITE"
+    --setenv PYTHONPATH /run/csub-lib
     --setenv PATH "/run/csub-bin:${PATH_PREPEND}${PATH}"
   )
+  [[ -d "$CSUB_SITE/tomli" ]] && BWRAP_ARGS+=(--ro-bind "$CSUB_SITE/tomli" /run/csub-lib/tomli)
 fi
 
 
@@ -583,8 +603,8 @@ write_sandbox_readme() {
     [[ -n "${OPENCODE_XDG_CONFIG:-}" ]] && echo "- $OPENCODE_XDG_CONFIG (read-write; opencode config copy)"
     echo "- /tmp (private tmpfs, TMPDIR), /usr /bin /lib /lib64 /sbin /etc (read-only system)"
     echo "- Not available: the home directory (unless listed above), other users' data, anything not listed."
-    echo "- Credential files directly under any listed directory (.ssh .aws .azure .kube .config/gcloud .docker,"
-    echo "  .git-credentials .npmrc .pypirc .netrc .env .env.local) appear EMPTY on purpose. Nothing is wrong; do not try to work around it."
+    echo "- Credential files directly under any listed directory (${SENSITIVE_HOME_DIRS[*]}"
+    echo "  ${SENSITIVE_HOME_FILES[*]}) appear EMPTY on purpose. Nothing is wrong; do not try to work around it."
     echo
     echo "## Network"
     echo
@@ -650,7 +670,7 @@ PY
     echo "## Tools"
     echo
     [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
-    [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; use \`-m litellm/kimi-k3\` or \`--model litellm/kimi-k3\` explicitly."
+    [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; name the model explicitly: \`--model ${SANDBOX_OPENCODE_MODEL:-litellm/kimi-k3}\` (or \`-m\`)."
     echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
     echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
   } > "$SANDBOX_README_FILE"

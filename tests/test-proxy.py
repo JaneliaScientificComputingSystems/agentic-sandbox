@@ -62,6 +62,10 @@ check("bare v6 refused", proxy_mod.split_hostport("::1", 80), None)
 check("non-numeric port refused", proxy_mod.split_hostport("example.com:http", 80), None)
 check("out-of-range port refused", proxy_mod.split_hostport("example.com:70000", 80), None)
 check("empty host refused", proxy_mod.split_hostport(":80", 80), None)
+check("escape sequence in host refused", proxy_mod.split_hostport("\x1b]0;x\x07evil.test:443", 443), None)
+check("control character in host refused", proxy_mod.split_hostport("evil\x00.example.com", 443), None)
+check("non-hex in bracketed literal refused", proxy_mod.split_hostport("[evil host]:443", 443), None)
+check("underscore and hyphen in host accepted", proxy_mod.split_hostport("my_host-1.example.com:443", 443), ("my_host-1.example.com", 443))
 
 
 # --- end-to-end through a real proxy process ------------------------------------------
@@ -140,12 +144,15 @@ async def e2e():
         check("e2e too many header lines rejected",
               await talk(sock, b"GET / HTTP/1.1\r\nHost: localhost\r\n" + b"X-A: b\r\n" * 250 + b"\r\n"),
               "HTTP/1.1 400 Bad Request")
+        check("e2e CONNECT with an escape sequence in the host rejected, not logged raw",
+              await talk(sock, b"CONNECT \x1b]0;pwned\x07evil.test:443 HTTP/1.1\r\n\r\n"), "HTTP/1.1 400 Bad Request")
         check("e2e CONNECT to IPv6 literal not on allowlist denied",
               await talk(sock, connect(f"[::1]:{port}")), "HTTP/1.1 403 Forbidden")
     finally:
         proc.terminate()
-        proc.wait()
+        log = proc.communicate()[1]
         os.unlink(sock)
+    check("proxy log holds no raw escape character", "\x1b" in log, False)
     upstream.close()
     await upstream.wait_closed()
 

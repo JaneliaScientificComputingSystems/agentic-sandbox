@@ -5,6 +5,22 @@ the evidence behind each.
 
 ## Unreleased
 
+- **`podman-run.sh` refuses mounts it cannot protect**: `--rw`/`--ro` on `$HOME` or a directory
+  above it (there is no credential masking under podman; a subdirectory of `$HOME` is fine), and on
+  `/scratch/$USER` or anything containing `.agentic-sandbox`. Previously documented as "never do
+  this". Its own script directory is mounted read-only when it sits inside an `--rw` mount, as
+  `sandbox-run.sh` already did, and `--rw` on that directory itself is refused.
+- **`sandbox-run.sh` refuses to run from `/`** as well as from `$HOME` and directories above it.
+- The allowlist proxy rejects a host that is not a plain hostname or IP literal (400), so a
+  sandboxed process can no longer put terminal escape sequences into the denied-host summary.
+- `podman-run.sh`: the image ID printed by the automatic `podman pull` goes to stderr; stdout is the
+  sandboxed command's alone.
+- `--csub` under bwrap: only the csub package (plus `tomli`) is on `PYTHONPATH`, at `/run/csub-lib`,
+  no longer the csub venv's whole `site-packages`. A path given as both `--rw` and `--ro` is listed
+  once in `CSUB_MOUNTS` (bwrap, read-write) or refused (podman).
+- An option missing its value, and `--env NAME=value`, are usage errors with a message. The
+  in-sandbox README lists the current masked paths; its opencode model hint follows
+  `SANDBOX_OPENCODE_MODEL` (default `litellm/kimi-k3`).
 - **`--csub` bounds client-claimed mounts to the sandbox.** Both wrappers start the broker with
   this sandbox's own mounts and `--allow` hosts as an envelope (`--envelope-mount`/`--envelope-host`,
   csub #13), so `CSUB_MOUNTS`/`--cwd` can no longer name a directory under `allowed_roots` that the
