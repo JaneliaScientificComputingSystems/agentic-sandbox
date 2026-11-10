@@ -54,7 +54,9 @@ EOF
 ```
 
 If you already have a `containers.conf`, add or update the two settings rather than overwriting
-it. You do not need to create the storage directories; podman does that on first use on each
+it. `podman-run.sh` passes both logging settings itself on every run, so a sandbox never logs
+through podman even without this file; the file is what covers `podman` when you run it directly
+(the node default, `journald`, copies everything a container prints into the system logs). You do not need to create the storage directories; podman does that on first use on each
 node.
 
 What this buys and costs: podman's per-user storage would otherwise land in

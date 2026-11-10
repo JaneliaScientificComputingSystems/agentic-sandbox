@@ -3,12 +3,22 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
-## Unreleased
+## 2026-11-10
 
+- **`podman-run.sh` turns podman's own logging off** (`--log-driver=none`, `--events-backend=none`),
+  whatever `containers.conf` says. The compute nodes default to `journald`, so without the
+  one-time `containers.conf` setup everything a container printed -- every screen redraw of an
+  interactive agent, and the conversation itself -- was copied into the node's journal and the
+  central syslog. Output still reaches your terminal and the job's output file as before;
+  `podman logs` shows nothing for these containers (the wrapper never used it). There is no flag
+  to turn it back on. Update your copy of the wrapper to get this.
 - **`podman-run.sh --shm-size SIZE`**, and `/dev/shm` is **8g by default with `--gpu`** (it was
   podman's 64 MB, which PyTorch DataLoader workers fill at once: "unable to allocate shared
   memory(shm)"). Without `--gpu` and without the flag nothing changes. csub child jobs that run
   with `--gpu` get the default too. (#8, reported by mahdibaghbanzadeh)
+
+## 2026-11-09
+
 - **Credential masks under `$HOME` apply wherever they are visible** (`sandbox-run.sh`). Since the
   previous entry's "masks only when `$HOME` is visible" change, a bound directory *inside* `$HOME`
   lost them: from `~/.config`, `gcloud/` and `gh/` were readable. The `$HOME` locations are now
@@ -37,16 +47,9 @@ the evidence behind each.
 - An option missing its value, and `--env NAME=value`, are usage errors with a message. The
   in-sandbox README lists the current masked paths; its opencode model hint follows
   `SANDBOX_OPENCODE_MODEL` (default `litellm/kimi-k3`).
-- **`--csub` bounds client-claimed mounts to the sandbox.** Both wrappers start the broker with
-  this sandbox's own mounts and `--allow` hosts as an envelope (`--envelope-mount`/`--envelope-host`,
-  csub #13), so `CSUB_MOUNTS`/`--cwd` can no longer name a directory under `allowed_roots` that the
-  sandbox cannot see. **`--csub` now refuses to start** when the envelope would be empty (no mount
-  outside `$HOME`/`/scratch` and no `--allow`; csub treats that as no envelope) or when csub lacks
-  the flags; `CSUB_ENVELOPE=off` accepts a policy-only broker explicitly. A preset `CSUB_MOUNTS` may
-  only narrow the derived list, never widen it. A child job that names an `agent` needs that agent's
-  hosts in `--allow`, or the envelope refuses it.
-- **Early exits leave no per-job state.** The per-job dir (with its `~/.claude.json` copy) is now
-  removed on every exit path, including a usage error or `--gpu` with no GPU allocated.
+
+## 2026-11-02
+
 - **`sandbox-run.sh` refuses to run from `$HOME`** (or a directory above it): `$PWD` is bound
   read-write and that would expose the whole home directory. Use `--rw "$HOME"` from a project
   directory if you really mean it.
@@ -64,6 +67,19 @@ the evidence behind each.
   csub package (plus `tomli`) is mounted, at `/opt/csub-lib`, instead of the whole host venv.
 - The in-sandbox relay is waited for instead of slept on, and no longer prints a banner on the
   command's stderr. The proxy bounds header reads (64 KiB, 200 lines, 30 s) and honours half-closes.
+
+## 2026-10-31
+
+- **`--csub` bounds client-claimed mounts to the sandbox.** Both wrappers start the broker with
+  this sandbox's own mounts and `--allow` hosts as an envelope (`--envelope-mount`/`--envelope-host`,
+  csub #13), so `CSUB_MOUNTS`/`--cwd` can no longer name a directory under `allowed_roots` that the
+  sandbox cannot see. **`--csub` now refuses to start** when the envelope would be empty (no mount
+  outside `$HOME`/`/scratch` and no `--allow`; csub treats that as no envelope) or when csub lacks
+  the flags; `CSUB_ENVELOPE=off` accepts a policy-only broker explicitly. A preset `CSUB_MOUNTS` may
+  only narrow the derived list, never widen it. A child job that names an `agent` needs that agent's
+  hosts in `--allow`, or the envelope refuses it.
+- **Early exits leave no per-job state.** The per-job dir (with its `~/.claude.json` copy) is now
+  removed on every exit path, including a usage error or `--gpu` with no GPU allocated.
 
 ## 2026-10-16
 

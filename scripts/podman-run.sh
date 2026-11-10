@@ -423,7 +423,7 @@ REPAIR
 if [[ "$IMAGE" != localhost/* ]]; then
   # stdout to stderr: `podman pull` prints the image ID on stdout, which would otherwise be the
   # first line of the sandboxed command's output.
-  podman pull "$IMAGE" >&2 || true
+  podman --events-backend=none pull "$IMAGE" >&2 || true
 fi
 
 # Give this invocation its own storage root/runroot via a per-job storage.conf, handed to
@@ -511,7 +511,14 @@ kill_orphaned_catatonit_for_this_job() {
   true
 }
 
-PODMAN_ARGS=(--rm --network=none)
+# --log-driver=none: this wrapper always runs podman attached, so the container's output already
+# goes to the terminal / the job's output file. The node default (journald) would ALSO copy every
+# byte of it -- each screen redraw of an interactive TUI, and whatever the user and the agent are
+# saying to each other -- into the node's journal and from there into the central syslog. Set
+# here, not left to the user's containers.conf, so it cannot be forgotten. --events-backend=none
+# (a global option, so it sits before the subcommand on each call that would emit events: pull,
+# run, rm) does the same for podman's container create/start/died events.
+PODMAN_ARGS=(--rm --network=none --log-driver=none)
 # Without -i, podman leaves stdin closed -- an interactive shell/TUI inside hits EOF and
 # exits immediately (looks like the container "won't stay open", but it ran fine and exited
 # on its own). Only add -t when a real terminal is attached; podman errors on -t under a
@@ -611,7 +618,7 @@ cleanup() {
   # the guard keeps it that way should this ever run before the export (the --all would then hit
   # the user's SHARED store and remove every container they own on the node).
   if [[ -n "${CONTAINERS_STORAGE_CONF:-}" ]]; then
-    podman rm -f --all --time 10 >/dev/null 2>&1 || true
+    podman --events-backend=none rm -f --all --time 10 >/dev/null 2>&1 || true
   fi
 
   # The watchdog below should already have reaped any lingering catatonit for this job by the
@@ -904,7 +911,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
   # The relay is waited for (up to 5s of connect attempts via bash's /dev/tcp), not slept on.
-  podman run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
+  podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
     for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/'"$RELAY_PORT"') 2>/dev/null && break; sleep 0.1; done
     export http_proxy=http://127.0.0.1:'"$RELAY_PORT"' https_proxy=http://127.0.0.1:'"$RELAY_PORT"'
@@ -913,7 +920,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
-  podman run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
+  podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
 fi
 PODMAN_PID=$!
 

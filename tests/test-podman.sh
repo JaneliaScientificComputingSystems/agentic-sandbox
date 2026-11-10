@@ -48,6 +48,24 @@ check "--gpu --shm-size 512m" "$(shm_mb --gpu --shm-size 512m)" "512"
 # df reports podman's 64 MB default as 63M (the tmpfs is 64000k, not 64 MiB); only "not raised" matters.
 OUT=$(shm_mb); [[ "$OUT" =~ ^[0-9]+$ && "$OUT" -le 64 ]] && OUT="at-most-64"
 check "no --gpu, no flag: podman's default, not raised" "$OUT" "at-most-64"
+
+echo "=== 2c. Container output is not logged by podman, whatever containers.conf says ==="
+# The node default is log_driver=journald, which copies the container's whole pty stream (TUI
+# redraws, the conversation with the agent) into the journal and the central syslog. Force that
+# default on top of the user's own config and read the log driver off conmon's command line.
+LOGCONF="$HOME/.agentic-sandbox-test-logconf-$$"
+printf '[containers]\nlog_driver = "journald"\n' > "$LOGCONF"
+CONTAINERS_CONF_OVERRIDE="$LOGCONF" "$PODMAN_RUN" -- sleep 20 >/dev/null 2>&1 &
+LOGPID=$!
+OUT=""
+for _ in $(seq 1 90); do
+  OUT=$(ps -ww -u "$USER" -o args= | grep '[/]conmon ' | grep -F "/.agentic-sandbox/" | sed -n 's/.* -l \([^ ]*\) .*/\1/p' | head -1)
+  [[ -n "$OUT" ]] && break
+  sleep 1
+done
+check "conmon log driver with log_driver=journald configured" "$OUT" "none"
+wait "$LOGPID"
+rm -f "$LOGCONF"
 check "--shm-size 1g without --gpu" "$(shm_mb --shm-size 1g)" "1024"
 OUT=$("$PODMAN_RUN" --shm-size lots -- true >/dev/null 2>&1; echo $?)
 check "--shm-size with a bad value refused (rc 1)" "$OUT" "1"

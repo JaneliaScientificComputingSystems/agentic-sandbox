@@ -877,6 +877,28 @@ size a real training job needs was not measured, and the reporter was asked to c
 state dirs are bound read-write; `podman run` drops no capabilities and sets no pids limit; images
 are pulled by `:latest`.
 
+### Podman logging forced off in the wrapper (2026-11-10)
+
+The compute nodes' podman (5.8.2) defaults to `log_driver = "journald"`: conmon is started with
+`-l journald` and copies the container's whole pty stream into the node's journal, and rsyslog
+and filebeat carry it to the central logs. An interactive Claude Code session produced bursts of
+10-20 entries a second of 6-14 KB each (screen redraws), containing the conversation, and its
+text tripped alerts that match on words such as "error". The one-time `containers.conf` in
+SETUP.md prevents this, but only for users who did it.
+
+`podman-run.sh` now passes `--log-driver=none` on `podman run` and `--events-backend=none` on
+the calls that emit events (`pull`, `run`, `rm`). Command-line options beat every
+`containers.conf`, and the wrapper has no pass-through for podman options, so a wrapper user
+cannot turn it back on short of editing the script. Verified on a GPU node with
+`CONTAINERS_CONF_OVERRIDE` forcing `journald`: conmon runs with `-l none` (it was `-l journald`
+with the previous wrapper under the same override). conmon still receives `--syslog`; that is
+conmon's own diagnostics, not container output. `test-podman.sh` section 2c pins this.
+
+Not covered: `podman` run directly, older copies of this wrapper, and the harbor wrapper (harbor
+starts podman itself). For those the fix is the user's `containers.conf`, or a node-wide
+`/etc/containers/containers.conf` with `[containers] log_driver = "none"`, which applies to
+everyone who has not set the option themselves.
+
 ### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
 
 Policy: the wrappers must not write to `/tmp` on the nodes. Constraints that shaped the
