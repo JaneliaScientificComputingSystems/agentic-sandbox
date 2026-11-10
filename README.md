@@ -120,14 +120,18 @@ cd /groups/lab/project/agent-work            # the one directory the agent can c
 **Filesystem, default-deny.** Only what is bound exists inside. Always bound: the toolchain
 (`/usr /bin /lib64 /lib /sbin /etc`) read-only and `$PWD` read-write (bwrap), or just the `-v` mounts
 you name (podman, whose cwd is the image's `WORKDIR`). `$HOME` is bound only if you ask. `/tmp` is a
-private tmpfs (bwrap) or the container's own (podman). A more specific `--rw` inside a `--ro` tree
-overrides it for that subtree only.
+private tmpfs (bwrap) or the container's own (podman). The more specific path keeps its
+own mode, whatever the flag order: a `--rw` inside a `--ro` tree is writable for that subtree only,
+and a `--ro` inside a `--rw` tree (or inside `$PWD`) stays read-only.
 
 **Credential masking (bwrap only).** Directly under every bound root (`$PWD`, `$HOME` if bound, every
 `--ro`/`--rw`/`--scratch` path), `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud` and `.docker`
 appear as empty directories, and `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`, `.env`,
-`.env.local` as empty files. Applied last, so a `--rw` on one of those paths doesn't unmask it. Only
-paths that exist at start are masked, and only direct children: a `.env` two levels down is readable.
+`.env.local` as empty files. The same names under `$HOME` are masked
+whenever they are inside a bound root (from `~/.config`, `gcloud/` is empty), and a root that is one
+of those `$HOME` locations, or inside one, is refused, as is `~/.claude` itself read-write. Only
+paths that exist at start are masked, and under a project root only direct children: a `.env` two
+levels down is readable. The full list is in the sandbox's own `/run/sandbox/README.md`.
 Podman can't do this (a `--tmpfs` can't shadow a path under an ancestor `-v` bind), so
 `podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME` (a subdirectory is fine),
 and on one that contains `/scratch/$USER/.agentic-sandbox`.

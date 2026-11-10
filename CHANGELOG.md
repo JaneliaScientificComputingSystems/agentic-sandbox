@@ -5,6 +5,18 @@ the evidence behind each.
 
 ## Unreleased
 
+- **Credential masks under `$HOME` apply wherever they are visible** (`sandbox-run.sh`). Since the
+  previous entry's "masks only when `$HOME` is visible" change, a bound directory *inside* `$HOME`
+  lost them: from `~/.config`, `gcloud/` and `gh/` were readable. The `$HOME` locations are now
+  masked whenever they sit inside any bound root. A root that **is** one of those locations or lies
+  inside one (`--ro ~/.ssh`, running from `~/.aws/sso`) is refused, as is `~/.claude` itself bound
+  read-write (cwd or `--rw`).
+- **Binds are applied shallowest path first** (`sandbox-run.sh`), so the deeper path keeps its own
+  mode whatever the flag order: `--rw proj --ro proj/sub` now leaves `proj/sub` read-only (it was
+  writable), and `--ro proj` from inside `proj/sub` no longer makes the working directory read-only.
+- `--csub`: a read-write mount with a read-only directory inside it is passed to child jobs
+  **read-only**, with a note (csub cannot express the nesting, and read-write would give children
+  access the sandbox lacks). Child jobs then need a read-write working directory elsewhere.
 - **`podman-run.sh` refuses mounts it cannot protect**: `--rw`/`--ro` on `$HOME` or a directory
   above it (there is no credential masking under podman; a subdirectory of `$HOME` is fine), and on
   `/scratch/$USER` or anything containing `.agentic-sandbox`. Previously documented as "never do

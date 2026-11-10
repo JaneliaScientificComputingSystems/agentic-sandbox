@@ -675,18 +675,32 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # CSUB_MOUNTS: what this container can see, in csub's "path:mode,..." form, always derived from
   # the --rw/--ro paths not under $HOME or /scratch (no $PWD here: the container's cwd is not the
   # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
-  _cands=()
-  for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-  for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:ro"); done
+  declare -A _mmode=()
+  _paths=()
+  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
+  for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
+  # A read-only mount inside a read-write one cannot be expressed to csub (the nested entry is
+  # dropped), so the outer one is passed read-only rather than give child jobs write access this
+  # container lacks. See sandbox-run.sh.
   DERIVED_MOUNTS=""
-  for c in "${_cands[@]:-}"; do
-    [[ -n "$c" ]] || continue
-    cp="${c%:*}"; nested=0
-    for o in "${_cands[@]}"; do
-      op="${o%:*}"
-      [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
+  for cp in "${_paths[@]:-}"; do
+    [[ -n "$cp" ]] || continue
+    nested=0
+    for op in "${_paths[@]}"; do
+      [[ "$op" != "$cp" && "$cp" == "${op%/}/"* ]] && { nested=1; break; }
     done
-    [[ $nested -eq 0 && ",$DERIVED_MOUNTS," != *",$c,"* ]] && DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$c"
+    [[ $nested -eq 1 ]] && continue
+    m="${_mmode[$cp]}"
+    if [[ "$m" == rw ]]; then
+      for r in "${RO_PATHS[@]:-}"; do
+        [[ -n "$r" && "$r" == "${cp%/}/"* ]] || continue
+        echo "podman-run.sh: --csub: $cp is passed to child jobs read-only, because $r inside it is read-only here and csub cannot express that. Child jobs need a read-write working directory outside $cp." >&2
+        m=ro
+        break
+      done
+    fi
+    DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$cp:$m"
   done
   # A preset $CSUB_MOUNTS may only NARROW that list (see sandbox-run.sh for the reasoning: the
   # same list becomes the envelope, and an envelope wider than the sandbox defeats it).

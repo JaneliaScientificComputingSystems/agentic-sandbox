@@ -267,10 +267,10 @@ fi
 BWRAP_ARGS=(
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib64 /lib64 --ro-bind /lib /lib
   --ro-bind /sbin /sbin --ro-bind /etc /etc
-  # /tmp BEFORE $PWD: bwrap applies mounts in order, so a tmpfs mounted after the $PWD bind
-  # would cover a $PWD that lives under /tmp, and the agent would start in an empty directory.
+  # /tmp BEFORE $PWD (which is bound with the other binds further down): bwrap applies mounts
+  # in order, so a tmpfs mounted after the $PWD bind would cover a $PWD that lives under /tmp,
+  # and the agent would start in an empty directory.
   --tmpfs /tmp
-  --bind "$PWD" "$PWD"
   --proc /proc --dev /dev --unshare-net --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
@@ -303,10 +303,26 @@ done
 if [[ -S /var/lib/sss/pipes/nss ]]; then
   BWRAP_ARGS+=(--ro-bind /var/lib/sss/pipes/nss /var/lib/sss/pipes/nss)
 fi
-for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--ro-bind "$p" "$p"); done
-for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--ro-bind-try "$p" "$p"); done
-for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--bind "$p" "$p"); done
-for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && BWRAP_ARGS+=(--bind-try "$p" "$p"); done
+# $PWD and every --ro/--rw bind, SHALLOWEST PATH FIRST. bwrap applies mounts in order and a later
+# mount covers an earlier one beneath it, so emitting them by flag (all --ro, then all --rw) made
+# `--rw proj --ro proj/sub` leave proj/sub writable, and `--ro proj` from inside proj/sub made the
+# working directory read-only. Sorted by depth, the deeper path always keeps its own mode, whatever
+# order the flags came in. Same path twice: $PWD, then --ro, then --rw, so the last of those wins.
+_bind_lines=""
+_seq=0
+add_bind() {  # $1 = bwrap flag, $2 = path
+  local d="${2//[^\/]/}"
+  _seq=$((_seq + 1))
+  _bind_lines+="${#d}"$'\t'"$_seq"$'\t'"$1"$'\t'"$2"$'\n'
+}
+add_bind --bind "$PWD"
+for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind "$p"; done
+for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind-try "$p"; done
+for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind "$p"; done
+for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind-try "$p"; done
+while IFS=$'\t' read -r _ _ _flag _path; do
+  [[ -n "$_path" ]] && BWRAP_ARGS+=("$_flag" "$_path" "$_path")
+done < <(printf '%s' "$_bind_lines" | sort -t$'\t' -k1,1n -k2,2n)
 
 # This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
 # the sandbox). If the directory they live in falls inside a read-write bind -- which is the
@@ -361,38 +377,66 @@ if [[ $WANT_OPENCODE -eq 0 ]]; then
   SENSITIVE_HOME_FILES+=(.local/share/opencode/auth.json)
   SENSITIVE_HOME_DIRS+=(.config/opencode)
 fi
-# $HOME is a mask root only when it is actually visible inside (equal to, or under, a bound
-# root). Masking an unbound $HOME made bwrap create empty ~/.ssh, ~/.aws, ... mountpoints in the
-# sandbox's root tmpfs: harmless, but it told the agent which of those the user has.
-HOME_VISIBLE=0
-for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do
-  [[ -n "$root" ]] || continue
-  [[ "$HOME_P" == "$root" || "$HOME_P" == "$root/"* ]] && { HOME_VISIBLE=1; break; }
-done
-declare -A MASK_ROOTS_SEEN=()
-MASK_ROOTS=()
+# Where the masks apply:
+#   - directly under every bound root (a project dir carries a .env or .git-credentials as easily
+#     as $HOME does), and
+#   - at the same names under $HOME, whenever that location is inside a bound root. That covers a
+#     visible $HOME and a bound directory BETWEEN $HOME and the secret: from ~/.config, the
+#     direct-children rule looks for ~/.config/.config/gcloud and finds nothing, while
+#     ~/.config/gcloud is right there. An unbound $HOME gets no masks at all: masking it made
+#     bwrap create empty ~/.ssh, ~/.aws, ... mountpoints, which told the agent which of those
+#     the user has.
+# A root that IS one of the $HOME credential locations, or lies inside one (`--ro ~/.ssh`, running
+# from ~/.aws/sso), is refused: a mask there would hide the very directory that was asked for, and
+# no mask would hand over the credentials. So is a read-write root that is ~/.claude itself
+# (settings.json hooks run unsandboxed in the next session; its subdirectories remain a
+# deliberate --ro/--rw choice, see the header).
+HOME_ROOTS=("$HOME_P")
+[[ "$HOME" != "$HOME_P" ]] && HOME_ROOTS+=("$HOME")
+ALL_ROOTS=()
 for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
-  [[ -n "$root" && -d "$root" ]] || continue
-  [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
-  MASK_ROOTS_SEEN[$root]=1
-  MASK_ROOTS+=("$root")
+  [[ -n "$root" ]] && ALL_ROOTS+=("$root")
 done
-for root in "$HOME_P" "$HOME"; do
-  [[ $HOME_VISIBLE -eq 1 && -d "$root" ]] || continue
-  [[ -n "${MASK_ROOTS_SEEN[$root]:-}" ]] && continue
-  MASK_ROOTS_SEEN[$root]=1
-  MASK_ROOTS+=("$root")
-done
-EMPTY_MASK_FILE=""
-for root in "${MASK_ROOTS[@]}"; do
-  for d in "${SENSITIVE_HOME_DIRS[@]}"; do
-    [[ -d "$root/$d" ]] && BWRAP_ARGS+=(--tmpfs "$root/$d")
+for h in "${HOME_ROOTS[@]}"; do
+  for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do
+    [[ -n "$root" ]] || continue
+    for s in "${SENSITIVE_HOME_DIRS[@]}" "${SENSITIVE_HOME_FILES[@]}"; do
+      if [[ "$root" == "$h/$s" || "$root" == "$h/$s/"* ]]; then
+        echo "sandbox-run.sh: refusing to bind $root: it is (or is inside) the credential location $h/$s, which is always masked. Work from, and bind, a project directory instead." >&2
+        exit 1
+      fi
+    done
   done
-  for f in "${SENSITIVE_HOME_FILES[@]}"; do
-    if [[ -f "$root/$f" ]]; then
-      [[ -z "$EMPTY_MASK_FILE" ]] && { EMPTY_MASK_FILE="$JOB_DIR/empty"; : > "$EMPTY_MASK_FILE"; }
-      BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$root/$f")
+  for root in "$PWD" "${RW_BINDS[@]:-}"; do
+    if [[ -n "$root" && "$root" == "$h/.claude" ]]; then
+      echo "sandbox-run.sh: refusing to bind $root read-write: it holds Claude Code's settings (hooks) and credentials. Use --claude for a per-job config, or bind the one subdirectory you need." >&2
+      exit 1
     fi
+  done
+done
+declare -A MASKED=()
+EMPTY_MASK_FILE=""
+mask_dir() {
+  [[ -d "$1" && -z "${MASKED[$1]:-}" ]] || return 0
+  MASKED[$1]=1
+  BWRAP_ARGS+=(--tmpfs "$1")
+}
+mask_file() {
+  [[ -f "$1" && -z "${MASKED[$1]:-}" ]] || return 0
+  MASKED[$1]=1
+  if [[ -z "$EMPTY_MASK_FILE" ]]; then EMPTY_MASK_FILE="$JOB_DIR/empty"; : > "$EMPTY_MASK_FILE"; fi
+  BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK_FILE" "$1")
+}
+for root in "${ALL_ROOTS[@]}"; do
+  [[ -d "$root" ]] || continue
+  for d in "${SENSITIVE_HOME_DIRS[@]}"; do mask_dir "$root/$d"; done
+  for f in "${SENSITIVE_HOME_FILES[@]}"; do mask_file "$root/$f"; done
+done
+for h in "${HOME_ROOTS[@]}"; do
+  for s in "${SENSITIVE_HOME_DIRS[@]}" "${SENSITIVE_HOME_FILES[@]}"; do
+    for root in "${ALL_ROOTS[@]}"; do
+      if [[ "$h/$s" == "${root%/}/"* ]]; then mask_dir "$h/$s"; mask_file "$h/$s"; break; fi
+    done
   done
 done
 
@@ -493,22 +537,36 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # policy forbids scratch as a root). csub rejects overlapping mounts, so a path nested under
   # another listed path is dropped (the outer one carries it): $PWD inside a --rw project root
   # is the common case.
-  _cands=("$PWD:rw")
-  for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _cands+=("$p:rw"); done
-  # A path given as both --rw and --ro is read-write inside (the --rw bind is applied later), and
-  # csub rejects the same path listed twice, so only the rw entry is kept.
-  for p in "${RO_BINDS[@]:-}"; do
-    [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] || continue
-    [[ " ${_cands[*]} " == *" $p:rw "* ]] || _cands+=("$p:ro")
-  done
+  # Effective mode per path, as the binds above resolve it: $PWD read-write, then --ro, then --rw
+  # (the last one named wins for one path).
+  declare -A _mmode=()
+  _paths=()
+  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  _add_mount "$PWD" rw
+  for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
+  for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
+  # csub cannot express a read-only directory inside a read-write one (nested entries are
+  # dropped, the outer one carries them). Passing the outer one as rw would give child jobs
+  # write access this sandbox does not have, so it goes to them READ-ONLY instead, with a note:
+  # a child job needs a read-write cwd, so submissions from there will be refused by csub.
   DERIVED_MOUNTS=""
-  for c in "${_cands[@]}"; do
-    cp="${c%:*}"; nested=0
-    for o in "${_cands[@]}"; do
-      op="${o%:*}"
-      [[ "$op" != "$cp" && "$cp" == "$op/"* ]] && { nested=1; break; }
+  for cp in "${_paths[@]}"; do
+    nested=0
+    for op in "${_paths[@]}"; do
+      [[ "$op" != "$cp" && "$cp" == "${op%/}/"* ]] && { nested=1; break; }
     done
-    [[ $nested -eq 0 && ",$DERIVED_MOUNTS," != *",$c,"* ]] && DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$c"
+    [[ $nested -eq 1 ]] && continue
+    m="${_mmode[$cp]}"
+    if [[ "$m" == rw ]]; then
+      for r in "${RO_BINDS[@]:-}"; do
+        [[ -n "$r" && "$r" == "${cp%/}/"* ]] || continue
+        [[ " ${RW_BINDS[*]:-} " == *" $r "* ]] && continue
+        echo "sandbox-run.sh: --csub: $cp is passed to child jobs read-only, because $r inside it is read-only here and csub cannot express that. Child jobs need a read-write working directory outside $cp." >&2
+        m=ro
+        break
+      done
+    fi
+    DERIVED_MOUNTS="${DERIVED_MOUNTS:+$DERIVED_MOUNTS,}$cp:$m"
   done
   # A preset $CSUB_MOUNTS may only NARROW that list: every entry must be one of the derived
   # mounts or a path under one, and not rw where the sandbox has it ro. It is checked here, not

@@ -267,5 +267,31 @@ if [[ -f "$HOME/.claude/.credentials.json" ]]; then
 fi
 rm -rf "$LINKDIR"
 
+echo "=== 23. Bind order and \$HOME-relative masks (fake \$HOME under /scratch) ==="
+FH="/scratch/$USER/test-bwrap-fakehome-$$"
+mkdir -p "$FH/home/.ssh" "$FH/home/.config/gcloud" "$FH/home/.config/tool" "$FH/home/.claude/skills" "$FH/home/work" "$FH/proj/sub" "$FH/proj/deep/cwd"
+echo KEY > "$FH/home/.ssh/id_rsa"; echo TOK > "$FH/home/.config/gcloud/tok"; echo fine > "$FH/home/.config/tool/conf"
+echo '{}' > "$FH/home/.claude/settings.json"; echo CRED > "$FH/home/.claude/.credentials.json"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --rw "$FH/proj" --ro "$FH/proj/sub" -- bash -c "touch $FH/proj/x 2>/dev/null && echo parent-rw; touch $FH/proj/sub/x 2>/dev/null && echo sub-WRITABLE || echo sub-ro" 2>/dev/null | tr '\n' ',')
+check "--ro under --rw stays read-only" "$OUT" "parent-rw,sub-ro,"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --ro "$FH/proj/sub" --rw "$FH/proj" -- bash -c "touch $FH/proj/sub/y 2>/dev/null && echo sub-WRITABLE || echo sub-ro" 2>/dev/null)
+check "same, flags in the other order" "$OUT" "sub-ro"
+OUT=$(cd "$FH/proj/deep/cwd" && HOME="$FH/home" "$SANDBOX_RUN" --ro "$FH/proj" -- bash -c "touch here 2>/dev/null && echo cwd-rw; touch $FH/proj/z 2>/dev/null && echo parent-WRITABLE || echo parent-ro" 2>/dev/null | tr '\n' ',')
+check "cwd stays read-write under a --ro parent" "$OUT" "cwd-rw,parent-ro,"
+OUT=$(cd "$FH/home/.config" && HOME="$FH/home" "$SANDBOX_RUN" -- bash -c 'ls -A gcloud | wc -l; cat tool/conf' 2>/dev/null | tr '\n' ',')
+check "cwd ~/.config: gcloud masked, the rest readable" "$OUT" "0,fine,"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --ro "$FH/home/.ssh" -- true >/dev/null 2>&1; echo $?)
+check "--ro ~/.ssh refused (rc 1)" "$OUT" "1"
+OUT=$(cd "$FH/home/.ssh" && HOME="$FH/home" "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
+check "running from ~/.ssh refused (rc 1)" "$OUT" "1"
+OUT=$(cd "$FH/home/.claude" && HOME="$FH/home" "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
+check "running from ~/.claude refused (rc 1)" "$OUT" "1"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --ro "$FH/home/.claude" -- bash -c "stat -c %s $FH/home/.claude/.credentials.json; test -d $FH/home/.claude/skills && echo skills-visible" 2>/dev/null | tr '\n' ',')
+check "--ro ~/.claude without --claude: credentials masked, rest visible" "$OUT" "0,skills-visible,"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" -- bash -c 'test -e "$HOME/.ssh" && echo vivified || echo clean' 2>/dev/null)
+check "cwd under \$HOME, \$HOME unbound: no placeholders" "$OUT" "clean"
+check "fake-home run left no per-job state" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
+rm -rf "$FH"
+
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
