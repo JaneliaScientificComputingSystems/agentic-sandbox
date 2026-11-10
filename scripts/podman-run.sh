@@ -32,6 +32,12 @@
 #   --gpu           Add --device nvidia.com/gpu=all. Under LSF the job's device cgroup lets
 #                    only the allocated GPUs through. In an LSF job with no GPU allocated
 #                    (CUDA_VISIBLE_DEVICES empty) this is an error.
+#   --shm-size SIZE Size of the container's /dev/shm, in podman's format (512m, 8g). Default: 8g
+#                    with --gpu, podman's own 64 MB otherwise. PyTorch DataLoader workers hand
+#                    batches to the training process through /dev/shm and fill 64 MB at once
+#                    ("unable to allocate shared memory(shm) ... No space left on device"). The
+#                    size is a cap, not a reservation: memory is used (and counted against the
+#                    LSF job) only for what is actually written there.
 #   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing). Deliberately
 #                    NOT all of /scratch/$USER: this wrapper's own per-job state (podman store,
 #                    runtime dir, config copies, proxy socket) lives under
@@ -87,6 +93,7 @@ RO_PATHS=()
 RW_PATHS=()
 ALLOW_HOSTS=()
 GPU=0
+SHM_SIZE=""
 WANT_CSUB=0
 KEEP_ID=0
 WANT_CLAUDE=0
@@ -134,6 +141,10 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
     --gpu) GPU=1; shift ;;
+    --shm-size)
+      need_arg "$@"
+      [[ "$2" =~ ^[0-9]+[bkmgBKMG]?$ ]] || { echo "podman-run.sh: --shm-size $2: expected a size such as 512m or 8g" >&2; exit 1; }
+      SHM_SIZE="$2"; shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
@@ -520,6 +531,10 @@ if [[ $GPU -eq 1 ]]; then
   # was already refused right after argument parsing.)
   PODMAN_ARGS+=(--device nvidia.com/gpu=all)
 fi
+# /dev/shm: 8g by default with --gpu (see --shm-size in the header; issue #8). Without --gpu and
+# without the flag, podman's 64 MB default stands.
+[[ -z "$SHM_SIZE" && $GPU -eq 1 ]] && SHM_SIZE=8g
+[[ -n "$SHM_SIZE" ]] && PODMAN_ARGS+=(--shm-size "$SHM_SIZE")
 if [[ $KEEP_ID -eq 1 ]]; then
   PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
 fi

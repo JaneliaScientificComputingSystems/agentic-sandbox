@@ -41,6 +41,20 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "=== 2b. /dev/shm size (issue #8): 8g with --gpu, --shm-size overrides, podman default otherwise ==="
+shm_mb() { "$PODMAN_RUN" "$@" -- df -BM --output=size /dev/shm 2>/dev/null | tail -1 | tr -d ' M'; }
+check "--gpu: /dev/shm is 8g" "$(shm_mb --gpu)" "8192"
+check "--gpu --shm-size 512m" "$(shm_mb --gpu --shm-size 512m)" "512"
+# df reports podman's 64 MB default as 63M (the tmpfs is 64000k, not 64 MiB); only "not raised" matters.
+OUT=$(shm_mb); [[ "$OUT" =~ ^[0-9]+$ && "$OUT" -le 64 ]] && OUT="at-most-64"
+check "no --gpu, no flag: podman's default, not raised" "$OUT" "at-most-64"
+check "--shm-size 1g without --gpu" "$(shm_mb --shm-size 1g)" "1024"
+OUT=$("$PODMAN_RUN" --shm-size lots -- true >/dev/null 2>&1; echo $?)
+check "--shm-size with a bad value refused (rc 1)" "$OUT" "1"
+# What the issue hit: more than 64 MB written to /dev/shm.
+OUT=$("$PODMAN_RUN" --gpu -- bash -c 'dd if=/dev/zero of=/dev/shm/t bs=1M count=200 2>/dev/null && echo wrote-200M' 2>/dev/null | tail -1)
+check "--gpu: 200 MB fits in /dev/shm" "$OUT" "wrote-200M"
+
 echo "=== 3. --scratch ==="
 OUT=$("$PODMAN_RUN" --gpu --scratch -- bash -c "test -d /scratch/$USER/work && ! test -e /scratch/$USER/.agentic-sandbox && echo ok" 2>&1 | tail -1)
 check "--scratch mounted" "$OUT" "ok"

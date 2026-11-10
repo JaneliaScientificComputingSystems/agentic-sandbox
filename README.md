@@ -326,6 +326,7 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH
   --opencode      Per-job copy of ~/.config/opencode, data dirs bound rw, CLI on PATH
   --gpu           (podman-run.sh) --device nvidia.com/gpu=all; an error in a job without a GPU
+  --shm-size SIZE (podman-run.sh) size of /dev/shm (512m, 8g); default 8g with --gpu, else 64 MB
   --keep-id       (podman-run.sh) run as your real uid/gid instead of container-root
   --image NAME    (podman-run.sh) any OCI image; default agentic-sandbox-lite
   -h, --help      Show help
@@ -341,6 +342,10 @@ Actions).
 ## Troubleshooting
 
 - **`Read-only file system`**: the path isn't inside a `--rw` bind. Add the specific path.
+- **`unable to allocate shared memory(shm)` / `No space left on device` from PyTorch DataLoader
+  workers** (podman): `/dev/shm` is too small. It is 8g with `--gpu` and podman's 64 MB without;
+  set it with `--shm-size 16g`. It is a cap, not a reservation, but what is written there counts
+  against the job's memory.
 - **A request hangs, or `claude`/`opencode` retries with `Request timed out`**: the host isn't on your
   allowlist (the wrapper prints the denied ones). Claude Code needs `api.anthropic.com`, `claude.ai`,
   `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`.

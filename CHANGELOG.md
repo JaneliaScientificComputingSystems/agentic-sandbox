@@ -5,6 +5,10 @@ the evidence behind each.
 
 ## Unreleased
 
+- **`podman-run.sh --shm-size SIZE`**, and `/dev/shm` is **8g by default with `--gpu`** (it was
+  podman's 64 MB, which PyTorch DataLoader workers fill at once: "unable to allocate shared
+  memory(shm)"). Without `--gpu` and without the flag nothing changes. csub child jobs that run
+  with `--gpu` get the default too. (#8, reported by mahdibaghbanzadeh)
 - **Credential masks under `$HOME` apply wherever they are visible** (`sandbox-run.sh`). Since the
   previous entry's "masks only when `$HOME` is visible" change, a bound directory *inside* `$HOME`
   lost them: from `~/.config`, `gcloud/` and `gh/` were readable. The `$HOME` locations are now
