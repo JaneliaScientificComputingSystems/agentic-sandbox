@@ -812,6 +812,71 @@ broker, an `--agent opencode` child accepted with `--allow litellm.int.janelia.o
 without it ("host ... is not allowed in the parent job"), and no state dir or broker left after
 the early exits.
 
+### Review follow-ups: masks, bind order, podman refusals, `/dev/shm` (2026-11-09/10)
+
+A full review of `main` at `265b038` found two high-severity defects in `sandbox-run.sh`, three
+medium ones across the wrappers and the proxy, and a list of small ones. Everything below was
+confirmed and re-tested on the cluster as an ordinary user through `bsub`, never as root on a
+development host.
+
+**Home masks lost under a bound directory inside `$HOME` (regression, fixed in `afa2753`).**
+`265b038` made `$HOME` a mask root only when `$HOME` itself is visible, to stop bwrap creating empty
+`~/.ssh`-style mountpoints in an unbound home. That also dropped the masks when the bound root is a
+directory *between* `$HOME` and the secret, because the remaining rule checks only direct children
+of a root: from `~/.config` it looks for `~/.config/.config/gcloud`. Probe with a fake home under
+`/scratch` (job 155306806): from `~/.config`, `gcloud/tok` readable; `--ro ~/.ssh`, `id_rsa`
+readable; from `~/.claude`, `.credentials.json` readable and `settings.json` writable. At `6729d83`
+the first two were masked. Now the `$HOME` locations are masked whenever they lie inside any bound
+root, and a root that is one of them or inside one is refused rather than masked (a mask would hide
+the directory that was asked for). `~/.claude` itself read-write is refused too: `settings.json`
+hooks run unsandboxed in the next session. `--ro ~/.claude` works with the credentials file masked.
+
+**`--ro` under `--rw` was writable (fixed in `afa2753`).** All `--ro` binds were emitted before all
+`--rw` binds and bwrap's later mount covers an earlier one beneath it, so `--rw proj --ro proj/sub`
+left `proj/sub` writable (same probe job). The mirror case was broken as well: `--ro proj` from
+inside `proj/sub` covered the `$PWD` bind and made the working directory read-only. `$PWD` and all
+binds are now emitted sorted by path depth. Podman was never affected; it orders mounts by
+destination depth itself.
+
+**csub cannot express that nesting.** It rejects overlapping mounts, so the wrappers always dropped
+a nested entry and let the outer one carry it. With the nesting now real, passing the outer mount as
+`rw` would give child jobs write access the parent lacks, so it is passed `ro`, with a note on
+stderr (verified: `CSUB_MOUNTS=<project>:ro`). The cost is that csub needs a read-write working
+directory, so submissions from inside that mount are refused. An upstream way to state a read-only
+subtree would remove the trade-off; not requested yet.
+
+**cwd `/` passed the home refusal (fixed in `2ab3526`).** The test was `"$HOME_P" == "$PWD/"*`, and
+`"$PWD/"` is `//` at the root.
+
+**Terminal escapes through the denied-host summary (fixed in `2ab3526`).** The sandboxed process
+picks the CONNECT host string, the proxy logged it raw, and the wrappers print denied hosts from the
+log to the user's terminal at exit. A CONNECT to `ESC ]0;pwned BEL evil.test:443` came through
+intact (job 155306806). The proxy now answers 400 to any host that is not `[A-Za-z0-9._-]+` or a
+bracketed IPv6 literal, before logging or resolving it.
+
+**Podman mounts that masking would have had to cover are refused (`2ab3526`).** `--rw`/`--ro` on
+`$HOME` or above, and on `/scratch/$USER` or anything containing `.agentic-sandbox`, exit 1; a
+subdirectory of `$HOME` is fine. The script directory inside an `--rw` mount is mounted read-only on
+top, which works under podman because a deeper bind over a shallower one is honoured (unlike the
+`--tmpfs`-under-a-bind masking attempt recorded above); verified by `touch` failing in `scripts/`
+while the parent stays writable. `tests/test-podman.sh` 11b/11d no longer mount the tester's real
+`$HOME`.
+
+**`/dev/shm` (issue #8, `13f2961`).** Podman's default is 64 MB (`df` shows 63M: the tmpfs is
+64000k). PyTorch DataLoader workers pass batches through it and fail with "unable to allocate shared
+memory(shm)". `--shm-size SIZE` was added, defaulting to 8g with `--gpu`: a cap, not a reservation,
+and below the smallest GPU slot's 15 GB. The suite checks the sizes and writes 200 MB; the smallest
+size a real training job needs was not measured, and the reporter was asked to confirm with theirs.
+
+**Suite results on the final commits:** `test-bwrap.sh` 55/0 at `afa2753` (job 155306968),
+`test-podman.sh` 44/0 at `13f2961` (job 155306992), `test-proxy.py` in GitHub Actions on every push
+(added in `2ab3526`). Two failures seen on the way were environmental: an expired Claude login
+(both suites, until re-login), and the 3-question opencode loop returning two answers once.
+
+**Still open from that review:** CONNECT reaches any port on an allowed host; opencode's cache and
+state dirs are bound read-write; `podman run` drops no capabilities and sets no pids limit; images
+are pulled by `:latest`.
+
 ### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
 
 Policy: the wrappers must not write to `/tmp` on the nodes. Constraints that shaped the
