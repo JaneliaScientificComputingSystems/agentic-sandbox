@@ -104,10 +104,20 @@ else
 fi
 
 echo "=== 7. Non-interactive loop, 3 questions, one sandbox ==="
-OUT=$("$SANDBOX_RUN" --scratch --opencode --allow litellm.int.janelia.org -- \
-  /bin/bash -c 'for q in "2+2" "10-3" "6*7"; do
-    opencode run "What is $q? Answer with just the number." --model litellm/kimi-k3
-  done' 2>&1 | grep -oE '^[0-9]+$' | tr '\n' ',')
+# What is under test is three opencode runs in ONE sandbox (proxy, relay and config copy surviving
+# across them), not the model: an answer that comes back empty or as prose is retried once
+# before the check counts it, and a second miss still fails.
+loop3() {
+  "$SANDBOX_RUN" --scratch --opencode --allow litellm.int.janelia.org -- \
+    /bin/bash -c 'for q in "2+2" "10-3" "6*7"; do
+      opencode run "What is $q? Answer with just the number." --model litellm/kimi-k3
+    done' 2>&1 | grep -oE '^[0-9]+$' | tr '\n' ','
+}
+OUT=$(loop3)
+if [[ "$OUT" != "4,7,42," ]]; then
+  echo "(retrying once: first attempt gave '$OUT')"
+  OUT=$(loop3)
+fi
 check "loop 3 questions" "$OUT" "4,7,42,"
 
 echo "=== 8. Explicit --ro on an additional path ==="
@@ -200,6 +210,19 @@ if command -v csub-broker >/dev/null 2>&1 && [[ -n "${CSUB_TEST_ROOT:-}" && -d "
     mkdir -p "$CW/sub"
     OUT=$(cd "$CW" && CSUB_MOUNTS="$CW/sub:ro" "$SANDBOX_RUN" --csub -- bash -c 'echo "$CSUB_MOUNTS"' 2>/dev/null)
     check "--csub: preset CSUB_MOUNTS narrower than the sandbox is kept" "$OUT" "$CW/sub:ro"
+    # A child job that names an agent (policy [agents]: the launcher flag plus the hosts it needs).
+    # The agent's hosts join the job's hosts BEFORE the envelope check, so the parent sandbox must
+    # --allow them itself: without, the envelope refuses the job (rc 3); with, the child runs
+    # under --opencode and finds the CLI. Skipped when the policy has no opencode agent.
+    AGENT_HOSTS=$(echo '{"protocol":1,"op":"probe"}' | csub-broker 2>/dev/null | python3 -c 'import json,sys; print("yes" if "opencode" in (json.load(sys.stdin).get("agents") or []) else "")' 2>/dev/null)
+    if [[ "$AGENT_HOSTS" == yes ]]; then
+      OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c 'csub submit --walltime 5 --agent opencode -- true >/dev/null 2>&1; echo $?')
+      check "--csub: --agent whose hosts the parent does not --allow is refused (envelope, rc 3)" "$OUT" "3"
+      OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub --allow litellm.int.janelia.org -- bash -c 'csub submit --walltime 5 --wait --name t17a --agent opencode -- sh -c "command -v opencode >/dev/null && echo agent-ok" 2>&1 | grep -c agent-ok' 2>/dev/null | tail -1)
+      check "--csub: --agent opencode child runs with the CLI when the parent allows its hosts" "$OUT" "1"
+    else
+      echo "SKIP: the csub policy has no [agents] opencode entry"
+    fi
     check "--csub: no broker left behind after refusals" "$(pgrep -u "$USER" -f 'csub.broker|csub-broker' | wc -l | tr -d ' ')" "0"
     rm -rf "$DECOY"
   else
