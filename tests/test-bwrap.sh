@@ -317,6 +317,23 @@ OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --ro "$FH/home/.claud
 check "--ro ~/.claude without --claude: credentials masked, rest visible" "$OUT" "0,skills-visible,"
 OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" -- bash -c 'test -e "$HOME/.ssh" && echo vivified || echo clean' 2>/dev/null)
 check "cwd under \$HOME, \$HOME unbound: no placeholders" "$OUT" "clean"
+# --claude-history[-rw]: only this directory's transcripts, read-only unless -rw, and only with --claude.
+HKEY=$(printf '%s' "$FH/home/work" | sed 's/[^A-Za-z0-9]/-/g')
+mkdir -p "$FH/home/.claude/projects/$HKEY" "$FH/home/.claude/projects/other-project"
+echo old > "$FH/home/.claude/projects/$HKEY/old.jsonl"; echo other > "$FH/home/.claude/projects/other-project/x.jsonl"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --claude --claude-history -- bash -c 'ls "$CLAUDE_CONFIG_DIR/projects" | wc -l; cat "$CLAUDE_CONFIG_DIR"/projects/*/old.jsonl; echo x >> "$CLAUDE_CONFIG_DIR"/projects/*/old.jsonl 2>/dev/null && echo WRITABLE || echo read-only' 2>/dev/null | tr '\n' ',')
+check "--claude-history: this directory's sessions only, read-only" "$OUT" "1,old,read-only,"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --claude --claude-history-rw -- bash -c 'echo new >> "$CLAUDE_CONFIG_DIR"/projects/*/old.jsonl && echo wrote' 2>/dev/null | tr '\n' ',')
+check "--claude-history-rw: writes persist to the real history" "$OUT$(tr '\n' ',' < "$FH/home/.claude/projects/$HKEY/old.jsonl")" "wrote,old,new,"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --claude -- bash -c 'ls "$CLAUDE_CONFIG_DIR/projects" 2>/dev/null | wc -l' 2>/dev/null)
+check "--claude alone: no history inside" "$OUT" "0"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --claude-history -- true >/dev/null 2>&1; echo $?)
+check "--claude-history without --claude refused (rc 1)" "$OUT" "1"
+# A tool symlink is bound by its real target; one that points into a credential location is refused.
+mkdir -p "$FH/home/.local/bin"; ln -s "$FH/home/.ssh/id_rsa" "$FH/home/.local/bin/claude"
+OUT=$(cd "$FH/home/work" && HOME="$FH/home" "$SANDBOX_RUN" --claude -- cat "$FH/home/.ssh/id_rsa" 2>&1; echo "rc=$?")
+check "--claude with ~/.local/bin/claude linked into ~/.ssh refused (rc 1, key not shown)" "$(echo "$OUT" | grep -c KEY),${OUT##*rc=}" "0,1"
+rm -f "$FH/home/.local/bin/claude"
 check "fake-home run left no per-job state" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 rm -rf "$FH"
 

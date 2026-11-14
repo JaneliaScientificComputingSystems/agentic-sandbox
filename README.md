@@ -106,6 +106,12 @@ The sandbox is identical in the three ways to run it; only the submission differ
 - **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
   and some run later as you, outside the sandbox: `.git/hooks/*`, project-level `.claude/settings.json`
   and `.mcp.json`. Review them before using the directory outside the sandbox.
+- **Resuming a Claude session.** The per-job config starts without history, so `claude --resume` and
+  `--continue` find nothing. `--claude-history` (with `--claude`, `sandbox-run.sh` only) binds the
+  past sessions of the directory you start from, and only those, read-only; the conversation can be
+  continued but the new turns are not kept. `--claude-history-rw` keeps them, and lets the agent
+  edit the old transcripts. Either way the agent can read everything said in those earlier
+  sessions, including ones you ran outside the sandbox from the same directory.
 - **Another harness?** Find where it keeps config and state, grant those paths with `--rw`/`--ro`,
   and `--allow` the domains its model needs.
 
@@ -324,6 +330,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
   --csub          Start a csub broker outside the sandbox and give the agent `csub` inside
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing)
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH
+  --claude-history[-rw]  (sandbox-run.sh, with --claude) this directory's past Claude sessions, so
+                  `claude --resume`/`--continue` work; read-only, or -rw to keep new ones too
   --opencode      Per-job copy of ~/.config/opencode, data dirs bound rw, CLI on PATH
   --gpu           (podman-run.sh) --device nvidia.com/gpu=all; an error in a job without a GPU
   --shm-size SIZE (podman-run.sh) size of /dev/shm (512m, 8g); default 8g with --gpu, else 64 MB

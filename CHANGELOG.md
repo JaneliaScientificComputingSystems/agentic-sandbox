@@ -3,6 +3,18 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-14
+
+- **`sandbox-run.sh --claude-history` and `--claude-history-rw`** (with `--claude`): the past Claude
+  sessions of the directory you start from become visible, so `claude --resume` and `--continue`
+  work. Read-only by default (new turns are not kept); `-rw` keeps them. Only that directory's
+  history is bound. The sandboxed agent can read those earlier sessions, including unsandboxed
+  ones. The flag without `--claude` is an error. (#9, hokinus)
+- **`--claude`/`--opencode` no longer fail with "Can't mount on symlink destination"** when the
+  directory holding the CLI's symlink (`~/.local/bin/claude`) is itself bound, for example with
+  `--ro ~/.local`: the link is recreated inside and its target bound. (#11, hokinus) A tool symlink
+  whose target is a credential location under `$HOME` is refused.
+
 ## 2026-11-10
 
 - **`podman-run.sh` turns podman's own logging off** (`--log-driver=none`, `--events-backend=none`),

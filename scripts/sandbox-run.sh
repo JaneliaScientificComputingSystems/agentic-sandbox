@@ -199,6 +199,9 @@ fi
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
+if [[ -n "$CLAUDE_HISTORY" && $WANT_CLAUDE -eq 0 ]]; then
+  echo "sandbox-run.sh: --claude-history needs --claude (the history is bound into the per-job Claude config)" >&2; exit 1
+fi
 
 # Per-job state directory (see "Per-job state" in the header). Created here, before the bwrap
 # argument list, and removed whole by cleanup() on exit. The tag matches podman-run.sh's.
@@ -430,6 +433,19 @@ for h in "${HOME_ROOTS[@]}"; do
     for s in "${SENSITIVE_HOME_DIRS[@]}" "${SENSITIVE_HOME_FILES[@]}"; do
       if [[ "$root" == "$h/$s" || "$root" == "$h/$s/"* ]]; then
         echo "sandbox-run.sh: refusing to bind $root: it is (or is inside) the credential location $h/$s, which is always masked. Work from, and bind, a project directory instead." >&2
+        exit 1
+      fi
+    done
+  done
+  # A tool path that is a symlink is bound by its real target (see the bind loop above), so the
+  # target gets the same test: a ~/.local/bin/claude pointing into ~/.ssh would otherwise bind
+  # that file at its real path, where no mask covers it.
+  for root in "${RO_TRY_BINDS[@]:-}"; do
+    [[ -n "$root" && -L "$root" ]] || continue
+    _t="$(realpath -e -- "$root" 2>/dev/null)" || continue
+    for s in "${SENSITIVE_HOME_DIRS[@]}" "${SENSITIVE_HOME_FILES[@]}"; do
+      if [[ "$_t" == "$h/$s" || "$_t" == "$h/$s/"* ]]; then
+        echo "sandbox-run.sh: refusing to start: $root is a symlink into the credential location $h/$s" >&2
         exit 1
       fi
     done
