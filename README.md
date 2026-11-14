@@ -386,12 +386,24 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
 ```
 
 ## Testing
-`tests/test-bwrap.sh` and `tests/test-podman.sh` are live suites: run them from a compute node (podman:
-a GPU job; bwrap: its `--gpu` checks run only in a GPU job, and the subset check needs two GPUs),
-**one at a time** (they share opencode's database). Some need a Claude login and a LiteLLM
-key; the `--csub` tests need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` under your policy's allowed
-roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy without a cluster, and runs on every push (GitHub
-Actions).
+
+Three suites in `tests/`:
+
+| Suite | Tests | Run it |
+| --- | --- | --- |
+| `test-bwrap.sh` | `sandbox-run.sh` | from a compute node, inside an LSF job; in a GPU job for the `--gpu` section (two GPUs for its subset check) |
+| `test-podman.sh` | `podman-run.sh` | from a GPU job |
+| `test-proxy.py` | the allowlist proxy | anywhere (`python3 tests/test-proxy.py`); also on every push (GitHub Actions) |
+
+- Run the two wrapper suites **one at a time**: they share opencode's database.
+- `ONLY=17,23 tests/test-bwrap.sh` runs only those sections. `SKIP_LLM=1` skips the sections that
+  need a model to answer (a Claude login, a LiteLLM key); everything else is the sandbox itself.
+- The `--csub` sections need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` set to a directory under
+  your policy's allowed roots.
+- The summary line counts what was skipped (`82 passed, 0 failed, 0 skipped`), so a run without a
+  GPU or without csub does not look like a full one.
+- "Nothing left behind" checks compare with the state at the start, and a killed run removes its
+  own test directories.
 
 ## Troubleshooting
 

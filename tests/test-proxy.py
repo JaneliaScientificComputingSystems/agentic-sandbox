@@ -11,6 +11,7 @@ directly (the same bytes relay.py would hand it from inside a sandbox).
 import asyncio
 import importlib.util
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,32 @@ async def talk(sock, request: bytes) -> str:
     return data.decode("latin1", "replace").split("\r\n")[0]
 
 
+async def tunnel(sock, hostport: str, request: bytes) -> str:
+    """CONNECT, then send a request through the tunnel; the last line of what comes back."""
+    reader, writer = await asyncio.open_unix_connection(sock)
+    writer.write(f"CONNECT {hostport} HTTP/1.1\r\nHost: {hostport}\r\n\r\n".encode())
+    await writer.drain()
+    try:
+        established = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 3)
+        if b" 200 " not in established:
+            return established.decode("latin1", "replace").split("\r\n")[0]
+        writer.write(request)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(4096), 3)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return "<timeout>"
+    finally:
+        writer.close()
+    return data.decode("latin1", "replace").split("\r\n")[-1]
+
+
+def closed_port() -> int:
+    """A local port nothing listens on (bound once, then released)."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 async def e2e():
     upstream = await start_upstream()
     port = upstream.sockets[0].getsockname()[1]
@@ -148,11 +175,27 @@ async def e2e():
               await talk(sock, b"CONNECT \x1b]0;pwned\x07evil.test:443 HTTP/1.1\r\n\r\n"), "HTTP/1.1 400 Bad Request")
         check("e2e CONNECT to IPv6 literal not on allowlist denied",
               await talk(sock, connect(f"[::1]:{port}")), "HTTP/1.1 403 Forbidden")
+        check("e2e CONNECT tunnel carries a request and its response",
+              await tunnel(sock, f"localhost:{port}", b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), "upstream")
+        dead = closed_port()
+        check("e2e CONNECT to an allowed host that does not answer is a 502",
+              await talk(sock, connect(f"localhost:{dead}")), "HTTP/1.1 502 Bad Gateway")
+        check("e2e plain HTTP to an allowed host that does not answer is a 502",
+              await talk(sock, http(f"localhost:{dead}")), "HTTP/1.1 502 Bad Gateway")
+        many = await asyncio.gather(*(talk(sock, http(f"localhost:{port}")) for _ in range(25)))
+        check("e2e 25 requests at once all answered", sorted(set(many)), ["HTTP/1.1 200 OK"])
+        mixed = await asyncio.gather(*(talk(sock, connect(f"evil-localhost:{port}")) if i % 2 else
+                                       talk(sock, http(f"localhost:{port}")) for i in range(20)))
+        check("e2e allowed and denied requests interleaved keep their own answers",
+              (mixed[0::2].count("HTTP/1.1 200 OK"), mixed[1::2].count("HTTP/1.1 403 Forbidden")), (10, 10))
     finally:
         proc.terminate()
         log = proc.communicate()[1]
         os.unlink(sock)
     check("proxy log holds no raw escape character", "\x1b" in log, False)
+    # The wrappers build their denied-host summary from these lines.
+    check("proxy log names the denied host", f"DENY CONNECT evil-localhost:{port}" in log, True)
+    check("proxy log names the allowed host", f"ALLOW CONNECT localhost:{port}" in log, True)
     upstream.close()
     await upstream.wait_closed()
 
