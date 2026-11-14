@@ -5,6 +5,11 @@ the evidence behind each.
 
 ## 2026-11-14
 
+- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from
+  `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
+  `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is passed in. An error
+  in a job with no GPU allocated. No CUDA toolkit comes with it: bind a venv/conda env or use podman
+  for an image.
 - **`sandbox-run.sh --claude-history` and `--claude-history-rw`** (with `--claude`): the past Claude
   sessions of the directory you start from become visible, so `claude --resume` and `--continue`
   work. Read-only by default (new turns are not kept); `-rw` keeps them. Only that directory's

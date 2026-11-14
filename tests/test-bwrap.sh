@@ -336,6 +336,20 @@ check "--claude with ~/.local/bin/claude linked into ~/.ssh refused (rc 1, key n
 rm -f "$FH/home/.local/bin/claude"
 check "fake-home run left no per-job state" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/dev/null | wc -l | tr -d ' ')" "0"
 rm -rf "$FH"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && command -v nvidia-smi >/dev/null; then
+  echo "=== GPU: --gpu ==="
+  N=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+  OUT=$("$SANDBOX_RUN" --gpu -- nvidia-smi -L 2>/dev/null | grep -c '^GPU ')
+  check "--gpu: nvidia-smi sees the allocated GPU(s)" "$OUT" "$N"
+  OUT=$("$SANDBOX_RUN" --gpu -- bash -c 'ls /dev | grep -c "^nvidia[0-9]"' 2>/dev/null)
+  check "--gpu: only the allocated GPUs' device nodes" "$OUT" "$N"
+  OUT=$("$SANDBOX_RUN" -- nvidia-smi -L 2>/dev/null | grep -c '^GPU ')
+  check "without --gpu: no GPU visible" "$OUT" "0"
+  OUT=$(env -u CUDA_VISIBLE_DEVICES "$SANDBOX_RUN" --gpu -- true 2>&1; echo "rc=$?")
+  check "--gpu without an allocation refused" "${OUT##*rc=}" "1"
+else
+  echo "=== GPU: skipped (no CUDA_VISIBLE_DEVICES / nvidia-smi) ==="
+fi
 
 echo "=== SUMMARY: $PASS passed, $FAIL failed ==="
 exit $((FAIL > 0 ? 1 : 0))
