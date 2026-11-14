@@ -1,0 +1,30 @@
+# The parts of tests/test-bwrap.sh that need no cluster: no LSF, no GPU, no csub, no model.
+# Those sections skip themselves and are counted as skipped. What is left is the sandbox
+# itself (mounts, masks, environment, network default-deny, the proxy path, cleanup), on
+# GitHub's runner with its own bwrap. The full suites still run on the cluster by hand.
+name: test-bwrap
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-bwrap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap curl
+          # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor; bwrap needs them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --version
+      - name: A /scratch like the cluster's
+        run: sudo mkdir -p "/scratch/$(id -un)" && sudo chown "$(id -un)" "/scratch/$(id -un)"
+      - name: test-bwrap.sh (cluster-independent sections)
+        env:
+          SKIP_LLM: "1"
+        run: |
+          export USER="${USER:-$(id -un)}"
+          bash tests/test-bwrap.sh
