@@ -395,6 +395,8 @@ Three suites in `tests/`:
 | `test-podman.sh` | `podman-run.sh` | from a GPU job |
 | `test-proxy.py` | the allowlist proxy | anywhere (`python3 tests/test-proxy.py`); also on every push (GitHub Actions) |
 
+- GitHub Actions also runs the sections of `test-bwrap.sh` that need no cluster (no LSF, GPU, csub
+  or model) on every push and pull request, with the rest counted as skipped.
 - Run the two wrapper suites **one at a time**: they share opencode's database.
 - `ONLY=17,23 tests/test-bwrap.sh` runs only those sections. `SKIP_LLM=1` skips the sections that
   need a model to answer (a Claude login, a LiteLLM key); everything else is the sandbox itself.
