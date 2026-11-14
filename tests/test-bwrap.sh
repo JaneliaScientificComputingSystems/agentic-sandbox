@@ -264,6 +264,10 @@ check "state dirs back to baseline" "$(ls -A /scratch/$USER/.agentic-sandbox 2>/
 echo "=== 21. --claude puts the CLI on PATH even from a scrubbed environment ==="
 OUT=$(env PATH=/usr/local/bin:/usr/bin:/bin "$SANDBOX_RUN" --claude -- sh -c 'command -v claude >/dev/null && echo claude-found' 2>/dev/null)
 check "claude resolvable with a scrubbed PATH" "$OUT" "claude-found"
+if [[ -L "$HOME/.local/bin/claude" ]]; then
+  OUT=$(cd "$PWD" && "$SANDBOX_RUN" --claude -- sh -c 'test -L "$HOME/.local/bin/claude" && test -e "$HOME/.local/bin/claude" && echo link-resolves' 2>/dev/null)
+  check "claude symlink exists and resolves inside the sandbox" "$OUT" "link-resolves"
+fi
 
 echo "=== 22. Working directory, paths and descriptors ==="
 OUT=$(cd "$HOME" && "$SANDBOX_RUN" -- true >/dev/null 2>&1; echo $?)
