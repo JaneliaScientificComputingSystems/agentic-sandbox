@@ -236,7 +236,7 @@ s_16() {
   mkdir -p "$FAKE/proxy" && echo "not-yours" > "$FAKE/proxy/proxy.log"
   OUT=$("$SANDBOX_RUN" --scratch -- bash -c 'test -e /scratch/$USER/.agentic-sandbox && echo visible || echo hidden')
   check "--scratch: state parent not mounted at all" "$OUT" "hidden"
-  OUT=$("$SANDBOX_RUN" --rw "/scratch/$USER" --claude -- bash -c 'echo "$(ls -A /scratch/$USER/.agentic-sandbox | grep -c fake-sibling),$(test -f "$CLAUDE_CONFIG_DIR/.claude.json" && echo own-cfg-ok)"' 2>/dev/null)
+  OUT=$("$SANDBOX_RUN" --rw "/scratch/$USER" --claude -- bash -c 'echo "$(ls -A /scratch/$USER/.agentic-sandbox | grep -c fake-sibling),$(test -d "$CLAUDE_CONFIG_DIR" && touch "$CLAUDE_CONFIG_DIR/probe" 2>/dev/null && echo own-cfg-ok)"' 2>/dev/null)
   check "--rw /scratch/\$USER: siblings masked by tmpfs, own cfg still bound" "$OUT" "0,own-cfg-ok"
   rm -rf "$FAKE"
   check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
