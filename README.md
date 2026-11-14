@@ -4,8 +4,9 @@ Sandboxing for unsupervised agentic loops on Janelia's LSF cluster. Two wrappers
 flags:
 
 - **`scripts/sandbox-run.sh`** — Bubblewrap (`bwrap`). No root, no daemon, no image. The default.
-- **`scripts/podman-run.sh`** — rootless Podman. For a task that needs a container image (CUDA toolkit,
-  cuDNN, PyTorch). Plain GPU access no longer needs it: `sandbox-run.sh --gpu` does that.
+- **`scripts/podman-run.sh`** — rootless Podman, for a task that needs a container image (CUDA
+  toolkit, cuDNN, PyTorch). GPU access alone does not need it; see
+  [GPU work: bwrap or podman](#gpu-work-bwrap-or-podman).
 
 They exist because internal guidance requires that an agentic loop running without a human
 reviewing each step has its file, device and network access restricted to what the task needs, and
@@ -209,12 +210,10 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   does not.
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
-  "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"` need a
-  csub that passes `--gpu` to `sandbox-run.sh` (saalfeldlab/csub `main` refuses them as of
-  2026-11-14; its open PR #15 removes the refusal and adds the flag). Set `sandbox_scripts_dir` in
-  `broker.toml` to this checkout's `scripts/` if it is not at csub's default
-  `~/.local/share/csub/agentic-sandbox/scripts`. `--gpu` on the parent sandbox is independent: it
-  changes neither the mounts nor the hosts in the envelope.
+  "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"`
+  need csub PR #15, open as of 2026-11-14 (tested here against it; csub `main` refuses them). Set
+  `sandbox_scripts_dir` in `broker.toml` to this checkout's `scripts/`. `--gpu` on the parent
+  sandbox is independent: it changes neither the mounts nor the hosts in the envelope.
 - **The agent controls `CSUB_MOUNTS` inside the sandbox**, but the broker is started with this
   sandbox's mounts and `--allow` hosts as its envelope (csub #13), so a child job cannot mount a
   directory the sandbox itself can't see, or reach a host it can't. With nothing to put in the
@@ -273,39 +272,44 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   both have been seen on the same prompt. Claude via Anthropic directly has no gateway guardrail.
   Treat either as a normal outcome, not a broken service.
 
-## GPU and podman specifics
-- **GPU under bwrap (`sandbox-run.sh --gpu`).** Each entry of `CUDA_VISIBLE_DEVICES` is mapped
-  (`nvidia-smi` → PCI bus id → `/proc/driver/nvidia/gpus/<bus>/information` → device minor) to its
-  `/dev/nvidiaN`, and bound in with `/dev/nvidiactl`, `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`; the
-  job's other GPUs get no device node. Inside, `CUDA_VISIBLE_DEVICES` is renumbered to match (`0..n-1`
-  in the order given, with `CUDA_DEVICE_ORDER=PCI_BUS_ID`), so starting one sandbox per GPU of a
-  multi-GPU job works. NVML also needs the GPU's PCI identity from sysfs, so
-  `/sys/devices` and `/sys/module` are bound read-only (without them: `GPU access blocked by the
-  operating system`; `nvidia-smi` and PyTorch both work with just those two). What this exposes: the
-  node's hardware inventory (PCI topology including the GPUs you were not given, NICs and MACs, DMI
-  strings, module parameters), read-only and not openable, since only your GPUs' device nodes exist.
-  The driver libraries and `nvidia-smi` come from the host `/usr`/`/lib64`; there is no cuDNN or
-  PyTorch unless you bind a venv/conda env (`--ro`). `module load cuda/<ver>` on the host before
-  starting works too: the toolkits live under `/usr/local/cuda-*`, already bound, and `PATH` is passed
-  in; add `--env CUDA_HOME --env LD_LIBRARY_PATH` for anything that loads `libcudart`/`libcublas`
-  dynamically (a static `nvcc` build did not need them). Some installs on a node are incomplete (on the L4
-  nodes checked, cuda/12.4 and 12.9, which is `cuda/12-latest`, lack `cuda_runtime.h`; 11.8 and 13.x
-  have it, so prefer a 13.x toolkit). Recipe from `AFzoo/scripts/env/bwrap-gpu.sh`.
-  `--gpu` in a job with no GPU is an error.
-- **Why podman for GPUs, then.** When the task wants an image with the toolkit, cuDNN and PyTorch
-  already in it. There `--gpu` maps to `--device nvidia.com/gpu=all` (NVIDIA CDI), which a bare bwrap
-  doesn't have (nor does Anthropic's `sandbox-runtime`:
-  [anthropics/claude-code#13108](https://github.com/anthropics/claude-code/issues/13108)). Isolation
-  differs little for the GPU itself: podman gets `/dev/nvidiaN`, `/dev/dri/*` and the control nodes
-  from the CDI spec, and a rootless container normally sees a read-only bind of the host's whole `/sys`
-  (not tested here), which is wider than bwrap's two required subtrees; podman adds masked `/proc`/`/sys`
-  paths and an image-only filesystem.
+## GPU work: bwrap or podman
+
+Both wrappers take `--gpu` inside an LSF GPU job. **Use bwrap unless the task needs a container
+image.**
+
+| | `sandbox-run.sh --gpu` (bwrap) | `podman-run.sh --gpu` |
+| --- | --- | --- |
+| One-time setup | none | a subuid/subgid range from HPC and a `storage.conf` (`SETUP.md` §3) |
+| Start-up | seconds | an image pull (1.2 GB, or several GB) on each new node, and again after the hourly scratch cleanup |
+| Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
+| Credential masking | yes | no, which is why `$HOME` cannot be mounted |
+| What the sandbox sees of the node | device nodes for the job's GPUs only; `/sys/devices` and `/sys/module`, read-only | a device node for every GPU on the node (LSF's device cgroup blocks the ones that are not yours) and all of `/sys`, read-only |
+| GPU child jobs through `--csub` | not yet: needs csub PR #15 | yes |
+| Moving parts | bwrap and the host driver | podman, an image store, user-namespace id mapping, `/dev/shm` sizing |
+
+What bwrap costs: there is no image, so no packaged CUDA toolkit, cuDNN or PyTorch. You depend on
+what the node has installed, which varies, or on a venv you build (see "Dependencies" above).
+
+**Under bwrap:**
+
+- Only the job's own GPUs are bound, and `CUDA_VISIBLE_DEVICES` is renumbered inside to match
+  (`0..n-1`, in the order given), so one sandbox per GPU of a multi-GPU job works. `--gpu` in a job
+  with no GPU is an error.
+- For a CUDA toolkit, `module load cuda/<version>` before starting: the toolkits live under
+  `/usr/local/cuda-*`, which is already bound, and `PATH` is passed in. Add `--env CUDA_HOME --env
+  LD_LIBRARY_PATH` for anything that loads `libcudart` or `libcublas` dynamically. Prefer a 13.x
+  toolkit: on the L4 nodes checked, cuda/12.4 and 12.9 (`cuda/12-latest`) lack `cuda_runtime.h`.
+- For PyTorch, bind a venv or conda env with `--ro`.
+- How the GPUs are found and why `/sys` is needed: `ADMIN-NOTES.md`, "bwrap `--gpu`".
+
+**Under podman:**
+
 - **Podman's own logging is off.** `podman-run.sh` passes `--log-driver=none` and
   `--events-backend=none` whatever your `containers.conf` says; the node default, `journald`, would
   copy everything the container prints into the system logs. Output still reaches your terminal and
   the job's output file; `podman logs` shows nothing.
-- **`gpu=all` is safe on a shared node**: LSF's device cgroup fences a job to its allocation, so a
-  1-GPU job on an 8-GPU node sees one GPU. Don't attach by index (`CUDA_VISIBLE_DEVICES` is `0` in every
+- **`--gpu` is `--device nvidia.com/gpu=all` (NVIDIA CDI), and that is safe on a shared node**:
+  LSF's device cgroup fences a job to its allocation, so a 1-GPU job on an 8-GPU node sees one GPU. Don't attach by index (`CUDA_VISIBLE_DEVICES` is `0` in every
   LSF GPU job, while CDI names count the whole node). `--gpu` in a job with no GPU is an error.
 - **"root" inside is you.** The container process is uid 0 with `$HOME=/root`, but rootless podman maps
   that to your uid: files written to a `--rw` path are yours, and its capabilities apply only inside.
@@ -315,8 +319,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **Your podman jobs can share a node.** Each invocation has its own image store and runtime dir keyed
   on job id, array index and pid; a pulled image is reused through a read-only shared store, which the
   wrapper never resets. Request the queue's normal CPU-to-GPU ratio; `bsub -gpu` needs an explicit GPU
-  queue. Check `bqueues` before choosing one: on 2026-10-17 `gpu_l4` had about 218,000 jobs pending
-  from a single array, while `gpu_short` (60-minute limit, for short test jobs) dispatched at once.
+  queue. Check `bqueues` before choosing one: a busy queue can hold a job for hours while `gpu_short`
+  (60-minute limit, for short test jobs) dispatches at once.
 
 ## What it does and does not protect against
 
@@ -424,8 +428,8 @@ Actions).
   policy or the `--allow` list, outside the sandbox.
 
 ## Known limitations
-- bwrap `--gpu` gives devices and the host driver only, no CUDA toolkit; podman can't mask credentials. The proxy is HTTP-style only (no SOCKS5), but
-  allows any port on a listed host.
+- bwrap has no image (so no packaged CUDA toolkit); podman can't mask credentials. The proxy is
+  HTTP-style only (no SOCKS5), but allows any port on a listed host.
 - One opencode sandbox per account at a time; `--keep-id` needs a widened subuid/subgid range.
 - Per-job state needs a writable `/scratch/$USER`; `sandbox-run.sh` falls back to `$TMPDIR` only off
   the cluster and says so, `podman-run.sh` requires it.
