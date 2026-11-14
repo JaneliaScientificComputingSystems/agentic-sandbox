@@ -28,7 +28,8 @@ not protect against](#what-it-does-and-does-not-protect-against).
 | `sandbox-run.sh` (bwrap) | a clone of this repo; nothing else | `SETUP.md` §1–2 |
 | `--claude` | `claude auth login` outside the sandbox | `SETUP.md` §4 |
 | `--opencode` | a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
-| `podman-run.sh` (GPU) | a subuid/subgid range from HPC (**not self-service, ask first**) and a `storage.conf` | `SETUP.md` §3 |
+| `sandbox-run.sh --gpu` | nothing more; run it inside an LSF GPU job | `SETUP.md` §2 |
+| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and a `storage.conf` | `SETUP.md` §3 |
 | `--csub` (optional) | csub installed and a policy file | `SETUP.md` §6 |
 
 ## Try it first (no login or key needed)
@@ -42,7 +43,7 @@ mkdir -p /scratch/$USER/work && cd /scratch/$USER/work      # a work dir, not th
 
 # 1. Your home is not there and there is no network:
 "$SANDBOX"/sandbox-run.sh --scratch -- bash -c 'ls -A "$HOME"; curl -sS -m 5 https://example.com'
-#    -> only empty .config and .ssh placeholders, then "Could not resolve host"
+#    -> "ls: cannot access '<your home>': No such file or directory", then "Could not resolve host"
 
 # 2. The directory you started in is writable, and one allowed host is reachable:
 "$SANDBOX"/sandbox-run.sh --scratch --allow example.com -- bash -c \
@@ -61,8 +62,11 @@ mkdir -p /scratch/$USER/work && cd /scratch/$USER/work      # a work dir, not th
 "$SANDBOX"/sandbox-run.sh --scratch --claude \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
 
-# the same on a GPU node, in a container (8 slots per GPU on gpu_l4)
+# the same on a GPU node (8 slots per GPU on gpu_l4): with the host's driver under bwrap ...
 bsub -q gpu_l4 -gpu "num=1" -n 8 -Is /bin/bash
+"$SANDBOX"/sandbox-run.sh --gpu --scratch --claude \
+  --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
+# ... or in a container image that brings CUDA, cuDNN and PyTorch
 "$SANDBOX"/podman-run.sh --gpu --scratch --claude \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
 ```
@@ -100,7 +104,9 @@ The sandbox is identical in the three ways to run it; only the submission differ
   `podman-run.sh --keep-id --rw /groups/lab/venv --allow pypi.org --allow files.pythonhosted.org -- bash -c
   'python3 -m venv --system-site-packages /groups/lab/venv && /groups/lab/venv/bin/pip install PKG'`.
   `--system-site-packages` keeps torch and the rest of the image. For bwrap, build it with the host's
-  `python3` (not tested).
+  `python3` the same way (`sandbox-run.sh --rw /groups/lab/venv --allow pypi.org --allow
+  files.pythonhosted.org -- bash -c 'python3 -m venv /groups/lab/venv && /groups/lab/venv/bin/pip
+  install PKG'`; verified with PyTorch, about 6 GB and four minutes).
 - **Git.** Credentials (`~/.ssh`, `.git-credentials`) aren't bound, so the agent can commit locally
   but can't push or clone private repos. Push from outside after reviewing.
 - **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
@@ -204,8 +210,8 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"` need a
-  csub that passes `--gpu` to `sandbox-run.sh` (saalfeldlab/csub as of `e253aa5` refuses them; the
-  `bwrap-gpu` patch there removes the refusal and adds the flag). Set `sandbox_scripts_dir` in
+  csub that passes `--gpu` to `sandbox-run.sh` (saalfeldlab/csub `main` refuses them as of
+  2026-11-14; its open PR #15 removes the refusal and adds the flag). Set `sandbox_scripts_dir` in
   `broker.toml` to this checkout's `scripts/` if it is not at csub's default
   `~/.local/share/csub/agentic-sandbox/scripts`. `--gpu` on the parent sandbox is independent: it
   changes neither the mounts nor the hosts in the envelope.
@@ -249,7 +255,7 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **Claude Code.** A fresh `claude auth login` inside the sandbox works only if
   `~/.claude/.credentials.json` already exists on the host. An API key beats an expired login; never
   put it on a `bsub` command line. Not carried in: `~/.claude/plugins`, skills, `projects/` history
-  (add `--ro`/`--rw` for a path a task needs).
+  (add `--ro`/`--rw` for a path a task needs; for this directory's history, `--claude-history`).
 - **opencode + Kimi K3.** **Always name the model** interactively, `opencode -m litellm/kimi-k3`: bare
   `opencode` defaults to its hosted "OpenCode Zen" model, which talks to hosts outside your allowlist
   and fails with a bare `Forbidden`. One-shot `opencode run ... --model litellm/kimi-k3` is unaffected.
@@ -282,8 +288,9 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   PyTorch unless you bind a venv/conda env (`--ro`). `module load cuda/<ver>` on the host before
   starting works too: the toolkits live under `/usr/local/cuda-*`, already bound, and `PATH` is passed
   in; add `--env CUDA_HOME --env LD_LIBRARY_PATH` for anything that loads `libcudart`/`libcublas`
-  dynamically (a static `nvcc` build did not need them). Some installs on a node can be incomplete (here
-  cuda/12.4 lacks `cuda_runtime.h`; 13.0 and 11.8 have it). Recipe from `AFzoo/scripts/env/bwrap-gpu.sh`.
+  dynamically (a static `nvcc` build did not need them). Some installs on a node are incomplete (on the L4
+  nodes checked, cuda/12.4 and 12.9, which is `cuda/12-latest`, lack `cuda_runtime.h`; 11.8 and 13.x
+  have it, so prefer a 13.x toolkit). Recipe from `AFzoo/scripts/env/bwrap-gpu.sh`.
   `--gpu` in a job with no GPU is an error.
 - **Why podman for GPUs, then.** When the task wants an image with the toolkit, cuDNN and PyTorch
   already in it. There `--gpu` maps to `--device nvidia.com/gpu=all` (NVIDIA CDI), which a bare bwrap
@@ -293,6 +300,10 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   from the CDI spec, and a rootless container normally sees a read-only bind of the host's whole `/sys`
   (not tested here), which is wider than bwrap's two required subtrees; podman adds masked `/proc`/`/sys`
   paths and an image-only filesystem.
+- **Podman's own logging is off.** `podman-run.sh` passes `--log-driver=none` and
+  `--events-backend=none` whatever your `containers.conf` says; the node default, `journald`, would
+  copy everything the container prints into the system logs. Output still reaches your terminal and
+  the job's output file; `podman logs` shows nothing.
 - **`gpu=all` is safe on a shared node**: LSF's device cgroup fences a job to its allocation, so a
   1-GPU job on an 8-GPU node sees one GPU. Don't attach by index (`CUDA_VISIBLE_DEVICES` is `0` in every
   LSF GPU job, while CDI names count the whole node). `--gpu` in a job with no GPU is an error.
@@ -332,6 +343,9 @@ It is **not** stopped from:
   credentials under a bound path (no masking, which is why binding `$HOME` is refused).
 - **Making syscalls the kernel allows an unprivileged user** (bwrap installs no seccomp filter, and
   the cluster's bwrap 0.6 predates `--disable-userns`, so nested user namespaces stay available).
+- **Reading the node's hardware inventory with `sandbox-run.sh --gpu`**: `/sys/devices` and
+  `/sys/module` are visible read-only (PCI topology, NICs and MACs, DMI strings). Without `--gpu`
+  there is no `/sys` at all.
 - Anything multi-node: one sandbox, one host. No MPI, Ray, DDP, Spark or Dask across nodes.
 - Your own mistakes in Mode C: a human is present and the sandbox limits damage but doesn't review.
 
@@ -346,8 +360,8 @@ It is **not** stopped from:
 ## Flag reference
 
 ```
-sandbox-run.sh [options] -- <command...>          # bwrap
-podman-run.sh  [options] -- <command...>          # podman, GPU-capable
+sandbox-run.sh [options] -- <command...>          # bwrap: the host's own files and driver
+podman-run.sh  [options] -- <command...>          # podman: a container image
 
   --ro PATH       Read-only bind (repeatable)
   --rw PATH       Read-write bind (repeatable)
@@ -369,7 +383,8 @@ podman-run.sh  [options] -- <command...>          # podman, GPU-capable
 
 ## Testing
 `tests/test-bwrap.sh` and `tests/test-podman.sh` are live suites: run them from a compute node (podman:
-a GPU job), **one at a time** (they share opencode's database). Some need a Claude login and a LiteLLM
+a GPU job; bwrap: its `--gpu` checks run only in a GPU job, and the subset check needs two GPUs),
+**one at a time** (they share opencode's database). Some need a Claude login and a LiteLLM
 key; the `--csub` tests need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` under your policy's allowed
 roots, else they're skipped. `python3 tests/test-proxy.py` tests the proxy without a cluster, and runs on every push (GitHub
 Actions).

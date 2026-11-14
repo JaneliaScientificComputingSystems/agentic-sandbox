@@ -274,6 +274,12 @@ hard limit for me regardless of how the request is packaged"*) — no exception,
 
 ## GPU / device access — evidence
 
+> **Superseded in part (2026-11-03, merged 2026-11-14).** The conclusion below, that bwrap cannot
+> pass a GPU through, was wrong about the cause. The missing piece was sysfs: with the device nodes
+> bound **and** `/sys/devices` and `/sys/module` visible read-only, `nvidia-smi`, CUDA and PyTorch
+> work under bwrap. See "bwrap `--gpu`" further down. What follows is kept as the record of what
+> was tried at the time; podman remains the way to run a container image.
+
 **Confirmed, root-caused, tested live on a real GPU allocation (`gpu_l4` LSF queue).**
 
 What was ruled out with direct tests:

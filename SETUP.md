@@ -22,7 +22,10 @@ run from the checkout, the wrapper re-binds its own directory read-only and says
 unprivileged user namespaces (`/proc/sys/user/max_user_namespaces` > 0), which are enabled here.
 `--gpu` additionally needs `nvidia-smi` on the host (inside an LSF GPU job); nothing else.
 
-## 3. Podman (GPU jobs)
+## 3. Podman (container images)
+
+Skip this unless a task needs a container image. GPU access alone does not: `sandbox-run.sh --gpu`
+uses the host's driver and needs none of the setup below.
 
 **Rootless podman needs a `/etc/subuid`/`/etc/subgid` range for your account.** HPC provisions
 these per user; they are not self-service and not granted by default. Ask before your first
@@ -57,8 +60,8 @@ EOF
 If you already have a `containers.conf`, add or update the two settings rather than overwriting
 it. `podman-run.sh` passes both logging settings itself on every run, so a sandbox never logs
 through podman even without this file; the file is what covers `podman` when you run it directly
-(the node default, `journald`, copies everything a container prints into the system logs). You do not need to create the storage directories; podman does that on first use on each
-node.
+(the node default, `journald`, copies everything a container prints into the system logs). You
+do not need to create the storage directories; podman does that on first use on each node.
 
 What this buys and costs: podman's per-user storage would otherwise land in
 `~/.local/share/containers` and fill your home with multi-GB images. On scratch it is node-local
@@ -132,7 +135,7 @@ python3 -m venv ~/.venvs/csub
 
 Compute nodes reach GitHub but not PyPI directly: `pip install` in a plain shell there fails. (Through
 the wrappers' allowlist proxy it works, with `--allow pypi.org --allow files.pythonhosted.org`; verified
-under `podman-run.sh`.) On Python 3.9 csub needs `tomli`, so download that wheel on a machine with
+under both wrappers.) On Python 3.9 csub needs `tomli`, so download that wheel on a machine with
 internet, copy it into your home, and `~/.venvs/csub/bin/pip install --no-index ~/tomli-*.whl`.
 
 ```bash

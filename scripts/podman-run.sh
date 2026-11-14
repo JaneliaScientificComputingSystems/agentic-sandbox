@@ -1,8 +1,9 @@
 #!/bin/bash
 # podman-run.sh -- convenience wrapper around podman, mirroring sandbox-run.sh's flags.
 #
-# Use this instead of sandbox-run.sh when the task needs GPU access -- bwrap cannot do GPU
-# passthrough (see the main README's GPU section); podman + NVIDIA CDI can.
+# Use this instead of sandbox-run.sh when the task needs a container image (a CUDA toolkit,
+# cuDNN, PyTorch). GPU access alone no longer needs it: sandbox-run.sh --gpu binds the job's GPUs
+# with the host's driver (see the main README's GPU section).
 #
 # Usage:
 #   podman-run.sh [options] -- <command...>
