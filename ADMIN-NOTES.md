@@ -788,6 +788,17 @@ nvidia-smi -L` ran as LSF job 155187444 "via bwrap" on a different GPU (UUID dif
 parent's) and printed one L4, exit 0. The child's own `sandbox-run.sh --gpu` took its allocation
 from the job's `CUDA_VISIBLE_DEVICES`.
 
+Review before merging (2026-11-14, as an ordinary user through `bsub`, two L4s on an 8-GPU node):
+the sandbox had two `/dev/nvidiaN` nodes and `mknod` failed for every minor; `/sys` held only
+`devices` and `module`, read-only. Real workloads matched the same GPU outside the sandbox: an
+`nvcc`-built kernel (toolkit 13.3) compiled and run inside, and PyTorch 2.8 installed inside through
+the proxy (`gpu_check.py`, a cuDNN/AMP training loop on both GPUs, a 4-worker DataLoader). One
+defect, fixed on merge: the job's `CUDA_VISIBLE_DEVICES` was passed in unchanged, so selecting
+only the second GPU (`CUDA_VISIBLE_DEVICES=1`) bound one device and pointed CUDA at index 1, which
+does not exist inside (`cuInit` 100, "No CUDA GPUs are available"). The value is now each GPU's
+rank among the bound ones. On that node `cuda/12-latest` (12.9) had no `cuda_runtime.h`; the 13.x
+toolkits did.
+
 ### `--csub`: the seam to Stephan Saalfeld's csub broker (2026-10-12)
 
 csub (saalfeldlab/csub) is a policy-checked job broker: a sandboxed client sends a JSON

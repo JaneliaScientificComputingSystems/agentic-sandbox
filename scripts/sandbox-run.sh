@@ -28,7 +28,8 @@
 #                         $CUDA_VISIBLE_DEVICES is mapped (nvidia-smi -> PCI bus id -> driver
 #                         minor) to its /dev/nvidiaN node, which is bound in together with
 #                         /dev/nvidiactl, /dev/nvidia-uvm and /dev/nvidia-uvm-tools. Only the
-#                         job's own GPUs get a device node. CUDA_VISIBLE_DEVICES is passed in.
+#                         job's own GPUs get a device node. CUDA_VISIBLE_DEVICES is set to their
+#                         numbering inside (0..n-1, same order), CUDA_DEVICE_ORDER to PCI_BUS_ID.
 #                         An error if no GPU is allocated. Driver libraries come from the
 #                         read-only /usr and /lib64 binds, and the PCI identity NVML needs from
 #                         read-only /sys/{devices,module}; needs nvidia-smi on the host.
@@ -218,6 +219,8 @@ fi
 # (index or GPU-UUID) -> PCI bus id -> driver device minor (the N in /dev/nvidiaN). Not
 # `--device nvidia.com/gpu=all` as podman does: bwrap has no CDI, so nodes are bound one by one.
 GPU_BINDS=()
+GPU_CVD=""
+_buses=()
 if [[ $WANT_GPU -eq 1 ]]; then
   if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     echo "sandbox-run.sh: --gpu, but CUDA_VISIBLE_DEVICES is empty -- no GPU is allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
@@ -235,7 +238,19 @@ if [[ $WANT_GPU -eq 1 ]]; then
       || { echo "sandbox-run.sh: --gpu: could not resolve GPU '$g' to a /dev/nvidiaN node (read $info)" >&2; exit 1; }
     echo "sandbox-run.sh: --gpu: $g -> /dev/nvidia$minor" >&2
     GPU_BINDS+=(--dev-bind "/dev/nvidia$minor" "/dev/nvidia$minor")
+    _buses+=("$bus")
   done
+  # The numbering inside. Only the bound GPUs can be opened there, so CUDA counts them from 0 (in
+  # PCI bus order, pinned with CUDA_DEVICE_ORDER below). Passing the job's own value through
+  # worked only when it was 0..n-1: `CUDA_VISIBLE_DEVICES=1` in a 2-GPU job bound one GPU and then
+  # pointed CUDA at a second one that did not exist ("No CUDA GPUs are available"). Each entry
+  # becomes its GPU's rank among the bound ones, in the order given.
+  _sorted="$(printf '%s\n' "${_buses[@]}" | sort -u)"
+  for b in "${_buses[@]}"; do
+    i=$(( $(printf '%s\n' "$_sorted" | grep -n -x -F -- "$b" | cut -d: -f1) - 1 ))
+    GPU_CVD+="${GPU_CVD:+,}$i"
+  done
+  [[ "$GPU_CVD" == "$CUDA_VISIBLE_DEVICES" ]] || echo "sandbox-run.sh: --gpu: CUDA_VISIBLE_DEVICES is $GPU_CVD inside the sandbox" >&2
   # NVML/CUDA read the GPU's PCI identity from sysfs; without it nvidia-smi fails with "GPU access
   # blocked by the operating system" even with every device node present (verified live). Only the
   # two subtrees it needs, read-only (bisected; PyTorch too): not /sys/bus, /sys/dev, /sys/fs
@@ -343,7 +358,7 @@ BWRAP_ARGS=(
 # After --dev /dev (mounts apply in order): the GPU device nodes, and the job's device numbering.
 if [[ ${#GPU_BINDS[@]} -gt 0 ]]; then
   BWRAP_ARGS+=("${GPU_BINDS[@]}")
-  EXTRA_SETENV+=(CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES")
+  EXTRA_SETENV+=(CUDA_VISIBLE_DEVICES "$GPU_CVD" CUDA_DEVICE_ORDER PCI_BUS_ID)
 fi
 # Own terminal session unless a human is actually at a terminal (Mode C): with a controlling
 # tty shared with the parent shell, a sandboxed process can queue keystrokes into it with the

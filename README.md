@@ -271,7 +271,9 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **GPU under bwrap (`sandbox-run.sh --gpu`).** Each entry of `CUDA_VISIBLE_DEVICES` is mapped
   (`nvidia-smi` → PCI bus id → `/proc/driver/nvidia/gpus/<bus>/information` → device minor) to its
   `/dev/nvidiaN`, and bound in with `/dev/nvidiactl`, `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`; the
-  job's other GPUs get no device node. NVML also needs the GPU's PCI identity from sysfs, so
+  job's other GPUs get no device node. Inside, `CUDA_VISIBLE_DEVICES` is renumbered to match (`0..n-1`
+  in the order given, with `CUDA_DEVICE_ORDER=PCI_BUS_ID`), so starting one sandbox per GPU of a
+  multi-GPU job works. NVML also needs the GPU's PCI identity from sysfs, so
   `/sys/devices` and `/sys/module` are bound read-only (without them: `GPU access blocked by the
   operating system`; `nvidia-smi` and PyTorch both work with just those two). What this exposes: the
   node's hardware inventory (PCI topology including the GPUs you were not given, NICs and MACs, DMI

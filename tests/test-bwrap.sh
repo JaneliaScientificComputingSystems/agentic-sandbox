@@ -347,6 +347,14 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && command -v nvidia-smi >/dev/null; the
   check "without --gpu: no GPU visible" "$OUT" "0"
   OUT=$(env -u CUDA_VISIBLE_DEVICES "$SANDBOX_RUN" --gpu -- true 2>&1; echo "rc=$?")
   check "--gpu without an allocation refused" "${OUT##*rc=}" "1"
+  if [[ $N -ge 2 ]]; then
+    # Only the job's LAST GPU: inside it is the only one, so it must be numbered 0 and CUDA (the
+    # driver's own libcuda: cuInit, cuDeviceGetCount) must find exactly one device.
+    OUT=$(CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES##*,} "$SANDBOX_RUN" --gpu -- bash -c 'echo "$CUDA_VISIBLE_DEVICES"; python3 -c "import ctypes; c=ctypes.CDLL(\"libcuda.so.1\"); n=ctypes.c_int(); print(c.cuInit(0), c.cuDeviceGetCount(ctypes.byref(n)), n.value)"' 2>/dev/null | tr '\n' ',')
+    check "--gpu with only the job's last GPU: numbered 0 inside and usable by CUDA" "$OUT" "0,0 0 1,"
+  else
+    echo "SKIP: GPU subset check needs a job with 2 or more GPUs"
+  fi
 else
   echo "=== GPU: skipped (no CUDA_VISIBLE_DEVICES / nvidia-smi) ==="
 fi
