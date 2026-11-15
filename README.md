@@ -28,14 +28,14 @@ not protect against](#what-it-does-and-does-not-protect-against).
 | --- | --- | --- |
 | `sandbox-run.sh` (bwrap) | a clone of this repo; nothing else | `SETUP.md` §1–2 |
 | `--claude` | `claude auth login` outside the sandbox | `SETUP.md` §4 |
-| `--opencode` | a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
+| `--opencode` | opencode installed and run once, and a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
 | `sandbox-run.sh --gpu` | nothing more; run it inside an LSF GPU job | `SETUP.md` §2 |
 | `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and a `storage.conf` | `SETUP.md` §3 |
 | `--csub` (optional) | csub installed and a policy file | `SETUP.md` §6 |
 
 ## Try it first (no login or key needed)
 
-From an interactive job (`bsub -q short -Is /bin/bash`), with `SANDBOX` pointing at this repo's
+From an interactive job (`bsub -q interactive -Is /bin/bash`), with `SANDBOX` pointing at this repo's
 `scripts/` directory:
 
 ```bash
@@ -107,7 +107,8 @@ The sandbox is identical in the three ways to run it; only the submission differ
   `--system-site-packages` keeps torch and the rest of the image. For bwrap, build it with the host's
   `python3` the same way (`sandbox-run.sh --rw /groups/lab/venv --allow pypi.org --allow
   files.pythonhosted.org -- bash -c 'python3 -m venv /groups/lab/venv && /groups/lab/venv/bin/pip
-  install PKG'`; verified with PyTorch, about 6 GB and four minutes).
+  install PKG'`; verified with PyTorch, about 6 GB and four minutes; install `numpy` with `torch`, or
+  every run warns `Failed to initialize NumPy`).
 - **Git.** Credentials (`~/.ssh`, `.git-credentials`) aren't bound, so the agent can commit locally
   but can't push or clone private repos. Push from outside after reviewing.
 - **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
@@ -269,7 +270,9 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **The Kimi K3 safeguard.** Requests to `kimi-k3` pass through a gateway guardrail (an LLM-as-judge
   for harmful content and jailbreaks) whatever the client. A refusal is either the gateway's
   `GuardrailRaisedException`/400 naming the check (`content_harm`) or the model declining in prose;
-  both have been seen on the same prompt. Claude via Anthropic directly has no gateway guardrail.
+  both have been seen on the same prompt. It also blocks an answer that names cluster nodes or job ids
+  (`sensitive_data_leak`), so ask for a result, not for where a job ran. Claude via Anthropic directly
+  has no gateway guardrail.
   Treat either as a normal outcome, not a broken service.
 
 ## GPU work: bwrap or podman

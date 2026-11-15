@@ -1,7 +1,8 @@
 # One-time setup
 
 Everything here is per account and done once. None of it runs on a login node: start an
-interactive job first (`bsub -q short -Is /bin/bash`) and do the setup there. The README assumes
+interactive job first (`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only) and do
+the setup there. The README assumes
 all of this is in place.
 
 ## 1. Get the wrappers
@@ -94,6 +95,13 @@ the key on a `bsub` command line: LSF keeps that verbatim in `bjobs -l`/`bhist -
 
 ## 5. opencode with Kimi K3
 
+Install opencode with its own installer, which puts the binary in `~/.opencode/bin` and works from a
+compute node:
+
+```bash
+curl -fsSL https://opencode.ai/install | bash
+```
+
 Kimi K3 is served behind Janelia's LiteLLM gateway (`litellm.int.janelia.org`). Ask the HPC team
 for a LiteLLM virtual key scoped to `kimi-k3`, then:
 
@@ -118,7 +126,17 @@ EOF
 chmod 600 ~/.config/opencode/opencode.json
 ```
 
-The wrappers give each sandbox a throwaway copy of this directory, so edits made inside never
+Then run opencode once outside the sandbox:
+
+```bash
+opencode models | grep litellm      # expect litellm/kimi-k3
+```
+
+This checks the config, and it is required after a fresh install: opencode writes
+`~/.opencode/.gitignore` on its first start, and `--opencode` binds `~/.opencode` read-only, so a first
+start inside the sandbox fails with `FileSystem.writeFile (.../.opencode/.gitignore)`.
+
+The wrappers give each sandbox a throwaway copy of the config directory, so edits made inside never
 reach it.
 
 ## 6. csub (optional: letting a sandboxed agent submit cluster jobs)
@@ -133,10 +151,10 @@ python3 -m venv ~/.venvs/csub
 ~/.venvs/csub/bin/pip install ~/csub
 ```
 
-Compute nodes reach GitHub but not PyPI directly: `pip install` in a plain shell there fails. (Through
-the wrappers' allowlist proxy it works, with `--allow pypi.org --allow files.pythonhosted.org`; verified
-under both wrappers.) On Python 3.9 csub needs `tomli`, so download that wheel on a machine with
-internet, copy it into your home, and `~/.venvs/csub/bin/pip install --no-index ~/tomli-*.whl`.
+This worked in a plain shell on the compute nodes checked on 2026-11-15 (it pulls `hatchling` and, on
+Python 3.9, `tomli` from PyPI). If a node cannot reach PyPI, run the install through the wrappers'
+allowlist proxy instead: `cd ~/csub && sandbox-run.sh --rw ~/.venvs/csub --allow pypi.org --allow
+files.pythonhosted.org -- ~/.venvs/csub/bin/pip install .` (verified).
 
 ```bash
 mkdir -p ~/.config/csub
@@ -153,7 +171,11 @@ Edit the policy:
   (`CSUB_ENVELOPE=off`), a sandboxed agent can ask a job to mount any directory beneath a root, so
   everything under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the policy
   rejects it).
+- `sandbox`: the sample says `"podman"`. Set `"bwrap"` unless you have the podman setup of §3; child
+  jobs then run through `sandbox-run.sh` and need no image or subuid range.
 - `sandbox_scripts_dir`: this repo's `scripts/` directory; child jobs run through it.
+- `[lsf] project`: the sample says `"CHANGEME"`. Set it to the lab or project your jobs bill to, or
+  delete the line to bill to your default (deleting is the tested case).
 - `allowed_images`: list the concrete images rather than the default glob, so `csub probe` and
   the in-sandbox README can tell an agent exactly what exists:
   `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` and
