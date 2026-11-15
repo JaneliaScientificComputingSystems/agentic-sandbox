@@ -212,7 +212,7 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"`
-  need csub PR #15, open as of 2026-11-14 (tested here against it; csub `main` refuses them). Set
+  need a csub with PR #15, merged 2026-11-15 (tested against `main` at `ec9aa88`; an older csub refuses them). Set
   `sandbox_scripts_dir` in `broker.toml` to this checkout's `scripts/`. `--gpu` on the parent
   sandbox is independent: it changes neither the mounts nor the hosts in the envelope.
 - **The agent controls `CSUB_MOUNTS` inside the sandbox**, but the broker is started with this
@@ -287,7 +287,7 @@ image.**
 | Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
 | Credential masking | yes | no, which is why `$HOME` cannot be mounted |
 | What the sandbox sees of the node | device nodes for the job's GPUs only; `/sys/devices` and `/sys/module`, read-only | a device node for every GPU on the node (LSF's device cgroup blocks the ones that are not yours) and all of `/sys`, read-only |
-| GPU child jobs through `--csub` | not yet: needs csub PR #15 | yes |
+| GPU child jobs through `--csub` | yes, with a csub from 2026-11-15 or later (PR #15) | yes |
 | Moving parts | bwrap and the host driver | podman, an image store, user-namespace id mapping, `/dev/shm` sizing |
 
 What bwrap costs: there is no image, so no packaged CUDA toolkit, cuDNN or PyTorch. You depend on
