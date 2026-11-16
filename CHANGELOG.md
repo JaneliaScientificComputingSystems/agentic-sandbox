@@ -3,6 +3,17 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-16
+
+- **`scripts/csub-policy.sh`** writes `~/.config/csub/broker.toml`, replacing the hand edits of
+  csub's sample policy: `csub-policy.sh --bwrap --rw PROJECT [--ro DIR] [--allow HOST]`.
+  It starts from the sample in your csub checkout, checks that csub loads the result, and refuses
+  to overwrite an existing policy without `--replace`. Jobs get no network hosts unless `--allow`
+  names them; the limits stay as in the sample unless given. An existing policy keeps working.
+- **`config/storage.conf` and `config/containers.conf`**: the two one-time podman files of
+  `SETUP.md` §3 are now files to copy. `containers.conf` gained `cgroup_manager = "cgroupfs"`,
+  without which podman prints four warnings on every run.
+
 ## 2026-11-14
 
 - **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from

@@ -40,25 +40,15 @@ once per account even though `/scratch` is per node:
 
 ```bash
 mkdir -p ~/.config/containers
-cat > ~/.config/containers/storage.conf << 'EOF'
-[storage]
-driver = "overlay"
-runroot = "/scratch/$USER/podman-run"
-graphroot = "/scratch/$USER/podman-storage"
-[storage.options]
-mount_program = "/usr/bin/fuse-overlayfs"
-EOF
-
-cat > ~/.config/containers/containers.conf << 'EOF'
-[engine]
-events_logger = "none"
-
-[containers]
-log_driver = "none"
-EOF
+cp ~/agentic-sandbox/config/storage.conf ~/.config/containers/storage.conf
+cp ~/agentic-sandbox/config/containers.conf ~/.config/containers/containers.conf
 ```
 
-If you already have a `containers.conf`, add or update the two settings rather than overwriting
+Both files are in this repo's `config/` directory and are the same for every account: the `$USER`
+in `storage.conf` is written as is, and podman fills it in. Adjust the path if your checkout is not
+`~/agentic-sandbox`.
+
+If you already have a `containers.conf`, add or update the three settings rather than overwriting
 it. `podman-run.sh` passes both logging settings itself on every run, so a sandbox never logs
 through podman even without this file; the file is what covers `podman` when you run it directly
 (the node default, `journald`, copies everything a container prints into the system logs). You
@@ -156,37 +146,56 @@ Python 3.9, `tomli` from PyPI). If a node cannot reach PyPI, run the install thr
 allowlist proxy instead: `cd ~/csub && sandbox-run.sh --rw ~/.venvs/csub --allow pypi.org --allow
 files.pythonhosted.org -- ~/.venvs/csub/bin/pip install .` (verified).
 
+Write the policy with `scripts/csub-policy.sh`. It starts from csub's sample policy
+(`~/csub/deploy/broker.janelia.toml`), so the queue and price tables are csub's current ones, and
+sets what has to differ:
+
 ```bash
-mkdir -p ~/.config/csub
-cp ~/csub/deploy/broker.janelia.toml ~/.config/csub/broker.toml
-chmod 600 ~/.config/csub/broker.toml
+~/agentic-sandbox/scripts/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project
 ```
 
-Edit the policy:
+- `--bwrap` or `--podman`: how jobs submitted through csub are sandboxed. Use `--bwrap` unless you
+  have the podman setup of §3; child jobs then run through `sandbox-run.sh` and need no image or
+  subuid range.
+- `--rw DIR` (repeatable): directories jobs may mount read-write. Use the narrowest directory under
+  `/groups` or `/nrs` that holds the project, ideally one you created for agent work. The wrappers
+  start the broker with the sandbox's mounts and hosts as its envelope (csub #12 for child jobs, #13
+  for the top-level sandbox), so a job can only mount what the sandbox already sees; without the
+  envelope (`CSUB_ENVELOPE=off`), a sandboxed agent can ask a job to mount any directory beneath a
+  root, so everything under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the
+  policy rejects it); the script refuses both.
+- `--ro DIR` (repeatable): directories jobs may mount read-only at most, such as a dataset, a scorer
+  or a venv. The broker forces any mount under them read-only even if the client asks for `:rw`.
+- `--allow HOST` (repeatable): network hosts jobs may reach. None unless given.
+- `--gpus N`, `--slots N`, `--walltime MIN`, `--cost USD`, `--pending N`: the limits for one job
+  and the number of pending jobs per session. Without these options the limits stay as in csub's
+  sample: 128 slots, 8 GPUs, 14 days, 200 dollars of estimated cost per job and 100 pending jobs. The
+  cost limit is a check on each job when it is submitted (slots and GPUs times the walltime asked
+  for, at the prices in the policy), not a budget across jobs.
 
-- `allowed_roots`: directories jobs may mount. Use the narrowest directory under `/groups` or `/nrs`
-  that holds the project, ideally one you created for agent work. The wrappers start the broker
-  with the sandbox's mounts and hosts as its envelope (csub #12 for child jobs, #13 for the top-level
-  sandbox), so a job can only mount what the sandbox already sees; without the envelope
-  (`CSUB_ENVELOPE=off`), a sandboxed agent can ask a job to mount any directory beneath a root, so
-  everything under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the policy
-  rejects it).
-- `sandbox`: the sample says `"podman"`. Set `"bwrap"` unless you have the podman setup of §3; child
-  jobs then run through `sandbox-run.sh` and need no image or subuid range.
-- `sandbox_scripts_dir`: this repo's `scripts/` directory; child jobs run through it.
-- `[lsf] project`: the sample says `"CHANGEME"`. Set it to the lab or project your jobs bill to, or
-  delete the line to bill to your default (deleting is the tested case).
+Directories and hosts must be given in two places, because of the envelope: here, and as `--rw`,
+`--ro` and `--allow` on the wrapper that starts the sandbox. The option names are the same on purpose.
+
+The script writes the whole file from its options, checks that csub loads it and prints what it
+set. It refuses to overwrite an existing policy; to change one, run it again with the full set of
+options and `--replace`. For example, to add a read-only dataset and let jobs reach PyPI:
+
+```bash
+~/agentic-sandbox/scripts/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project \
+    --ro /nrs/ml_datasets --allow pypi.org --allow files.pythonhosted.org --replace
+```
+
+What the script does not set, edit by hand in `~/.config/csub/broker.toml` afterwards (a later
+`--replace` run discards hand edits):
+
+- `[lsf] project`: the script deletes the sample's `"CHANGEME"` line, so jobs bill to your default
+  (the tested case). Add `project = "NAME"` under `[lsf]` to bill to a lab or project.
 - `allowed_images`: list the concrete images rather than the default glob, so `csub probe` and
   the in-sandbox README can tell an agent exactly what exists:
   `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` and
   `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest`.
-- `readonly_roots`: directories you mount read-only, such as a dataset, a scorer or a venv. The broker
-  forces any mount under them read-only even if the client asks for `:rw`.
-- `[queues.<name>]`: every queue an agent may use needs a stanza, for example `gpu_short` (60-minute
-  limit, suited to short GPU trials): `mem_per_slot_mb = 15360`, `max_walltime_min = 60`, `gpu = true`,
-  `slots_per_gpu = 8`.
-- `allowed_hosts`, `limits`: to taste. The Janelia file's slot and memory numbers mirror the cluster's
-  esub.
+- `[queues.<name>]`: the sample has a stanza for every queue an agent may use. Delete the ones you
+  do not want agents to reach.
 
 Check it, then make the broker findable whenever you start a `--csub` sandbox:
 
