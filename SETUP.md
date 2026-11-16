@@ -308,7 +308,7 @@ ssh janelia-agent 'csub probe'                 # queues and limits, your project
 RAW=https://raw.githubusercontent.com/JaneliaScientificComputingSystems/agentic-sandbox/main/config
 mkdir -p ~/claude-cluster/.claude && cd ~/claude-cluster && git init -q
 curl -fsSL $RAW/CLAUDE.md -o CLAUDE.md
-echo '{"permissions": {"allow": ["Bash(ssh janelia-agent:*)"]}}' > .claude/settings.json
+echo '{"permissions": {"allow": ["Bash(ssh janelia-agent:*)", "Bash(curl -s https://hpc.int.janelia.org/docs/ai-agent-hints.md:*)"]}}' > .claude/settings.json
 ```
 
    For Codex (use `AGENTS-podman.md` in place of `AGENTS.md` with `--podman`):
@@ -320,8 +320,11 @@ curl -fsSL $RAW/AGENTS.md -o AGENTS.md
 echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/.codex/rules/default.rules
 ```
 
-   Read the instruction file before you use it: it is what the agent will follow. Then start the
-   agent in that directory, with `claude` or `codex`.
+   Read the instruction file before you use it: it is what the agent will follow. Besides the sandbox's
+   own description, it points the agent at the HPC team's hints page for AI agents
+   (`https://hpc.int.janelia.org/docs/ai-agent-hints.md`, reachable from the Janelia network or VPN);
+   the second permission in the Claude Code settings lets it fetch that page without asking. Then
+   start the agent in that directory, with `claude` or `codex`.
 
 To watch: log in as yourself. `bjobs -a` lists the agent's jobs, the ssh sessions among them named
 `agent-ssh`, and `PROJECT/.csub/jobs` has one directory per submitted job. To stop it: `bkill -J

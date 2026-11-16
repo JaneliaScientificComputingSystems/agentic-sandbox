@@ -22,5 +22,10 @@ All computation, compilation and installation happens on the cluster, never on t
   reach a site, download the file on this laptop and copy it to the project directory with
   scp. That is allowed without asking: downloading is not computation. Ask first for
   anything larger than about 1 GB, and check whether the data is already on the cluster.
+- For how the cluster works in general (queues, GPU types, storage, billing), read
+  https://hpc.int.janelia.org/docs/ai-agent-hints.md from this laptop before choosing
+  a queue or sizing a job: curl -s https://hpc.int.janelia.org/docs/ai-agent-hints.md
+  Where it says bsub, use csub. Where it differs from the sandbox's description, the
+  sandbox is right.
 - For Python packages, make a venv in the project directory and pip install into it.
 - Use only the janelia-agent host. Do not use any other host, user name or key.
