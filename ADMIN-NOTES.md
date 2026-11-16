@@ -1033,6 +1033,54 @@ survive a *normal* job exit," not just a `bkill`.
   Confirmed live: after the fixes, a normal-exit job left neither the host-side proxy nor the
   container running.
 
+## An agent off the cluster: `ssh-entry.sh` — design and evidence
+
+**The problem.** An agent on a laptop that is given ssh access acts as the user on a login node. No
+sandbox applies, and it computes where nothing may run. Telling the agent to wrap its own commands
+in `bsub` and `sandbox-run.sh` is a request, not a boundary.
+
+**The mechanism.** The agent gets its own key, and the line for that key in
+`~/.ssh/authorized_keys` starts with `command="... ssh-entry.sh --project DIR ..."`. sshd then runs
+that command for every session on the key and puts what the client asked for in
+`SSH_ORIGINAL_COMMAND`. The key cannot run anything else, whatever the client sends; the line's
+`no-port-forwarding`, `no-agent-forwarding` and `no-X11-forwarding` close the other uses of a
+session, and `expiry-time` ends the key by date.
+
+**What runs where.** On the login node: sshd, the script and `bsub`, nothing of the agent's. The
+script submits an interactive job (`bsub -I`, or `-Is` for a login with a terminal; job name
+`agent-ssh`) whose command is the script again with `--inner`, and that, on the compute node, enters
+the project directory and execs `sandbox-run.sh` or `podman-run.sh` with the wrapper options from
+the key line. The agent's command travels in the environment variable `AGENT_SSH_COMMAND`, which LSF
+copies with the submission environment, so it is never part of a `bsub` command line and no shell
+re-parses it on the way; the arguments the script does pass to `bsub` are quoted with `printf %q`.
+`BSUB_QUIET` keeps bsub's own lines out of the agent's output on the login node and is unset inside,
+because csub's broker reads the job id from the line it would silence.
+
+**What bounds the agent.** The same things as any sandbox here: the wrapper options in the key line
+are fixed by the account owner, and the agent cannot add to them. With `--csub`, jobs it submits go
+through the broker, bounded by the policy and by this sandbox's envelope, so a host or directory has
+to be in both the key line and the policy.
+
+**Evidence (2026-11-14 to 16, as an ordinary user, bwrap unless noted).**
+
+- From a Mac through the key: `hostname; pwd` returns a compute node and the project directory;
+  `ls ~/.ssh` fails with no such directory; `bsub -V` is not found; `curl` to an unlisted site fails.
+- The exit status and the three streams come back; `scp` into the project directory works.
+- `csub probe` and `csub submit --wait` work from the session; a child job on another node runs in
+  its own sandbox. With PyPI in the policy only, a job that needed it was refused with `host pypi.org
+  is not allowed in the parent job`; with `--allow` in the key line as well, it ran.
+- `--ro /nrs/ml_datasets` in the key line and the policy: listed read-only in `$SANDBOX_README`,
+  readable in the session and in a csub job, and a write fails with `Read-only file system` in both.
+- An 8-GPU csub job on `gpu_short` under bwrap ran and passed an NCCL test across the 8 GPUs.
+- Claude Code and Codex both drove it: Claude Code read `$SANDBOX_README` when told to by its
+  `CLAUDE.md`; whether Codex follows the same rule in `AGENTS.md` has not been checked.
+- `--podman`: sessions and a csub job ran in containers. `--ro` and `--allow` after ` -- ` with
+  `--podman` have not been checked.
+
+**Not covered.** The script has no test suite. The agent's process on the laptop is outside all of
+this: what it can do there is up to the harness and the user. A key line is only as narrow as its
+options, so `--allow` and `--rw` there deserve the same care as on a wrapper command line.
+
 ## Running under LSF — full evidence
 
 - LSF puts every job in its own cgroup v2 leaf (`/lsf/Janelia/job.<id>/leaf`). bwrap's

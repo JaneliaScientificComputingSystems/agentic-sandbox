@@ -10,12 +10,20 @@ the evidence behind each.
   It starts from the sample in your csub checkout, checks that csub loads the result, and refuses
   to overwrite an existing policy without `--replace`. Jobs get no network hosts unless `--allow`
   names them; the limits stay as in the sample unless given. An existing policy keeps working.
+- **`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`**: the instruction file for an
+  agent on a laptop that works through `ssh-entry.sh` (`SETUP.md` §8, new).
+- **`tests/test-csub-policy.sh`** tests `csub-policy.sh` without a cluster and runs on every push.
 - **`config/storage.conf` and `config/containers.conf`**: the two one-time podman files of
   `SETUP.md` §3 are now files to copy. `containers.conf` gained `cgroup_manager = "cgroupfs"`,
   without which podman prints four warnings on every run.
 
 ## 2026-11-14
 
+- **`scripts/ssh-entry.sh`**: a forced command for an ssh key used by an agent that runs off the
+  cluster, such as Claude Code or Codex on a laptop. Tied to the key in `~/.ssh/authorized_keys`, it
+  turns every `ssh cluster '<command>'` into an interactive LSF job that runs the command through
+  `sandbox-run.sh` (or `podman-run.sh` with `--podman`) in one project directory. Only the script and
+  `bsub` run on the login node. Documented on 2026-11-16: README, "An agent on your laptop".
 - **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from
   `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
   `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is set to their

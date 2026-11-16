@@ -15,7 +15,15 @@ live on the cluster as an ordinary user account.
 
 **Which document:** [`SETUP.md`](SETUP.md) first (one-time, per account) · this README to use the
 wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`ADMIN-NOTES.md`](ADMIN-NOTES.md)
-for the evidence and reasoning behind each decision.
+for the evidence and reasoning behind each decision · [`config/`](config/) for the files setup copies.
+
+**Which setup:**
+
+| Where the agent runs | What you use | Read |
+| --- | --- | --- |
+| On the cluster, with you watching | a wrapper inside an interactive job | [Quick start](#quick-start) |
+| On the cluster, unattended | a wrapper as a batch job | [Quick start](#quick-start), modes A and B |
+| On your laptop, with the work on the cluster | `scripts/ssh-entry.sh` behind a dedicated ssh key | [An agent on your laptop](#an-agent-on-your-laptop-the-work-on-the-cluster-ssh-entrysh) |
 
 **In short:** the agent sees only the directories you bind in (the one you start from is read-write),
 reaches only hosts you `--allow`, sees none of your shell environment, and works on a throwaway copy of
@@ -30,8 +38,9 @@ not protect against](#what-it-does-and-does-not-protect-against).
 | `--claude` | `claude auth login` outside the sandbox | `SETUP.md` §4 |
 | `--opencode` | opencode installed and run once, and a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
 | `sandbox-run.sh --gpu` | nothing more; run it inside an LSF GPU job | `SETUP.md` §2 |
-| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and a `storage.conf` | `SETUP.md` §3 |
-| `--csub` (optional) | csub installed and a policy file | `SETUP.md` §6 |
+| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and the two files in `config/` | `SETUP.md` §3 |
+| `--csub` (optional) | csub installed and a policy, written by `scripts/csub-policy.sh` | `SETUP.md` §6 |
+| `ssh-entry.sh` (an agent on your laptop) | a dedicated ssh key, one line in `~/.ssh/authorized_keys`, and normally `--csub` | `SETUP.md` §8 |
 
 ## Try it first (no login or key needed)
 
@@ -212,8 +221,9 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"`
-  need a csub with PR #15, merged 2026-11-15 (tested against `main` at `ec9aa88`; an older csub refuses them). Set
-  `sandbox_scripts_dir` in `broker.toml` to this checkout's `scripts/`. `--gpu` on the parent
+  need a csub with PR #15, merged 2026-11-15 (tested against `main` at `ec9aa88`; an older csub refuses them).
+  `scripts/csub-policy.sh` writes the policy, including `sandbox_scripts_dir`, which must point at this
+  checkout's `scripts/`. `--gpu` on the parent
   sandbox is independent: it changes neither the mounts nor the hosts in the envelope.
 - **The agent controls `CSUB_MOUNTS` inside the sandbox**, but the broker is started with this
   sandbox's mounts and `--allow` hosts as its envelope (csub #13), so a child job cannot mount a
@@ -223,6 +233,11 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   `allowed_roots` as narrow as the project either way.
 - Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). Without `bsub` on the host,
   `--csub` fails at start; csub's `csub relay` is the tool for that case.
+- **The limits are per job, checked at submit.** A job asks for slots, GPUs and a walltime; the broker
+  refuses one above `max_slots`, `max_gpus` or `max_walltime_min`. `max_estimated_cost_usd` is the same
+  kind of check, not a budget: the estimate is the slots and GPUs times the walltime asked for, at the
+  prices in the policy, and nothing is added up across jobs. `max_pending_per_session` caps how many
+  jobs wait at once. All GPUs of one job come from one node.
 
 ```bash
 export PATH=~/.venvs/csub/bin:$PATH
@@ -235,6 +250,57 @@ cd /groups/<your-allowed-root>/project
 
 Verified live on both wrappers: probe, submit with wait (child in its own container on another node),
 status, a policy rejection as exit code 3, and a child submitting a grandchild. Nothing left behind.
+
+## An agent on your laptop, the work on the cluster (`ssh-entry.sh`)
+
+An agent on a laptop that reaches the cluster with your ordinary ssh key acts as you on a login node:
+no sandbox, and work on a node where none is allowed. `scripts/ssh-entry.sh` closes that. The agent
+gets its own ssh key, and one line in `~/.ssh/authorized_keys` on the cluster ties that key to the
+script, so the key can do nothing else:
+
+```
+command="env PATH=$HOME/.venvs/csub/bin:$PATH $HOME/agentic-sandbox/scripts/ssh-entry.sh --project /groups/lab/project --queue interactive --walltime 60 -- --csub",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,expiry-time="20271231" ssh-ed25519 AAAA... agent
+```
+
+```
+laptop                         login node                       compute node
+─────────────────────────      ─────────────────────────        ─────────────────────────────
+agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
+                               (the script and bsub only)           in the project directory
+```
+
+- **Each `ssh cluster '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
+  `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are
+  relayed, so `scp` to the project directory works too. A job takes from seconds to a minute to
+  start, and nothing carries over between commands except files in the project directory.
+- **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
+  in the job's environment, not on a command line.
+- **`--project DIR`** is the one directory the agent can read and write; it must exist and be outside
+  `$HOME`. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
+  command runs in. `--podman` runs the command through `podman-run.sh` in a container image, with
+  the project bound read-write at the same path; it needs `SETUP.md` §3.
+- **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, `--gpu`,
+  and for podman `--image NAME`. They are the sandbox every command gets.
+- **A host or directory has to be allowed twice** when jobs go through `--csub`: here in the key line,
+  and in the csub policy (`csub-policy.sh --allow HOST --ro DIR`). A job the agent submits must pass
+  the policy and stay inside the sandbox it was submitted from; with only one of the two, csub
+  answers `not allowed in the parent job`.
+- **Tell the agent.** It runs outside the sandbox and cannot know the rules unless told. `config/` has
+  the instruction file to put in the agent's working directory on the laptop: `CLAUDE.md` for Claude
+  Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`). They point the agent at
+  `$SANDBOX_README`, the sandbox's own description, with `ssh cluster 'cat $SANDBOX_README'`.
+- **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions and `bkill -g /csub/$USER 0` the jobs it
+  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date.
+
+What this does not change: the agent's own process runs on the laptop with whatever that harness
+allows there. The sandbox bounds what it can do on the cluster, not on the laptop. Give the key no
+passphrase only because the agent must use it unattended, never reuse a personal key for it, and
+keep `IdentitiesOnly yes` and `IdentityAgent none` in the ssh alias so the agent cannot fall back to
+yours. Setup, step by step: `SETUP.md` §8.
+
+Verified live under bwrap, with Claude Code and Codex on a Mac between them: commands, `scp`, the denials (no
+`~/.ssh`, no `bsub`, no network beyond `--allow`), `--ro`, `--allow`, and csub jobs up to 8 GPUs. The
+`--podman` form has been run, but its `--ro` and `--allow` options have not been checked.
 
 ## Images (podman)
 
@@ -386,17 +452,27 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --keep-id       (podman-run.sh) run as your real uid/gid instead of container-root
   --image NAME    (podman-run.sh) any OCI image; default agentic-sandbox-lite
   -h, --help      Show help
+
+ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--walltime MIN] [-- wrapper options]
+                  # forced command for an agent's ssh key: each ssh command becomes a sandboxed LSF job
+
+csub-policy.sh --bwrap|--podman --rw DIR [--ro DIR] [--allow HOST] [--gpus N] [--slots N]
+               [--walltime MIN] [--cost USD] [--pending N] [--replace]
+                  # writes ~/.config/csub/broker.toml from csub's sample; --help for the rest
 ```
 
 ## Testing
 
-Three suites in `tests/`:
+Four suites in `tests/`:
 
 | Suite | Tests | Run it |
 | --- | --- | --- |
 | `test-bwrap.sh` | `sandbox-run.sh` | from a compute node, inside an LSF job; in a GPU job for the `--gpu` section (two GPUs for its subset check) |
 | `test-podman.sh` | `podman-run.sh` | from a GPU job |
 | `test-proxy.py` | the allowlist proxy | anywhere (`python3 tests/test-proxy.py`); also on every push (GitHub Actions) |
+| `test-csub-policy.sh` | `csub-policy.sh` | anywhere (`bash tests/test-csub-policy.sh`); also on every push. It uses a stand-in for csub's sample policy, so it covers the edits and the refusals, not csub's reading of the result |
+
+`ssh-entry.sh` has no suite: it needs sshd, a key line and LSF together, and has been tested by hand.
 
 - GitHub Actions also runs the sections of `test-bwrap.sh` that need no cluster (no LSF, GPU, csub
   or model) on every push and pull request, with the rest counted as skipped.
@@ -428,7 +504,8 @@ Three suites in `tests/`:
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
 - **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a
-  checkout that moved; fix the path in `~/.config/csub/broker.toml`.
+  checkout that moved; fix the path in `~/.config/csub/broker.toml`, or write the policy again with
+  `csub-policy.sh ... --replace` from the new checkout.
 - **`csub: policy_violation: mount ... home directory`**: `CSUB_MOUNTS` includes something under
   `$HOME`; work from a directory under an allowed root. `csub --json probe` (`--json` before the
   subcommand) shows the policy.
@@ -441,6 +518,9 @@ Three suites in `tests/`:
 - **`csub: policy_violation: ... not allowed in the parent`** (from a child's submission): the child
   job claimed a mount or host outside this sandbox's envelope. That is the envelope working; give the
   top-level sandbox the mount or `--allow` host if the child really needs it.
+- **`Permission denied (publickey)` through an `ssh-entry.sh` key**: the key line is wrong or past its
+  `expiry-time`, or `~/.ssh` on the cluster is not mode 700. **`project directory ... does not
+  exist`**: fix `--project` in the key line.
 - **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
   policy or the `--allow` list, outside the sandbox.
 

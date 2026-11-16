@@ -8,10 +8,14 @@ all of this is in place.
 ## 1. Get the wrappers
 
 ```bash
+cd
 git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git
-SANDBOX="$PWD/agentic-sandbox/scripts"        # the README's examples use this variable
+SANDBOX="$HOME/agentic-sandbox/scripts"       # the README's examples use this variable
 # a new job shell starts without it: put the line above in your shell startup file
 ```
+
+The rest of this document assumes the checkout is `~/agentic-sandbox`. Anywhere else works; set
+`SANDBOX` to its `scripts/` directory.
 
 Run the wrappers from a work directory, not from inside the checkout: the directory you invoke
 them from is bound read-write, and the wrapper and its helper scripts run on the host. (If you do
@@ -40,13 +44,11 @@ once per account even though `/scratch` is per node:
 
 ```bash
 mkdir -p ~/.config/containers
-cp ~/agentic-sandbox/config/storage.conf ~/.config/containers/storage.conf
-cp ~/agentic-sandbox/config/containers.conf ~/.config/containers/containers.conf
+cp "$SANDBOX"/../config/storage.conf "$SANDBOX"/../config/containers.conf ~/.config/containers/
 ```
 
 Both files are in this repo's `config/` directory and are the same for every account: the `$USER`
-in `storage.conf` is written as is, and podman fills it in. Adjust the path if your checkout is not
-`~/agentic-sandbox`.
+in `storage.conf` is written as is, and podman fills it in.
 
 If you already have a `containers.conf`, add or update the three settings rather than overwriting
 it. `podman-run.sh` passes both logging settings itself on every run, so a sandbox never logs
@@ -151,7 +153,7 @@ Write the policy with `scripts/csub-policy.sh`. It starts from csub's sample pol
 sets what has to differ:
 
 ```bash
-~/agentic-sandbox/scripts/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project
+"$SANDBOX"/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project
 ```
 
 - `--bwrap` or `--podman`: how jobs submitted through csub are sandboxed. Use `--bwrap` unless you
@@ -181,7 +183,7 @@ set. It refuses to overwrite an existing policy; to change one, run it again wit
 options and `--replace`. For example, to add a read-only dataset and let jobs reach PyPI:
 
 ```bash
-~/agentic-sandbox/scripts/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project \
+"$SANDBOX"/csub-policy.sh --bwrap --rw /groups/YOUR_LAB/YOUR_DIR/project \
     --ro /nrs/ml_datasets --allow pypi.org --allow files.pythonhosted.org --replace
 ```
 
@@ -197,11 +199,16 @@ What the script does not set, edit by hand in `~/.config/csub/broker.toml` after
 - `[queues.<name>]`: the sample has a stanza for every queue an agent may use. Delete the ones you
   do not want agents to reach.
 
-Check it, then make the broker findable whenever you start a `--csub` sandbox:
+Make the broker findable whenever you start a `--csub` sandbox:
+
+```bash
+export PATH=~/.venvs/csub/bin:$PATH
+```
+
+After a hand edit, check that csub still loads the policy:
 
 ```bash
 echo '{"protocol":1,"op":"probe"}' | ~/.venvs/csub/bin/csub-broker     # expect "ok":true
-export PATH=~/.venvs/csub/bin:$PATH
 ```
 
 The envelope covers hosts as well as mounts: a job that names an `agent` (policy `[agents]`) gets
@@ -216,8 +223,107 @@ they lack:
 ```bash
 cd agentic-sandbox/podman
 podman build -t agentic-sandbox-lite:latest .                                   # CUDA runtime + CLIs
-podman build -t agentic-sandbox-pytorch:latest -f Dockerfile.pytorch .          # NVIDIA PyTorch + CLIs
+podman build -t agentic-sandbox-gpu:latest -f Dockerfile.pytorch .              # NVIDIA PyTorch + CLIs
 # then: podman-run.sh --image localhost/agentic-sandbox-lite:latest ...
 ```
 
 Note that csub policies cannot use `localhost/` images (they are not visible on other nodes).
+
+## 8. An agent on your laptop (`ssh-entry.sh`)
+
+Skip this unless the agent runs on your laptop and should do its work on the cluster. The README's
+section "An agent on your laptop" says what this gives you. You need §1, and §6 if the agent should
+submit jobs, which is the normal case. `LAPTOP` steps run in a terminal on the laptop, `CLUSTER` steps
+on the cluster as yourself.
+
+1. `CLUSTER`, inside an interactive job: make the project directory, outside your home directory, and
+   write the csub policy for it.
+
+```bash
+PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
+mkdir -p "$PROJECT"
+"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT
+```
+
+2. `LAPTOP`: make a key for the agent only. It has no passphrase, because the agent must use it
+   unattended; the key line in step 4 is what limits it.
+
+```bash
+ssh-keygen -t ed25519 -N '' -C agent-cluster -f ~/.ssh/agent_cluster
+```
+
+3. `LAPTOP`: add an alias to `~/.ssh/config`, with your cluster user name, and copy the public half of
+   the key over with your own login. The last three lines keep the agent from ever using your
+   personal key.
+
+```
+Host janelia-agent
+    HostName login1.int.janelia.org
+    User YOUR_USER
+    IdentityFile ~/.ssh/agent_cluster
+    IdentitiesOnly yes
+    IdentityAgent none
+    BatchMode yes
+```
+
+```bash
+scp ~/.ssh/agent_cluster.pub YOUR_USER@login1.int.janelia.org:agent_cluster.pub
+```
+
+4. `CLUSTER`, on the login node (this only edits a file): add the key line. `EXPIRES` is the last day
+   the key works, as year, month, day. Your existing keys stay untouched.
+
+```bash
+PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
+PUBKEY="$(cat ~/agent_cluster.pub)"
+EXPIRES=20271231
+ENTRY="env PATH=\$HOME/.venvs/csub/bin:\$PATH \$HOME/agentic-sandbox/scripts/ssh-entry.sh"
+OPTS="--project $PROJECT --queue interactive --walltime 60 -- --csub"
+LOCK="no-port-forwarding,no-agent-forwarding,no-X11-forwarding"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "command=\"$ENTRY $OPTS\",$LOCK,expiry-time=\"$EXPIRES\" $PUBKEY" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+command rm ~/agent_cluster.pub
+```
+
+   To let the agent reach a host or read another directory, add `--allow HOST` or `--ro DIR` after
+   `--csub` in `OPTS`, and give the same options to `csub-policy.sh` with `--replace`. Both places are
+   needed. For podman, add `--podman` before `--queue` and write the policy with `--podman`.
+
+5. `LAPTOP`: test by hand. Each command is a cluster job, so each takes up to a minute to start.
+
+```bash
+ssh janelia-agent 'hostname; pwd'              # a compute node, then your project directory
+ssh janelia-agent 'ls ~/.ssh'                  # No such file or directory
+ssh janelia-agent 'bsub -V'                    # command not found
+ssh janelia-agent 'head -22 $SANDBOX_README'   # what the sandbox tells the agent
+ssh janelia-agent 'csub probe'                 # queues and limits, your project under the allowed roots
+```
+
+6. `LAPTOP`: give the agent a working directory with the instruction file from `config/`, and let it
+   run `ssh` to the alias without asking each time. The file is fetched from this repo, since the
+   laptop has no checkout. For Claude Code:
+
+```bash
+RAW=https://raw.githubusercontent.com/JaneliaScientificComputingSystems/agentic-sandbox/main/config
+mkdir -p ~/claude-cluster/.claude && cd ~/claude-cluster && git init -q
+curl -fsSL $RAW/CLAUDE.md -o CLAUDE.md
+echo '{"permissions": {"allow": ["Bash(ssh janelia-agent:*)"]}}' > .claude/settings.json
+```
+
+   For Codex (use `AGENTS-podman.md` in place of `AGENTS.md` with `--podman`):
+
+```bash
+RAW=https://raw.githubusercontent.com/JaneliaScientificComputingSystems/agentic-sandbox/main/config
+mkdir -p ~/codex-cluster ~/.codex/rules && cd ~/codex-cluster && git init -q
+curl -fsSL $RAW/AGENTS.md -o AGENTS.md
+echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/.codex/rules/default.rules
+```
+
+   Read the instruction file before you use it: it is what the agent will follow. Then start the
+   agent in that directory, with `claude` or `codex`.
+
+To watch: log in as yourself. `bjobs -a` lists the agent's jobs, the ssh sessions among them named
+`agent-ssh`, and `PROJECT/.csub/jobs` has one directory per submitted job. To stop it: `bkill -J
+agent-ssh 0` and `bkill -g /csub/$USER 0`. To cut it off: delete its line from
+`~/.ssh/authorized_keys`.

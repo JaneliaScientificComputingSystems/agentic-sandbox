@@ -1,4 +1,5 @@
 # The allowlist proxy's tests need no cluster, no bwrap and no network (see tests/test-proxy.py).
+# The same holds for tests/test-csub-policy.sh, which runs csub-policy.sh against a stand-in sample.
 # The wrapper suites (tests/test-bwrap.sh, tests/test-podman.sh) need an LSF node and stay manual.
 name: test-proxy
 on:
@@ -18,4 +19,5 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python3 tests/test-proxy.py
-      - run: bash -n scripts/sandbox-run.sh scripts/podman-run.sh
+      - run: for f in scripts/*.sh tests/*.sh; do bash -n "$f" || exit 1; done
+      - run: bash tests/test-csub-policy.sh

@@ -107,9 +107,12 @@ baseline `train.py` (`train_baseline.py`) and `TASK.md`, rendered from `TASK.md.
 `run_eval.py`, which runs `train.py` as a subprocess with a 540 s timeout and prints a `RESULT` line. The same
 script installs the trap in step 5, so run it after step 1 has produced the data.
 
-**Step 3. csub policy.** In `broker.toml`: `allowed_roots` containing `$R`; `readonly_roots` listing
-`$R/eval`, `$R/data` and `$R/venv`; and a `[queues.gpu_short]` stanza. The read-only roots mean the agent cannot
-get a read-write mount of the scorer, the data or the venv even if it asks.
+**Step 3. csub policy.** After step 2 has created the directories, write it with
+`"$SANDBOX"/csub-policy.sh --podman --rw $R --ro $R/eval --ro $R/data --ro $R/venv` (add `--replace` if you
+already have a policy). That puts `$R` in `allowed_roots` and the three directories in `readonly_roots`, so the
+agent cannot get a read-write mount of the scorer, the data or the venv even if it asks. The run recorded in
+`results/` used a policy edited by hand to the same roots; csub loads the script's policy with these nested
+roots (checked 2026-11-16), but the example has not been rerun with it.
 
 **Step 4. The venv** (`scripts/build-venv.sh`). Build it inside the GPU image so its interpreter resolves in the
 child, with PyPI reachable through the proxy (`--allow pypi.org --allow files.pythonhosted.org`), adding

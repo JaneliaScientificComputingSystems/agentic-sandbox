@@ -1,0 +1,36 @@
+# A stand-in for csub's deploy/broker.janelia.toml, for tests/test-csub-policy.sh only.
+# It has the lines csub-policy.sh edits, in the layout of csub's sample, and nothing else of it.
+
+[broker]
+sandbox = "podman"
+state_dir = "~/.csub"
+sandbox_scripts_dir = "~/.local/share/csub/agentic-sandbox/scripts"
+allowed_roots = ["/groups/CHANGEME", "/nrs/CHANGEME"]
+denied_roots = []
+readonly_roots = []
+allowed_hosts = [
+  "pypi.org",
+  "github.com",
+]
+scratch = true
+
+[limits]
+max_slots = 128
+max_gpus = 8
+max_walltime_min = 20160
+max_estimated_cost_usd = 200
+max_pending_per_session = 100   # 0 = no cap
+slot_price_usd_per_hour = 0.05
+
+[queues.short]
+mem_per_slot_mb = 15360
+max_walltime_min = 60
+
+[queues.gpu_rtx6000]
+gpu = true
+slots_per_gpu = 16
+max_gpus = 1
+
+[lsf]
+profile = "/etc/profile.d/profile.lsf.sh"
+project = "CHANGEME"   # billing
