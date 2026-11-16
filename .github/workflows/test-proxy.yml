@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   test-proxy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # ubuntu-latest moved to 26.04, which has no Python 3.9; the cluster runs 3.9
     strategy:
       matrix:
         python: ["3.9", "3.12"]
