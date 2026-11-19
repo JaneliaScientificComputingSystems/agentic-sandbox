@@ -326,6 +326,13 @@ echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/
    the second permission in the Claude Code settings lets it fetch that page without asking. Then
    start the agent in that directory, with `claude` or `codex`.
 
+   The instruction file applies only when the agent is started in that directory. There, the agent
+   still runs the code it writes, but on the cluster: each test or script goes through `ssh
+   janelia-agent` and runs as a sandboxed job in the project directory, which takes from a few
+   seconds to a minute to start. Started anywhere else on the laptop, the agent works as usual and
+   runs its code locally. (The Codex rule that allows `ssh janelia-agent` without asking is
+   account-wide; only the instruction to send the work there belongs to the directory.)
+
 To watch: log in as yourself. `bjobs -a` lists the agent's jobs, the ssh sessions among them named
 `agent-ssh`, and `PROJECT/.csub/jobs` has one directory per submitted job. To stop it: `bkill -J
 agent-ssh 0` and `bkill -g /csub/$USER 0`. To cut it off: delete its line from
