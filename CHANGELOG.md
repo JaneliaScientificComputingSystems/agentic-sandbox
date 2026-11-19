@@ -3,6 +3,18 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-19
+
+- **`sandbox-run.sh --job-nodes`** (with `--peers`, `--listen`, `--ifname`): one sandbox per node
+  of a multi-node LSF job, with a private network that reaches the job's other nodes and nothing
+  else. The node list comes from LSF. Needs `pasta` (the `passt` package) on the nodes.
+- **`sandbox-run.sh --host-net`**: the same role on queues without InfiniBand, where the relay
+  behind `--job-nodes` is too slow for the data: the node's own network, unrestricted.
+- **`sandbox-run.sh --ib`**: binds the InfiniBand devices and the sysfs entries NCCL reads.
+- All three are for a job's workers, not for the agent: each refuses `--claude` and `--opencode`,
+  and the two network flags refuse `--allow` and `--csub`. Nothing changes for existing uses.
+- **`tests/test-multinode.sh`** tests them as a two-node LSF job.
+
 ## 2026-11-16
 
 - **`scripts/csub-policy.sh`** writes `~/.config/csub/broker.toml`, replacing the hand edits of

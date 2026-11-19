@@ -1033,6 +1033,95 @@ survive a *normal* job exit," not just a `bkill`.
   Confirmed live: after the fixes, a normal-exit job left neither the host-side proxy nor the
   container running.
 
+## Multi-node jobs: `--job-nodes`, `--host-net`, `--ib` — design and evidence
+
+All tests 2026-11-19, as `cericg`, RHEL 9 kernel 5.14, bwrap 0.6.3, pasta `0^20251210`, PyTorch
+with NCCL 2.27.3. GPU tests used the `torchrun` recipes of gpu-cluster-recipes with the wrapper
+put in front of each worker that `blaunch` starts; the launcher stays outside.
+
+**Why the default sandbox cannot do it.** Both wrappers give the sandbox an empty network
+namespace. Two sandboxes on two nodes cannot reach each other, and `--allow` is an HTTP proxy, not
+a route. `torchrun` needs TCP to its rendezvous address; NCCL needs TCP between nodes to set up
+its connections on InfiniBand and Ethernet alike, and on Ethernet it sends its data that way too.
+
+**The constraint.** nftables cannot be used on the nodes, so there is no per-job firewall rule.
+
+**`--job-nodes`: what happens.**
+
+1. *Outer stage.* Resolve this node's address and interface, and the other nodes from
+   `LSB_MCPU_HOSTS` (or `--peers`). Choose a block of 5000 ports below the node's range for
+   outgoing connections (`ip_local_port_range` is 15000-65000 on our nodes, so 10000-14999),
+   leaving out ports that already listen; a block that is mostly taken belongs to another sandbox
+   on the node, so the next one down is used. One sandbox at a time per node does this, under
+   `flock`. Then start `pasta --config-net -4 -i IF -I IF -t ADDR/~1-9999,~15000-65535[,~busy]
+   [-t ADDR/PORT per --listen] -u none -T none -U none --no-map-gw -- sandbox-run.sh <same args>`.
+   The excludes-only form makes pasta forward the block best effort.
+2. *Inner stage*, as root of pasta's user and network namespace. It first proves where it is
+   (`/proc/self/uid_map` maps uid 0 to the calling user, one id): `SANDBOX_NET_STAGE` is only an
+   environment variable, and as real root the next step would flush the node's routes. Then it
+   flushes the routes, adds one `/32` route per other node, checks that the table holds exactly
+   those, sets the namespace's `ip_local_port_range` to the top 1000 of the block, and puts the
+   node's hostname back (pasta names its namespace `pasta-<host>`).
+3. *The sandbox.* bwrap without `--unshare-net`, with `--unshare-user --uid --gid`: a nested user
+   namespace, which has no capability over the network namespace. `/etc/hosts` is replaced by the
+   job's nodes. Inside, the process has the user's own uid and gid.
+
+**Why each part is there** (each was a failure first):
+
+- *Best-effort block, not a fixed range.* `-t ADDR/20000-29999` failed at start: the nodes hand
+  out 15000-65000 for outgoing connections, and one port was taken.
+- *The lock and the second block.* Two sandboxes starting on one node in the same instant each
+  bound part of the same block, with thousands of `Address already in use` lines from pasta.
+- *Signals to the whole tree.* A `TERM` to the wrapper, passed to the inner stage only, did
+  nothing: bash runs a trap when its foreground command returns. The outer stage now signals
+  everything below pasta. `setpriv --pdeathsig KILL` at both levels makes a killed wrapper take
+  pasta and the sandbox with it.
+- *The state directory name.* The inner stage is pid 1 of pasta's pid namespace every time, so it
+  uses the outer stage's pid; two workers on a node otherwise claim the same directory.
+- *The sysfs binds.* Without `/sys/bus/pci` and `/sys/class/pci_bus`, InfiniBand comes up, NCCL
+  logs `network path ... is not a PCI device`, and the job dies with `NCCL WARN Could not find NET
+  with id 0`. Without `/sys/class/net`, NCCL over Ethernet ran about 27% slower inside the sandbox
+  (4.7-4.8 GB/s against 6.4-6.7), presumably because it sizes its socket transport from the
+  interface speed; with it, 6.27 GB/s. The two PCI paths were added together and not tested apart.
+
+**Results.**
+
+| Test | Unsandboxed | Sandboxed |
+| --- | --- | --- |
+| H200, 2 nodes, 16 GPUs, `test_torchrun.py` | all pass | all pass, `NET/IB`, GPUDirect RDMA enabled, no NCCL warning |
+| H200, bandwidth at 4 GB messages (busbw) | 483.58 GB/s | 482.24 GB/s with `--job-nodes --ib` |
+| H200, sustained 120 s | about 482.7 GB/s | 482.55 GB/s |
+| L4, 2 nodes, 16 GPUs, Ethernet, 1 GB messages, sustained 60 s | 6.39 and 6.68 GB/s | 0.15 GB/s with `--job-nodes` (killed); 6.27 GB/s with `--host-net` |
+| CPU, 2 nodes (`tests/test-multinode.sh`) | | 24 checks pass |
+| `tests/test-bwrap.sh` with `SKIP_LLM=1` on a CPU node, after the change | | 61 passed, 0 failed, 6 skipped |
+
+On H200 the nodes report `rdma system show`: `netns shared`, eight adapters with link layer
+InfiniBand and one Ethernet, `/dev/infiniband/uverbs*` mode `rw-rw-rw-`, locked-memory limit
+unlimited inside the sandbox. Verbs work from the private network namespace because of the shared
+mode and because the fabric is native InfiniBand; RoCE ties its addresses to a network device and
+was not tested.
+
+Other recipes run with the same network on the two H200 nodes, all passing: the `torchrun` soak
+(2000 cross-node all-reduces, 10 minutes), ViT-base on ImageNet (about 20,000 img/s), and Ray
+Train with CIFAR-10, GPT-2, ResNet-50, ViT-Large and LIVECell. Ray needs its own launcher shape: the head's
+sandbox starts Ray, waits for the nodes, runs the script and stops Ray; each other node's sandbox
+joins and stays until its raylet exits. `ray start` gets `--node-ip-address` (its own lookup
+needs the internet) and fixed ports inside the block.
+
+**What `--job-nodes` improves over `--host-net`, beyond other hosts.** The node's loopback
+services and its abstract Unix sockets are not reachable from a private network namespace.
+
+**Open.**
+
+- More than two nodes; B300, H100, A100 and RTX 6000 nodes; a node shared with other jobs.
+- `pasta` on every node type (present on the H200, L4 and CPU nodes used).
+- pasta was not tuned. It is single-threaded and copies in user space, so the Ethernet figure may
+  improve but will not reach the node's own speed.
+- A limit for Ethernet queues at full speed would need a filter on `connect` (seccomp user
+  notification with a supervisor outside the sandbox). Not built.
+- `podman-run.sh` has no equivalent yet. csub has no multi-node job type.
+- No adversarial review of the pasta path yet.
+
 ## An agent off the cluster: `ssh-entry.sh` — design and evidence
 
 **The problem.** An agent on a laptop that is given ssh access acts as the user on a login node. No

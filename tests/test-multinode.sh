@@ -1,0 +1,108 @@
+#!/bin/bash
+# test-multinode.sh -- sandbox-run.sh --job-nodes / --peers / --listen / --host-net, across two nodes.
+#
+# The job script of a two-node LSF job. Submit it from a directory that is on shared storage and
+# outside your home directory; it needs no GPU:
+#
+#   cd /groups/<lab>/<some project dir>
+#   bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o multinode-%J.out /path/to/tests/test-multinode.sh
+#
+# It starts one sandbox per node with blaunch, as a multi-node launcher does, and checks that the
+# two reach each other and nothing else. --ib is not covered: it needs InfiniBand nodes and a
+# program that uses them (see ADMIN-NOTES.md, "Multi-node jobs").
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+W="$SCRIPT_DIR/../scripts/sandbox-run.sh"
+PROBE="$SCRIPT_DIR/multinode-probe.py"
+
+[[ -n "${LSB_DJOB_HOSTFILE:-}" ]] || { echo "run this as an LSF job (see the header)"; exit 2; }
+mapfile -t HOSTS < <(sort -u "$LSB_DJOB_HOSTFILE")
+[[ ${#HOSTS[@]} -ge 2 ]] || { echo "this job has one node; ask for two: -n 2 -R \"span[ptile=1]\""; exit 2; }
+command -v pasta >/dev/null || { echo "no pasta on $(hostname): --job-nodes cannot work here"; exit 2; }
+
+TR="$PWD/.test-multinode-$$"
+mkdir "$TR" || exit 2
+cd "$TR" || exit 2
+STATE="/scratch/$USER/.agentic-sandbox"
+cleanup() { cd /; rm -rf "$TR"; }
+trap cleanup EXIT
+
+PASS=0 FAIL=0
+ok()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
+bad() { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); }
+check() { if "${@:2}" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+refuses() {  # refuses "what" "expected text" wrapper-args...
+  local what=$1 text=$2 out rc; shift 2
+  out="$("$W" "$@" 2>&1)"; rc=$?
+  if [[ $rc -ne 0 && "$out" == *"$text"* ]]; then ok "refuses $what"; else bad "refuses $what (exit $rc: ${out:0:120})"; fi
+}
+left() { ls "$STATE" 2>/dev/null | grep -c "^$LSB_JOBID-" || true; }
+
+ADDRS=()
+for h in "${HOSTS[@]}"; do ADDRS+=("$(getent ahostsv4 "$h" | awk 'NR==1{print $1}')"); done
+ALL="$(IFS=,; echo "${ADDRS[*]}")"
+OUTSIDER="$(getent ahostsv4 "${LSB_SUB_HOST:-$(hostname)}" | awk 'NR==1{print $1}')"
+echo "job $LSB_JOBID, nodes ${HOSTS[*]} ($ALL), outsider $OUTSIDER"
+
+echo "1. one sandbox per node"
+cat > node.sh <<EOF
+#!/bin/bash
+cd "$TR" || exit 1
+exec "$W" --job-nodes --ro "$SCRIPT_DIR" -- python3 "$PROBE" "$TR" "\$1" "$ALL" "$OUTSIDER"
+EOF
+chmod +x node.sh
+for i in "${!HOSTS[@]}"; do blaunch -z "${HOSTS[$i]}" "$TR/node.sh" "${ADDRS[$i]}" > "probe.$i.out" 2>&1 & done
+wait
+cat probe.*.out > probe.out
+n=${#HOSTS[@]}
+count() { grep -c "^$1 " probe.out || true; }
+[[ "$(count PEER_OUT_OK)" -eq $((n * (n - 1))) ]] && ok "every node connects to every other node" || bad "connections to the other nodes ($(count PEER_OUT_OK) of $((n * (n - 1))))"
+[[ "$(count PEER_IN_OK)" -eq $((n * (n - 1))) ]] && ok "every node accepts from every other node" || bad "connections from the other nodes ($(count PEER_IN_OK) of $((n * (n - 1))))"
+[[ "$(count OUTSIDER_BLOCKED)" -eq $((2 * n)) && "$(count OUTSIDER_BAD)" -eq 0 ]] && ok "a host outside the job and the internet are unreachable" || bad "outside hosts ($(count OUTSIDER_BLOCKED) blocked, $(count OUTSIDER_BAD) reached)"
+[[ "$(count DNS_BLOCKED)" -eq $n ]] && ok "no DNS" || bad "DNS"
+[[ "$(count HOSTS_OK)" -eq $n ]] && ok "/etc/hosts names the other nodes" || bad "/etc/hosts"
+[[ "$(count ROUTE_REFUSED)" -eq $n ]] && ok "the sandboxed process cannot add a route" || bad "route change"
+[[ "$(count OWNER_OK)" -eq $n ]] && ok "files written inside belong to the user" || bad "file ownership"
+[[ $FAIL -eq 0 ]] || sed 's/^/      /' probe.out
+
+echo "2. exit status, stdin and the description for the agent"
+echo "from stdin" | "$W" --job-nodes --listen 40123 -- bash -c 'read -r x; [[ "$x" == "from stdin" ]] || exit 3; grep -q "Only the other nodes of this job" "$SANDBOX_README" || exit 4; grep -q "and on 40123" "$SANDBOX_README" || exit 5; exit 7' 2>/dev/null
+[[ $? -eq 7 ]] && ok "exit status, stdin and \$SANDBOX_README" || bad "exit status, stdin or \$SANDBOX_README"
+
+echo "3. refusals"
+refuses "--allow with --job-nodes" "not with --allow" --job-nodes --allow pypi.org -- true
+refuses "--csub with --job-nodes" "not with --csub" --job-nodes --csub -- true
+refuses "--claude with --job-nodes" "not with --claude" --job-nodes --claude -- true
+refuses "--listen without --job-nodes" "need --job-nodes" --listen 40123 -- true
+refuses "a bad --peers value" "--peers takes host names" --peers 'bad host' -- true
+refuses "an unknown peer" "cannot resolve" --peers nosuchhost.invalid -- true
+out="$(env -u LSB_MCPU_HOSTS "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *LSB_MCPU_HOSTS* ]] && ok "refuses --job-nodes without LSF's node list" || bad "refuses --job-nodes without LSF's node list"
+out="$(SANDBOX_NET_STAGE=inner "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *"not running in pasta's namespace"* ]] && ok "refuses a faked inner stage" || bad "refuses a faked inner stage"
+refuses "--host-net with --job-nodes" "not with --job-nodes" --host-net --job-nodes -- true
+refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
+refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
+
+echo "4. the other two networks"
+"$W" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null" 2>/dev/null && bad "default sandbox: no network" || ok "default sandbox: no network"
+"$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
+
+echo "5. two sandboxes on one node take different blocks of ports"
+for t in A B; do "$W" --peers "$(hostname)" -- bash -c "sleep 3; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
+wait
+[[ -s block.A && -s block.B && "$(cat block.A)" != "$(cat block.B)" && ! -s block.A.err && ! -s block.B.err ]] \
+  && ok "different blocks, no complaints from pasta ($(cat block.A | tr -d '\n'); $(cat block.B | tr -d '\n'))" || bad "port blocks: A='$(cat block.A)' B='$(cat block.B)' $(head -2 block.A.err block.B.err)"
+
+echo "6. stopping"
+"$W" --job-nodes -- sleep 3221 2>/dev/null & P=$!
+sleep 5; kill -TERM $P; wait $P; rc=$?
+sleep 1
+[[ $rc -eq 143 && -z "$(pgrep -u "$(id -u)" -f '^sleep 3221' || true)" && "$(left)" -eq 0 ]] && ok "TERM: exit 143, nothing running, nothing left" || bad "TERM (exit $rc, state dirs $(left))"
+"$W" --job-nodes -- sleep 3222 2>/dev/null & P=$!
+sleep 5; kill -9 $P; wait $P 2>/dev/null; sleep 3
+[[ -z "$(pgrep -u "$(id -u)" -f '^sleep 3222' || true)" && -z "$(pgrep -u "$(id -u)" -x pasta || true)" ]] && ok "kill -9 of the wrapper takes pasta and the sandbox with it" || bad "kill -9 left processes"
+rm -rf "$STATE/$LSB_JOBID-"* 2>/dev/null   # a killed run cannot clean up after itself
+
+echo
+echo "$PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
