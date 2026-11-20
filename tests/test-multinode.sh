@@ -10,10 +10,16 @@
 # It starts one sandbox per node with blaunch, as a multi-node launcher does, and checks that the
 # two reach each other and nothing else. --ib is not covered: it needs InfiniBand nodes and a
 # program that uses them (see ADMIN-NOTES.md, "Multi-node jobs").
+#
+# The same checks run against podman-run.sh with SANDBOX_WRAPPER=podman-run.sh in the environment
+# of the bsub command (allow -W 30: every container start checks the image).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
-W="$SCRIPT_DIR/../scripts/sandbox-run.sh"
+WRAPPER="${SANDBOX_WRAPPER:-sandbox-run.sh}"
+W="$SCRIPT_DIR/../scripts/$WRAPPER"
+PODMAN=0; [[ "$WRAPPER" == podman-run.sh ]] && PODMAN=1
+[[ -x "$W" ]] || { echo "no such wrapper: $W"; exit 2; }
 PROBE="$SCRIPT_DIR/multinode-probe.py"
 
 [[ -n "${LSB_DJOB_HOSTFILE:-}" ]] || { echo "run this as an LSF job (see the header)"; exit 2; }
@@ -27,6 +33,9 @@ cd "$TR" || exit 2
 STATE="/scratch/$USER/.agentic-sandbox"
 cleanup() { cd /; rm -rf "$TR"; }
 trap cleanup EXIT
+# sandbox-run.sh binds the working directory by itself; podman-run.sh mounts only what it is told.
+MNT=(--ro "$SCRIPT_DIR"); [[ $PODMAN -eq 1 ]] && MNT+=(--rw "$TR")
+START=5; [[ $PODMAN -eq 1 ]] && START=45   # seconds until the sandboxed command is surely running
 
 PASS=0 FAIL=0
 ok()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
@@ -43,13 +52,13 @@ ADDRS=()
 for h in "${HOSTS[@]}"; do ADDRS+=("$(getent ahostsv4 "$h" | awk 'NR==1{print $1}')"); done
 ALL="$(IFS=,; echo "${ADDRS[*]}")"
 OUTSIDER="$(getent ahostsv4 "${LSB_SUB_HOST:-$(hostname)}" | awk 'NR==1{print $1}')"
-echo "job $LSB_JOBID, nodes ${HOSTS[*]} ($ALL), outsider $OUTSIDER"
+echo "$WRAPPER, job $LSB_JOBID, nodes ${HOSTS[*]} ($ALL), outsider $OUTSIDER"
 
 echo "1. one sandbox per node"
 cat > node.sh <<EOF
 #!/bin/bash
 cd "$TR" || exit 1
-exec "$W" --job-nodes --ro "$SCRIPT_DIR" -- python3 "$PROBE" "$TR" "\$1" "$ALL" "$OUTSIDER"
+exec "$W" --job-nodes ${MNT[*]} -- python3 "$PROBE" "$TR" "\$1" "$ALL" "$OUTSIDER"
 EOF
 chmod +x node.sh
 for i in "${!HOSTS[@]}"; do blaunch -z "${HOSTS[$i]}" "$TR/node.sh" "${ADDRS[$i]}" > "probe.$i.out" 2>&1 & done
@@ -78,7 +87,11 @@ refuses "--listen without --job-nodes" "need --job-nodes" --listen 40123 -- true
 refuses "a bad --peers value" "--peers takes host names" --peers 'bad host' -- true
 refuses "an unknown peer" "cannot resolve" --peers nosuchhost.invalid -- true
 out="$(env -u LSB_MCPU_HOSTS "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *LSB_MCPU_HOSTS* ]] && ok "refuses --job-nodes without LSF's node list" || bad "refuses --job-nodes without LSF's node list"
-out="$(SANDBOX_NET_STAGE=inner "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *"not running in pasta's namespace"* ]] && ok "refuses a faked inner stage" || bad "refuses a faked inner stage"
+if [[ $PODMAN -eq 1 ]]; then
+  refuses "--keep-id with --job-nodes" "not with --keep-id" --job-nodes --keep-id -- true
+else
+  out="$(SANDBOX_NET_STAGE=inner "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *"not running in pasta's namespace"* ]] && ok "refuses a faked inner stage" || bad "refuses a faked inner stage"
+fi
 refuses "--host-net with --job-nodes" "not with --job-nodes" --host-net --job-nodes -- true
 refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
 refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
@@ -88,20 +101,26 @@ echo "4. the other two networks"
 "$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
 
 echo "5. two sandboxes on one node take different blocks of ports"
-for t in A B; do "$W" --peers "$(hostname)" -- bash -c "sleep 3; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
+for t in A B; do "$W" --peers "$(hostname)" -- bash -c "sleep 8; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
 wait
+[[ $PODMAN -eq 1 ]] && : > block.A.err && : > block.B.err   # podman reports its image check on stderr
 [[ -s block.A && -s block.B && "$(cat block.A)" != "$(cat block.B)" && ! -s block.A.err && ! -s block.B.err ]] \
   && ok "different blocks, no complaints from pasta ($(cat block.A | tr -d '\n'); $(cat block.B | tr -d '\n'))" || bad "port blocks: A='$(cat block.A)' B='$(cat block.B)' $(head -2 block.A.err block.B.err)"
 
 echo "6. stopping"
 "$W" --job-nodes -- sleep 3221 2>/dev/null & P=$!
-sleep 5; kill -TERM $P; wait $P; rc=$?
+sleep $START; kill -TERM $P; wait $P; rc=$?
 sleep 1
 [[ $rc -eq 143 && -z "$(pgrep -u "$(id -u)" -f '^sleep 3221' || true)" && "$(left)" -eq 0 ]] && ok "TERM: exit 143, nothing running, nothing left" || bad "TERM (exit $rc, state dirs $(left))"
-"$W" --job-nodes -- sleep 3222 2>/dev/null & P=$!
-sleep 5; kill -9 $P; wait $P 2>/dev/null; sleep 3
-[[ -z "$(pgrep -u "$(id -u)" -f '^sleep 3222' || true)" && -z "$(pgrep -u "$(id -u)" -x pasta || true)" ]] && ok "kill -9 of the wrapper takes pasta and the sandbox with it" || bad "kill -9 left processes"
-rm -rf "$STATE/$LSB_JOBID-"* 2>/dev/null   # a killed run cannot clean up after itself
+[[ -z "$(pgrep -u "$(id -u)" -x pasta || true)" ]] && ok "no pasta left running" || bad "pasta left running"
+if [[ $PODMAN -eq 0 ]]; then
+  # podman-run.sh has no equivalent: a container outlives a wrapper killed with -9, with or
+  # without these flags, until LSF ends the job.
+  "$W" --job-nodes -- sleep 3222 2>/dev/null & P=$!
+  sleep 5; kill -9 $P; wait $P 2>/dev/null; sleep 3
+  [[ -z "$(pgrep -u "$(id -u)" -f '^sleep 3222' || true)" && -z "$(pgrep -u "$(id -u)" -x pasta || true)" ]] && ok "kill -9 of the wrapper takes pasta and the sandbox with it" || bad "kill -9 left processes"
+  rm -rf "$STATE/$LSB_JOBID-"* 2>/dev/null   # a killed run cannot clean up after itself
+fi
 
 echo
 echo "$PASS passed, $FAIL failed"

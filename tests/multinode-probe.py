@@ -73,5 +73,17 @@ try:
 except Exception as e:  # noqa: BLE001
     say("HOSTS_BAD", e)
 
-r = subprocess.run(["/usr/sbin/ip", "route", "add", "1.1.1.1/32", "dev", "lo"], capture_output=True)
-say("ROUTE_REFUSED" if r.returncode != 0 else "ROUTE_BAD")
+try:
+    r = subprocess.run(["/usr/sbin/ip", "route", "add", "1.1.1.1/32", "dev", "lo"], capture_output=True)
+    say("ROUTE_REFUSED" if r.returncode != 0 else "ROUTE_BAD")
+except FileNotFoundError:
+    # An image without iproute2. The kernel checks the permission before it looks at the request,
+    # so an empty "add route" request tells the same: EPERM without the right, EINVAL with it.
+    import errno
+    import fcntl
+
+    try:
+        fcntl.ioctl(socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0x890B, bytes(120))  # SIOCADDRT
+        say("ROUTE_BAD", "accepted")
+    except OSError as e:
+        say("ROUTE_REFUSED" if e.errno == errno.EPERM else "ROUTE_BAD", e.strerror)

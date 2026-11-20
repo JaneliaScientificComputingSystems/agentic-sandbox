@@ -67,7 +67,39 @@
 #                    Fails with "potentially insufficient UIDs or GIDs available in user
 #                    namespace" if your range isn't wide enough -- ask HPC for a wider one
 #                    (width > your real gid, not just "a range") if you hit this.
+#   --job-nodes     For one worker of a multi-node LSF job (started once per node, e.g. by
+#                    blaunch): a network that reaches the OTHER NODES OF THIS JOB and nothing
+#                    else -- no other host, no internet, no DNS. The node list comes from LSF
+#                    ($LSB_MCPU_HOSTS). Needs pasta (the passt package) on the node. Not with
+#                    --allow, --csub, --claude, --opencode or --keep-id. See "Multi-node jobs"
+#                    below.
+#   --peers HOST[,HOST]  Like --job-nodes, with the nodes named explicitly (outside LSF, tests).
+#   --listen PORT   With --job-nodes: also accept connections from the job's nodes on PORT
+#                    (repeatable). For a port the launcher picked on the node, such as
+#                    torchrun's master port.
+#   --ifname NAME   With --job-nodes: the name of the network interface inside. Default: the
+#                    name of the node's own interface.
+#   --host-net      For one worker of a multi-node LSF job on a queue WITHOUT InfiniBand: the
+#                    node's own network (--network=host), unrestricted. Use it only where
+#                    --job-nodes is too slow, which is when the data itself travels over TCP
+#                    (NCCL on Ethernet). Not with --job-nodes, --allow, --csub, --claude or
+#                    --opencode.
+#   --ib            Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and the
+#                    sysfs entries libibverbs reads. The IMAGE must bring the user-space side
+#                    (libibverbs and the mlx5 provider: rdma-core / ibverbs-providers). Verbs
+#                    traffic does not pass through the container's network, so this opens the
+#                    InfiniBand fabric to the container whatever else is closed.
 #   -h, --help      Show help
+#
+# Multi-node jobs: the same three flags as sandbox-run.sh, with the same meaning (see its header
+# for the design and the measurements). The mechanism differs. With --job-nodes podman starts
+# pasta itself (--network=pasta) with this wrapper's options, handed over in a per-job
+# containers.conf: no UDP, no gateway mapping, and TCP forwarded from the node's own address on
+# one block of 5000 ports below the node's range for outgoing connections. An OCI hook
+# (jobnet-hook.sh, next to this script) then runs on the node between network setup and the
+# container's command and replaces the routes inside with one host route per node of the job.
+# The command runs without CAP_NET_ADMIN, so it cannot put a route back. --keep-id is refused
+# with --job-nodes: there the network is set up only after the hook has run.
 #
 # Unlike sandbox-run.sh, $HOME is NOT bound by default here -- use --rw/--ro if you need your
 # real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
@@ -100,6 +132,12 @@ KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 ENV_ARGS=()
+WANT_IB=0
+WANT_JOBNET=0     # --job-nodes / --peers
+WANT_HOSTNET=0    # --host-net
+PEER_LIST=""      # --peers HOST[,HOST]
+LISTEN_PORTS=()   # --listen PORT
+NET_IFNAME=""     # --ifname NAME
 
 # Everything from line 2 down to the blank comment line before `set -euo pipefail`.
 usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
@@ -148,6 +186,21 @@ while [[ $# -gt 0 ]]; do
       SHM_SIZE="$2"; shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
+    --ib) WANT_IB=1; shift ;;
+    --job-nodes) WANT_JOBNET=1; shift ;;
+    --host-net) WANT_HOSTNET=1; shift ;;
+    --peers)
+      need_arg "$@"
+      [[ "$2" =~ ^[A-Za-z0-9._,-]+$ ]] || { echo "podman-run.sh: --peers takes host names separated by commas (got '$2')" >&2; exit 1; }
+      WANT_JOBNET=1; PEER_LIST="$2"; shift 2 ;;
+    --listen)
+      need_arg "$@"
+      [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || { echo "podman-run.sh: --listen takes a port from 1024 to 65535 (got '$2')" >&2; exit 1; }
+      LISTEN_PORTS+=("$2"); shift 2 ;;
+    --ifname)
+      need_arg "$@"
+      [[ "$2" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || { echo "podman-run.sh: --ifname takes an interface name of up to 15 characters (got '$2')" >&2; exit 1; }
+      NET_IFNAME="$2"; shift 2 ;;
     --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
@@ -188,6 +241,62 @@ if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; th
   echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
        "the job has no GPU allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
   exit 1
+fi
+
+# Multi-node workers (see "Multi-node jobs" in the header). Everything here runs before anything
+# is created, so a refusal leaves nothing behind.
+jobnet_die() { echo "podman-run.sh: --job-nodes: $*" >&2; exit 1; }
+if [[ $WANT_HOSTNET -eq 1 ]]; then
+  # One flag must not be enough to run an agent itself, or its job broker, with an open network.
+  _why=""
+  [[ $WANT_JOBNET -eq 1 ]] && _why="--job-nodes or --peers (choose one of the two networks)"
+  [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "podman-run.sh: --host-net: not with $_why" >&2; exit 1; }
+  echo "podman-run.sh: --host-net: this container shares the node's network; nothing limits where it connects" >&2
+fi
+if [[ $WANT_JOBNET -eq 0 && ( ${#LISTEN_PORTS[@]} -gt 0 || -n "$NET_IFNAME" ) ]]; then
+  echo "podman-run.sh: --listen and --ifname need --job-nodes (or --peers)" >&2; exit 1
+fi
+if [[ $WANT_IB -eq 1 && ! -d /dev/infiniband ]]; then
+  echo "podman-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1
+fi
+JOBNET_PEERS="" JOBNET_HOSTS_TEXT="" JOBNET_MYIP="" JOBNET_HIF=""
+if [[ $WANT_JOBNET -eq 1 ]]; then
+  [[ $WANT_CLAUDE -eq 0 && $WANT_OPENCODE -eq 0 ]] || jobnet_die "not with --claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ ${#ALLOW_HOSTS[@]} -eq 0 ]] || jobnet_die "not with --allow: a worker reaches the job's nodes only"
+  [[ $WANT_CSUB -eq 0 ]] || jobnet_die "not with --csub"
+  [[ $KEEP_ID -eq 0 ]] || jobnet_die "not with --keep-id: there podman sets up the network after the point where this wrapper can limit it"
+  command -v pasta >/dev/null || jobnet_die "needs pasta (the passt package) on $(hostname)"
+  [[ -x "$SCRIPT_DIR/jobnet-hook.sh" ]] || jobnet_die "$SCRIPT_DIR/jobnet-hook.sh is missing or not executable"
+  IP_BIN="$(command -v ip || echo /usr/sbin/ip)"
+  # `|| true`: an unknown name must reach the message below, not end the script under `set -e`.
+  JOBNET_MYIP="$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" || true
+  [[ "$JOBNET_MYIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve this node's own address ($(hostname))"
+  JOBNET_HIF="$("$IP_BIN" -o -4 addr show | awk -v ip="$JOBNET_MYIP" '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')"
+  [[ -n "$JOBNET_HIF" ]] || jobnet_die "no network interface holds $JOBNET_MYIP"
+  [[ "$JOBNET_HIF" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || jobnet_die "unexpected interface name: $JOBNET_HIF"
+  JOBNET_IF="${NET_IFNAME:-$JOBNET_HIF}"
+  _names=()
+  if [[ -n "$PEER_LIST" ]]; then
+    IFS=, read -ra _names <<< "$PEER_LIST"
+  elif [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
+    # "host1 slots1 host2 slots2 ..." -- LSF sets it in every task of the job
+    read -ra _mc <<< "$LSB_MCPU_HOSTS"
+    for ((i = 0; i < ${#_mc[@]}; i += 2)); do _names+=("${_mc[i]}"); done
+  else
+    jobnet_die "not inside an LSF job (LSB_MCPU_HOSTS is not set); name the nodes with --peers HOST,HOST"
+  fi
+  JOBNET_HOSTS_TEXT="$JOBNET_MYIP $(getent hosts "$JOBNET_MYIP" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
+  for n in "${_names[@]}"; do
+    [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || jobnet_die "not a host name: $n"
+    a="$(getent ahostsv4 "$n" | awk 'NR==1{print $1}')" || true
+    [[ "$a" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve $n"
+    [[ "$a" == "$JOBNET_MYIP" || " $JOBNET_PEERS " == *" $a "* ]] && continue
+    JOBNET_PEERS+="${JOBNET_PEERS:+ }$a"
+    JOBNET_HOSTS_TEXT+="$a $(getent hosts "$a" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
+  done
 fi
 
 # --claude/--opencode: the harness CONFIG is copied into a per-job directory. Claude's copy is
@@ -519,7 +628,31 @@ kill_orphaned_catatonit_for_this_job() {
 # here, not left to the user's containers.conf, so it cannot be forgotten. --events-backend=none
 # (a global option, so it sits before the subcommand on each call that would emit events: pull,
 # run, rm) does the same for podman's container create/start/died events.
-PODMAN_ARGS=(--rm --network=none --log-driver=none)
+PODMAN_ARGS=(--rm --log-driver=none)
+if [[ $WANT_HOSTNET -eq 1 ]]; then
+  # The node's network namespace. podman then binds the node's /sys read-only, which is where
+  # NCCL reads the network card's details (without them it runs about a quarter slower).
+  PODMAN_ARGS+=(--network=host)
+elif [[ $WANT_JOBNET -eq 1 ]]; then
+  # pasta, with the options written to a per-job containers.conf just before the launch (the
+  # forwarding option contains commas, which --network=pasta:opt,opt would split). The hook
+  # narrows the routes; /etc/hosts names the job's nodes, since no DNS server is reachable.
+  mkdir "$JOB_DIR/hooks"
+  { echo "127.0.0.1 localhost"; printf '%s' "$JOBNET_HOSTS_TEXT"; } > "$JOB_DIR/hosts"
+  PODMAN_ARGS+=(--network=pasta --hooks-dir "$JOB_DIR/hooks" --hostname "$(hostname)" --no-hosts
+                -v "$JOB_DIR/hosts:/etc/hosts:ro")
+else
+  PODMAN_ARGS+=(--network=none)
+fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # The verbs device nodes. With a network namespace of its own the container gets a fresh
+  # sysfs, which lists the adapters (/sys/class/infiniband) but not their uverbs entries, so
+  # that one directory comes from the node. (--host-net already has the node's whole /sys.)
+  PODMAN_ARGS+=(--device /dev/infiniband)
+  if [[ $WANT_HOSTNET -eq 0 && -d /sys/class/infiniband_verbs ]]; then
+    PODMAN_ARGS+=(-v /sys/class/infiniband_verbs:/sys/class/infiniband_verbs:ro)
+  fi
+fi
 # Without -i, podman leaves stdin closed -- an interactive shell/TUI inside hits EOF and
 # exits immediately (looks like the container "won't stay open", but it ran fine and exited
 # on its own). Only add -t when a real terminal is attached; podman errors on -t under a
@@ -826,8 +959,21 @@ write_sandbox_readme() {
       echo "- Only these hosts are reachable, over HTTP(S) through a proxy already configured in http_proxy/https_proxy:"
       for h in "${ALLOW_HOSTS[@]}"; do echo "  - $h (and its subdomains)"; done
       echo "- Everything else (other hosts, raw TCP, ssh, package registries not listed) fails. Do not retry or look for a route; ask the user."
+    elif [[ $WANT_JOBNET -eq 1 ]]; then
+      echo "- This is one worker of a multi-node job. Only the other nodes of this job are reachable:"
+      for a in $JOBNET_PEERS; do echo "  - $a"; done
+      [[ -n "$JOBNET_PEERS" ]] || echo "  - (none: this job has one node)"
+      echo "- This node's address is $JOBNET_MYIP, on interface $JOBNET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
+      echo "- Everything else (other hosts, the internet, package registries) fails at once with 'network unreachable'. Do not retry or look for a route."
+      echo "- Other nodes can connect to this one on ports $JOBNET_LO-$JOBNET_HI${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be inside that range."
+    elif [[ $WANT_HOSTNET -eq 1 ]]; then
+      echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
+      echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."
     else
       echo "- No network at all. Every connection attempt fails by design."
+    fi
+    if [[ $WANT_IB -eq 1 ]]; then
+      echo "- InfiniBand (RDMA verbs) devices are available in /dev/infiniband."
     fi
     echo
     echo "## Environment"
@@ -893,6 +1039,48 @@ PY
   fi
 }
 
+# --job-nodes: choose this container's block of ports and write pasta's options and the hook.
+# One sandbox at a time on this node does this and lets pasta bind: two that look at the same
+# instant would each get part of the same block. The lock is held from here until the hook has
+# run (pasta is listening by then) or podman has given up, never across the container's command.
+JOBNET_LOCKFD=""
+if [[ $WANT_JOBNET -eq 1 ]]; then
+  exec {JOBNET_LOCKFD}> "$SANDBOX_STATE_PARENT/net.lock"
+  flock "$JOBNET_LOCKFD"
+  # Ports other nodes may connect to: a block of 5000 below the node's own range for outgoing
+  # connections, so that nothing on the node hands one out by chance. Ports already listening
+  # on the node are left out. A block that is mostly taken belongs to another sandbox on this
+  # node, so the next block down is tried. (Same choice as sandbox-run.sh, same lock file.)
+  read -r _elo _ < /proc/sys/net/ipv4/ip_local_port_range
+  _top=14999; [[ "$_elo" -le "$_top" ]] && _top=$((_elo - 1))
+  _listening="$(ss -Htln 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | sort -un || true)"
+  JOBNET_LO="" JOBNET_HI="" _busy=""
+  for ((_h = _top; _h - 4999 >= 1024; _h -= 5000)); do
+    _b="$(awk -v lo=$((_h - 4999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
+    if [[ "$(grep -c . <<< "$_b" || true)" -lt 2500 ]]; then JOBNET_LO=$((_h - 4999)); JOBNET_HI=$_h; _busy="$_b"; break; fi
+  done
+  [[ -n "$JOBNET_LO" ]] || jobnet_die "no free block of 5000 ports below $((_top + 1)) on $(hostname) (other sandboxes on this node hold them)"
+  # Excludes only: pasta then forwards the rest best effort.
+  _spec="~1-$((JOBNET_LO - 1)),~$((JOBNET_HI + 1))-65535"
+  for port in $_busy; do _spec+=",~$port"; done
+  _opts="\"-4\", \"-i\", \"$JOBNET_HIF\", \"-I\", \"$JOBNET_IF\", \"-t\", \"$JOBNET_MYIP/$_spec\""
+  for port in "${LISTEN_PORTS[@]:-}"; do
+    [[ -n "$port" ]] || continue
+    [[ "$port" -ge "$JOBNET_LO" && "$port" -le "$JOBNET_HI" ]] || _opts+=", \"-t\", \"$JOBNET_MYIP/$port\""
+  done
+  _opts+=", \"-u\", \"none\", \"-T\", \"none\", \"-U\", \"none\", \"--no-map-gw\""
+  printf '[network]\ndefault_rootless_network_cmd = "pasta"\npasta_options = [%s]\n' "$_opts" > "$JOB_DIR/containers.conf"
+  _hargs="\"jobnet-hook.sh\", \"$JOB_DIR\", \"$JOBNET_IF\""
+  for a in $JOBNET_PEERS; do _hargs+=", \"$a\""; done
+  printf '{"version": "1.0.0", "hook": {"path": "%s", "args": [%s]}, "when": {"always": true}, "stages": ["createRuntime"]}\n' \
+    "$SCRIPT_DIR/jobnet-hook.sh" "$_hargs" > "$JOB_DIR/hooks/jobnet.json"
+  : > "$JOB_DIR/net.starting"
+  # A listener on port 0 gets a port other nodes can reach: the top 1000 of the block.
+  PODMAN_ARGS+=(--sysctl "net.ipv4.ip_local_port_range=$((JOBNET_HI - 999)) $JOBNET_HI")
+  # On top of the user's and the system's containers.conf, for this wrapper's podman calls only.
+  export CONTAINERS_CONF_OVERRIDE="$JOB_DIR/containers.conf"
+fi
+
 write_sandbox_readme
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
@@ -924,6 +1112,16 @@ else
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
 fi
 PODMAN_PID=$!
+if [[ -n "$JOBNET_LOCKFD" ]]; then
+  for ((_w = 0; _w < 1200; _w++)); do
+    [[ -e "$JOB_DIR/net.starting" ]] && kill -0 "$PODMAN_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  exec {JOBNET_LOCKFD}>&-
+  if [[ -e "$JOB_DIR/net.starting" && -s "$JOB_DIR/hook.log" ]]; then
+    sed 's/^/podman-run.sh: --job-nodes: /' "$JOB_DIR/hook.log" >&2
+  fi
+fi
 
 # `catatonit` (podman's container-init) lingering after the container's own command has
 # finished is a known issue on this cluster, independent of this script -- Janelia's own

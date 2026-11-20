@@ -13,7 +13,11 @@ the evidence behind each.
 - **`sandbox-run.sh --ib`**: binds the InfiniBand devices and the sysfs entries NCCL reads.
 - All three are for a job's workers, not for the agent: each refuses `--claude` and `--opencode`,
   and the two network flags refuse `--allow` and `--csub`. Nothing changes for existing uses.
-- **`tests/test-multinode.sh`** tests them as a two-node LSF job.
+- **`podman-run.sh`** takes the same flags (`--job-nodes`, `--peers`, `--listen`, `--ifname`,
+  `--host-net`, `--ib`) with the same meaning. `--job-nodes` is refused with `--keep-id`. With
+  `--ib` the image must contain `libibverbs` and the mlx5 provider. New file:
+  `scripts/jobnet-hook.sh`, which must stay next to `podman-run.sh`.
+- **`tests/test-multinode.sh`** tests them as a two-node LSF job, for either wrapper.
 
 ## 2026-11-16
 

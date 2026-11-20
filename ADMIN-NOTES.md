@@ -1108,6 +1108,40 @@ sandbox starts Ray, waits for the nodes, runs the script and stops Ray; each oth
 joins and stays until its raylet exits. `ray start` gets `--node-ip-address` (its own lookup
 needs the internet) and fixed ports inside the block.
 
+**The same flags in `podman-run.sh`.** The meaning is the same and the mechanism differs:
+
+- **`--job-nodes`.** podman starts pasta itself (`--network=pasta`). The wrapper's pasta options
+  go into a per-job `containers.conf`, named in `CONTAINERS_CONF_OVERRIDE`, because the
+  forwarding option contains commas, which `--network=pasta:opt,opt` would split. An OCI
+  `createRuntime` hook (`scripts/jobnet-hook.sh`, found through `--hooks-dir`) runs on the node
+  after pasta is up and before the container's command. It enters the container's network
+  namespace, flushes the copied routes, adds one host route per node of the job, and checks the
+  result. A failing hook stops the container before the command starts. The command has no
+  `CAP_NET_ADMIN` (podman's default set), so it cannot add a route; the probe confirms this with
+  an `SIOCADDRT` request, which fails with `EPERM`.
+- **Not with `--keep-id`.** There the hook sees a namespace that has no interface yet (`Cannot
+  find device`): podman sets the network up after `createRuntime`. Refused.
+- **Ports.** Same choice and the same lock file as `sandbox-run.sh`, so a Bubblewrap and a podman
+  sandbox on one node take different blocks. The lock is held until the hook has run. The port
+  range inside is set with `--sysctl net.ipv4.ip_local_port_range`.
+- **`--ib`.** `--device /dev/infiniband`. A container with its own network namespace gets a fresh
+  sysfs, which lists the adapters in `/sys/class/infiniband` but only `abi_version` in
+  `/sys/class/infiniband_verbs`, so that directory is bound from the node. The locked-memory limit
+  is unlimited inside without a flag.
+- **`--host-net`.** `--network=host`. podman then binds the node's `/sys` read-only, so nothing
+  needs adding for NCCL.
+
+| Test (podman, `agentic-sandbox-gpu` image: PyTorch 2.13, NCCL 2.30.7) | Result |
+| --- | --- |
+| H200, 2 nodes, 16 GPUs, `--gpu --ib --job-nodes`, bandwidth at 4 GB messages (job 155645990) | 483.61 GB/s; sustained 60 s: 481.97 GB/s; `NET/IB`; login node unreachable from inside |
+| CPU, 2 nodes, `tests/test-multinode.sh` with `SANDBOX_WRAPPER=podman-run.sh` (job 155645987) | 24 checks pass |
+| `tests/test-podman.sh` with `SKIP_LLM=1` on an H200 node, after the change (job 155646437) | 46 passed, 0 failed, 3 skipped |
+
+The H200 run printed `NCCL WARN Call to ibv_query_port_speed failed with error Protocol not
+supported` 128 times and ran at full speed. The Bubblewrap runs, with NCCL 2.27.3 from a venv,
+did not print it. Probably the image's newer NCCL asking for something this kernel's driver
+does not offer; not confirmed with the same image outside the sandbox.
+
 **What `--job-nodes` improves over `--host-net`, beyond other hosts.** The node's loopback
 services and its abstract Unix sockets are not reachable from a private network namespace.
 
@@ -1119,7 +1153,9 @@ services and its abstract Unix sockets are not reachable from a private network 
   improve but will not reach the node's own speed.
 - A limit for Ethernet queues at full speed would need a filter on `connect` (seccomp user
   notification with a supervisor outside the sandbox). Not built.
-- `podman-run.sh` has no equivalent yet. csub has no multi-node job type.
+- `podman-run.sh --host-net` on an Ethernet queue: jobs queued, no result yet.
+- `podman-run.sh --job-nodes` with `--keep-id`.
+- csub has no multi-node job type.
 - No adversarial review of the pasta path yet.
 
 ## An agent off the cluster: `ssh-entry.sh` — design and evidence
