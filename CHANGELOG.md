@@ -5,7 +5,7 @@ the evidence behind each.
 
 ## 2026-11-19
 
-- **`sandbox-run.sh --job-nodes`** (with `--peers`, `--listen`, `--ifname`): one sandbox per node
+- **`sandbox-run.sh --job-nodes`** (with `--peers`, `--listen`): one sandbox per node
   of a multi-node LSF job, with a private network that reaches the job's other nodes and nothing
   else. The node list comes from LSF. Needs `pasta` (the `passt` package) on the nodes.
 - **`sandbox-run.sh --host-net`**: the same role on queues without InfiniBand, where the relay
@@ -13,14 +13,15 @@ the evidence behind each.
 - **`sandbox-run.sh --ib`**: binds the InfiniBand devices and the sysfs entries NCCL reads.
 - All three are for a job's workers, not for the agent: each refuses `--claude` and `--opencode`,
   and the two network flags refuse `--allow` and `--csub`. Nothing changes for existing uses.
-- **`podman-run.sh`** takes the same flags (`--job-nodes`, `--peers`, `--listen`, `--ifname`,
+- **`podman-run.sh`** takes the same flags (`--job-nodes`, `--peers`, `--listen`,
   `--host-net`, `--ib`) with the same meaning. `--job-nodes` is refused with `--keep-id`. With
   `--ib` the image must contain `libibverbs` and the mlx5 provider. New file:
   `scripts/jobnet-hook.sh`, which must stay next to `podman-run.sh`.
 - **`tests/test-multinode.sh`** tests them as a two-node LSF job, for either wrapper.
 - **`podman-run.sh` fix:** a command that ended within about a second could make the wrapper
   return 1 instead of the command's own exit status.
-- **`--ib`** refuses `--csub`, `--claude` and `--opencode` in both wrappers.
+- **`--ib`** refuses `--csub`, `--claude` and `--opencode` in both wrappers, and `--host-net`
+  refuses `--ib`. Inside an LSF job `--peers` accepts only nodes of that job.
 - **Images rebuilt.** Both now contain OpenAI's Codex CLI and current Claude Code and opencode.
   `agentic-sandbox-gpu` adds Ray 2.60 (Train and Data), `tiktoken`, `scikit-image` and
   `pycocotools`, and stays on NVIDIA's PyTorch 26.07 base: 26.11 was built and measured 4 to 8%

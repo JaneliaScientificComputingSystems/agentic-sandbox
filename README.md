@@ -420,7 +420,8 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
 ```
 
 - **Where the node list comes from.** LSF: `--job-nodes` reads `$LSB_MCPU_HOSTS`, which LSF sets in
-  every task of the job. Nobody types it. `--peers HOST,HOST` names the nodes by hand, outside LSF.
+  every task of the job. Nobody types it. `--peers HOST,HOST` names the nodes by hand, outside LSF;
+  inside an LSF job it accepts only nodes of that job.
 - **How `--job-nodes` limits the network.** The wrapper starts itself again under `pasta`, a
   user-space relay (the `passt` package, which rootless podman also uses). The sandbox gets a
   network namespace that carries the node's own address, with one route to each other node of the
@@ -453,7 +454,8 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   `agentic-sandbox-gpu` does.
 - **Refused together.** `--job-nodes` and `--host-net` each refuse `--allow`, `--csub`, `--claude`
   and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network. `--ib`
-  refuses `--csub`, `--claude` and `--opencode` for the same reason.
+  refuses `--csub`, `--claude` and `--opencode` for the same reason. `--host-net` refuses `--ib`:
+  a job on InfiniBand takes `--job-nodes --ib` and keeps its network limited.
 - **Connections in.** A host outside the job can open a TCP connection to the relay's ports, but
   nothing it sends reaches the sandboxed program, and the program never sees the connection.
 - **What it tells the agent.** `$SANDBOX_README` lists the reachable nodes, this node's address
@@ -524,7 +526,6 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --job-nodes     one worker of a multi-node job: a private network that reaches the
                   job's other nodes only (from LSF); --peers HOST,HOST names them by hand
   --listen PORT   (with --job-nodes) also accept the job's nodes on PORT (repeatable)
-  --ifname NAME   (with --job-nodes) name of the network interface inside
   --host-net      one worker of a multi-node job on a queue without InfiniBand:
                   the node's own network, unrestricted
   --ib            bind the InfiniBand (RDMA verbs) devices

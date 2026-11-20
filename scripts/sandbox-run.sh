@@ -42,13 +42,11 @@
 #                         the node. Not with --allow, --csub, --claude or --opencode. See
 #                         "Multi-node jobs" below.
 #   --peers HOST[,HOST]   Like --job-nodes, with the nodes named explicitly (outside LSF, tests).
+#                         Inside an LSF job every name must be a node of that job.
 #   --listen PORT         With --job-nodes: also accept connections from the job's nodes on PORT
 #                         (repeatable). For a port the launcher picked on the node, such as
 #                         torchrun's master port. Ports the sandboxed program opens itself need
 #                         no flag -- see "Multi-node jobs".
-#   --ifname NAME         With --job-nodes: the name of the network interface inside. Default:
-#                         the name of the node's own interface. For software that is told an
-#                         interface by name (NCCL_SOCKET_IFNAME).
 #   --host-net            For one worker of a multi-node LSF job on a queue WITHOUT InfiniBand:
 #                         the node's own network, unrestricted. Files, credentials, environment
 #                         and processes are sandboxed as always; the network is not. Use it only
@@ -189,7 +187,6 @@ WANT_JOBNET=0     # --job-nodes / --peers
 WANT_HOSTNET=0    # --host-net
 PEER_LIST=""      # --peers HOST,HOST (empty: take the nodes from LSF)
 LISTEN_PORTS=()   # --listen PORT
-NET_IFNAME=""     # --ifname NAME
 ORIG_ARGS=("$@")  # --job-nodes starts this script again, with the same arguments, under pasta
 WANT_CLAUDE=0
 WANT_OPENCODE=0
@@ -235,10 +232,6 @@ while [[ $# -gt 0 ]]; do
       need_arg "$@"
       [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || { echo "sandbox-run.sh: --listen takes a port from 1024 to 65535 (got '$2')" >&2; exit 1; }
       LISTEN_PORTS+=("$2"); shift 2 ;;
-    --ifname)
-      need_arg "$@"
-      [[ "$2" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || { echo "sandbox-run.sh: --ifname takes an interface name of up to 15 characters (got '$2')" >&2; exit 1; }
-      NET_IFNAME="$2"; shift 2 ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
       WANT_CLAUDE=1
@@ -298,6 +291,7 @@ if [[ $WANT_HOSTNET -eq 1 ]]; then
   # One flag must not be enough to run an agent itself, or its job broker, with an open network.
   _why=""
   [[ $WANT_JOBNET -eq 1 ]] && _why="--job-nodes or --peers (choose one of the two networks)"
+  [[ $WANT_IB -eq 1 ]] && _why="--ib: a job on InfiniBand takes --job-nodes --ib, which is as fast and keeps the network limited"
   [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
@@ -311,8 +305,8 @@ if [[ $WANT_IB -eq 1 ]]; then
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }
 fi
-if [[ $WANT_JOBNET -eq 0 && ( ${#LISTEN_PORTS[@]} -gt 0 || -n "$NET_IFNAME" ) ]]; then
-  echo "sandbox-run.sh: --listen and --ifname need --job-nodes (or --peers)" >&2; exit 1
+if [[ $WANT_JOBNET -eq 0 && ${#LISTEN_PORTS[@]} -gt 0 ]]; then
+  echo "sandbox-run.sh: --listen needs --job-nodes (or --peers)" >&2; exit 1
 fi
 if [[ $WANT_JOBNET -eq 1 ]]; then
   # The agent itself stays in the ordinary single-node sandbox; this mode is for its workers.
@@ -329,9 +323,17 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     [[ "$_myip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve this node's own address ($(hostname))"
     _hif="$("$IP_BIN" -o -4 addr show | awk -v ip="$_myip" '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')"
     [[ -n "$_hif" ]] || jobnet_die "no network interface holds $_myip"
-    _names=()
+    _names=() _jobaddrs=""
     if [[ -n "$PEER_LIST" ]]; then
       IFS=, read -ra _names <<< "$PEER_LIST"
+      # Inside an LSF job --peers may only narrow the job's own nodes: otherwise it would be a
+      # way to open a path to any host by naming it.
+      if [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
+        read -ra _mc <<< "$LSB_MCPU_HOSTS"
+        for ((i = 0; i < ${#_mc[@]}; i += 2)); do
+          _jobaddrs+=" $(getent ahostsv4 "${_mc[i]}" | awk 'NR==1{print $1}' || true)"
+        done
+      fi
     elif [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
       # "host1 slots1 host2 slots2 ..." -- LSF sets it in every task of the job
       read -ra _mc <<< "$LSB_MCPU_HOSTS"
@@ -344,6 +346,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || jobnet_die "not a host name: $n"
       a="$(getent ahostsv4 "$n" | awk 'NR==1{print $1}')" || true
       [[ "$a" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve $n"
+      [[ -z "$_jobaddrs" || " $_jobaddrs " == *" $a "* ]] || jobnet_die "--peers $n: not a node of this LSF job ($LSB_MCPU_HOSTS)"
       [[ "$a" == "$_myip" || " $_peers " == *" $a "* ]] && continue
       _peers+="${_peers:+ }$a"
       _hosts+="$a $(getent hosts "$a" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
@@ -379,7 +382,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
         [[ "$port" -ge "$_lo" && "$port" -le "$_hi" ]] || _fwd+=(-t "$_myip/$port")
       done
       export SANDBOX_NET_STAGE=inner SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip" \
-             SANDBOX_NET_IF="${NET_IFNAME:-$_hif}" SANDBOX_NET_HOSTS="$_hosts" SANDBOX_NET_HOSTNAME="$(hostname)" \
+             SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts" SANDBOX_NET_HOSTNAME="$(hostname)" \
              SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$" SANDBOX_NET_MARK="$_markdir/net-$$.starting"
       : > "$SANDBOX_NET_MARK"
       # A killed parent takes its child with it, at both levels: this shell -> pasta -> inner stage.

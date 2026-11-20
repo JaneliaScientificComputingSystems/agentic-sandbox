@@ -86,7 +86,7 @@ echo "3. refusals"
 refuses "--allow with --job-nodes" "not with --allow" --job-nodes --allow pypi.org -- true
 refuses "--csub with --job-nodes" "not with --csub" --job-nodes --csub -- true
 refuses "--claude with --job-nodes" "not with --claude" --job-nodes --claude -- true
-refuses "--listen without --job-nodes" "need --job-nodes" --listen 40123 -- true
+refuses "--listen without --job-nodes" "needs --job-nodes" --listen 40123 -- true
 refuses "a bad --peers value" "--peers takes host names" --peers 'bad host' -- true
 refuses "an unknown peer" "cannot resolve" --peers nosuchhost.invalid -- true
 out="$(env -u LSB_MCPU_HOSTS "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *LSB_MCPU_HOSTS* ]] && ok "refuses --job-nodes without LSF's node list" || bad "refuses --job-nodes without LSF's node list"
@@ -98,6 +98,8 @@ fi
 refuses "--host-net with --job-nodes" "not with --job-nodes" --host-net --job-nodes -- true
 refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
 refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
+refuses "--host-net with --ib" "not with --ib" --host-net --ib -- true
+refuses "--peers naming a host outside the job" "not a node of this LSF job" --peers "${LSB_SUB_HOST:-login1}" -- true
 refuses "--ib with --claude" "--ib: not with --claude" --ib --claude -- true
 refuses "--ib with --csub" "--ib: not with --csub" --ib --csub -- true
 

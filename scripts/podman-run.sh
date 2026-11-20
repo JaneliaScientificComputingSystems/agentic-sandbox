@@ -74,11 +74,10 @@
 #                    --allow, --csub, --claude, --opencode or --keep-id. See "Multi-node jobs"
 #                    below.
 #   --peers HOST[,HOST]  Like --job-nodes, with the nodes named explicitly (outside LSF, tests).
+#                    Inside an LSF job every name must be a node of that job.
 #   --listen PORT   With --job-nodes: also accept connections from the job's nodes on PORT
 #                    (repeatable). For a port the launcher picked on the node, such as
 #                    torchrun's master port.
-#   --ifname NAME   With --job-nodes: the name of the network interface inside. Default: the
-#                    name of the node's own interface.
 #   --host-net      For one worker of a multi-node LSF job on a queue WITHOUT InfiniBand: the
 #                    node's own network (--network=host), unrestricted. Use it only where
 #                    --job-nodes is too slow, which is when the data itself travels over TCP
@@ -137,7 +136,6 @@ WANT_JOBNET=0     # --job-nodes / --peers
 WANT_HOSTNET=0    # --host-net
 PEER_LIST=""      # --peers HOST[,HOST]
 LISTEN_PORTS=()   # --listen PORT
-NET_IFNAME=""     # --ifname NAME
 
 # Everything from line 2 down to the blank comment line before `set -euo pipefail`.
 usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
@@ -197,10 +195,6 @@ while [[ $# -gt 0 ]]; do
       need_arg "$@"
       [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || { echo "podman-run.sh: --listen takes a port from 1024 to 65535 (got '$2')" >&2; exit 1; }
       LISTEN_PORTS+=("$2"); shift 2 ;;
-    --ifname)
-      need_arg "$@"
-      [[ "$2" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || { echo "podman-run.sh: --ifname takes an interface name of up to 15 characters (got '$2')" >&2; exit 1; }
-      NET_IFNAME="$2"; shift 2 ;;
     --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
@@ -250,6 +244,7 @@ if [[ $WANT_HOSTNET -eq 1 ]]; then
   # One flag must not be enough to run an agent itself, or its job broker, with an open network.
   _why=""
   [[ $WANT_JOBNET -eq 1 ]] && _why="--job-nodes or --peers (choose one of the two networks)"
+  [[ $WANT_IB -eq 1 ]] && _why="--ib: a job on InfiniBand takes --job-nodes --ib, which is as fast and keeps the network limited"
   [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
@@ -263,8 +258,8 @@ if [[ $WANT_IB -eq 1 ]]; then
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "podman-run.sh: --ib: not with $_why" >&2; exit 1; }
 fi
-if [[ $WANT_JOBNET -eq 0 && ( ${#LISTEN_PORTS[@]} -gt 0 || -n "$NET_IFNAME" ) ]]; then
-  echo "podman-run.sh: --listen and --ifname need --job-nodes (or --peers)" >&2; exit 1
+if [[ $WANT_JOBNET -eq 0 && ${#LISTEN_PORTS[@]} -gt 0 ]]; then
+  echo "podman-run.sh: --listen needs --job-nodes (or --peers)" >&2; exit 1
 fi
 if [[ $WANT_IB -eq 1 && ! -d /dev/infiniband ]]; then
   echo "podman-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1
@@ -284,10 +279,18 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   JOBNET_HIF="$("$IP_BIN" -o -4 addr show | awk -v ip="$JOBNET_MYIP" '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')"
   [[ -n "$JOBNET_HIF" ]] || jobnet_die "no network interface holds $JOBNET_MYIP"
   [[ "$JOBNET_HIF" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || jobnet_die "unexpected interface name: $JOBNET_HIF"
-  JOBNET_IF="${NET_IFNAME:-$JOBNET_HIF}"
-  _names=()
+  JOBNET_IF="$JOBNET_HIF"
+  _names=() _jobaddrs=""
   if [[ -n "$PEER_LIST" ]]; then
     IFS=, read -ra _names <<< "$PEER_LIST"
+    # Inside an LSF job --peers may only narrow the job's own nodes: otherwise it would be a way
+    # to open a path to any host by naming it.
+    if [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
+      read -ra _mc <<< "$LSB_MCPU_HOSTS"
+      for ((i = 0; i < ${#_mc[@]}; i += 2)); do
+        _jobaddrs+=" $(getent ahostsv4 "${_mc[i]}" | awk 'NR==1{print $1}' || true)"
+      done
+    fi
   elif [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
     # "host1 slots1 host2 slots2 ..." -- LSF sets it in every task of the job
     read -ra _mc <<< "$LSB_MCPU_HOSTS"
@@ -300,6 +303,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || jobnet_die "not a host name: $n"
     a="$(getent ahostsv4 "$n" | awk 'NR==1{print $1}')" || true
     [[ "$a" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve $n"
+    [[ -z "$_jobaddrs" || " $_jobaddrs " == *" $a "* ]] || jobnet_die "--peers $n: not a node of this LSF job ($LSB_MCPU_HOSTS)"
     [[ "$a" == "$JOBNET_MYIP" || " $JOBNET_PEERS " == *" $a "* ]] && continue
     JOBNET_PEERS+="${JOBNET_PEERS:+ }$a"
     JOBNET_HOSTS_TEXT+="$a $(getent hosts "$a" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
