@@ -8,7 +8,7 @@
 # nvidia-smi/the CUDA runtime API to work -- enough to prove GPU passthrough works and for
 # most agent coding tasks. Switch to -devel if agent-generated code needs to nvcc-compile
 # CUDA kernels itself; switch to -runtime if it links against cuDNN/cuBLAS without compiling.
-FROM nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04
 
 # Unlike Dockerfile.pytorch's base image, this one ships no dev toolchain at all -- not even
 # curl or git. Install exactly what's needed: curl (for the installers below),
@@ -35,5 +35,9 @@ RUN curl -fsSL https://opencode.ai/install | bash && \
 # Deliberately targeted, not a blanket `chmod -R o+rX /root`: only opens traversal on /root
 # itself plus read+execute on the two install trees these symlinks actually point into.
 RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
+
+# OpenAI's Codex CLI, from npm (a global install lands in /usr/lib/node_modules and /usr/bin,
+# readable by every user, so --keep-id needs nothing extra).
+RUN npm install -g @openai/codex && codex --version
 
 WORKDIR /work

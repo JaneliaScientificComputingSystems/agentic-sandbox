@@ -748,6 +748,28 @@ with `--no-cache` so the installers fetched current CLIs: `claude --version` →
 `opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
 published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
 
+**Rebuilt 2026-11-19** (both images, `--no-cache`): Codex added (`npm install -g
+@openai/codex`, `codex-cli 0.171.0`), `claude --version` → `2.1.329`, `opencode --version` →
+`1.19.6`. `agentic-sandbox-lite` moved to `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04`.
+`agentic-sandbox-gpu` gained `ray[train,data]` 2.60.0, `tiktoken`, `scikit-image` and
+`pycocotools`; the base image's pip constraints kept its own PyTorch.
+
+The PyTorch base stays at 26.07. A build on `nvcr.io/nvidia/pytorch:26.11-py3` (PyTorch 2.15,
+CUDA 13.5, NCCL 2.32.6) worked but was slower in `test_torchrun_ibstress.py` under
+`podman-run.sh --gpu --ib --job-nodes`, same wrapper and settings:
+
+| Nodes | 26.07 (NCCL 2.30.7) | 26.11 (NCCL 2.32.6) |
+| --- | --- | --- |
+| 2 x H200, 16 GPUs, sustained 60 s | 482.0 GB/s (twice) | 462.4 GB/s |
+| 4 x H100, 32 GPUs, sustained 60 s | 379.4 GB/s | 361.7 GB/s |
+
+The cause was not looked for. Both images print `NCCL WARN Call to ibv_query_port_speed failed`,
+so that warning is not it.
+
+Verified with the published `latest` candidates before the tag moved: `tests/test-podman.sh`
+(`SKIP_LLM=1`) 46 passed, 0 failed, 3 skipped (jobs 155646684 for the lite image, 155646967 for
+both); Ray Train CIFAR-10 on two H200 nodes under `--job-nodes --ib`, 71.94% (job 155646968).
+
 ### bwrap `--gpu` (2026-11-03)
 
 Recipe taken from `AFzoo/scripts/env/bwrap-gpu.sh` (which runs `bwrap --bind / /`), reimplemented against
@@ -1136,6 +1158,14 @@ needs the internet) and fixed ports inside the block.
 | H200, 2 nodes, 16 GPUs, `--gpu --ib --job-nodes`, bandwidth at 4 GB messages (job 155645990) | 483.61 GB/s; sustained 60 s: 481.97 GB/s; `NET/IB`; login node unreachable from inside |
 | CPU, 2 nodes, `tests/test-multinode.sh` with `SANDBOX_WRAPPER=podman-run.sh` (job 155645987) | 24 checks pass |
 | `tests/test-podman.sh` with `SKIP_LLM=1` on an H200 node, after the change (job 155646437) | 46 passed, 0 failed, 3 skipped |
+| Ray Train, CIFAR-10, 10 epochs, 2 H200 nodes, `--gpu --ib --job-nodes --shm-size 64g` (job 155646968) | pass: both nodes joined, 71.94% test accuracy |
+| H100, 4 nodes, 32 GPUs, sustained 60 s: unsandboxed 378.1 GB/s (job 155646822) | Bubblewrap 377.6 GB/s (155646823); podman 379.4 GB/s (155646969); all four nodes inside, login node unreachable from each |
+
+**Image pull and start-up skew (podman).** A second H200 run failed with
+`RendezvousTimeoutError` (job 155646702): one node had the image and started its worker at once,
+the other spent two minutes pulling, and the first gave up after 100 s. Not a network fault. A
+launcher should pull on every node first; the Ray launcher used here survives it because its
+workers retry for ten minutes.
 
 The H200 run printed `NCCL WARN Call to ibv_query_port_speed failed with error Protocol not
 supported` 128 times and ran at full speed. The Bubblewrap runs, with NCCL 2.27.3 from a venv,
@@ -1147,7 +1177,7 @@ services and its abstract Unix sockets are not reachable from a private network 
 
 **Open.**
 
-- More than two nodes; B300, H100, A100 and RTX 6000 nodes; a node shared with other jobs.
+- More than four nodes; B300, A100 and RTX 6000 nodes; a node shared with other jobs.
 - `pasta` on every node type (present on the H200, L4 and CPU nodes used).
 - pasta was not tuned. It is single-threaded and copies in user space, so the Ethernet figure may
   improve but will not reach the node's own speed.

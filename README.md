@@ -308,8 +308,8 @@ Neither is required; `--image` takes any OCI image. A csub policy decides which 
 
 | Image | Base | Contents | Size | Use when |
 | --- | --- | --- | --- | --- |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, `git`, `rsync`, `python3` | 1.24 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, plus the same CLIs | several GB | real ML work, native extensions, "set up a venv and pip install" tasks |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, Codex, `git`, `rsync`, `python3` | about 2 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, NCCL 2.30, Ray 2.60 (Train and Data), `libibverbs` for `--ib`, `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, plus the same CLIs | 26 GB | real ML work, native extensions, "set up a venv and pip install" tasks |
 
 `podman-run.sh` checks for a newer image on every run (a digest check; a download only if it changed).
 `--allow` needs `bash` and `python3` in the image for the in-container relay; a minimal image such as
@@ -432,6 +432,10 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   command runs without the capability to change them. `--job-nodes` refuses `--keep-id`, where
   podman sets the network up too late for the hook. podman passes no host environment in, so the
   worker script sets what it needs itself.
+- **Pull the image on every node first.** Each node keeps its own image store, and the 26 GB
+  image takes about two minutes to pull. When one node has it and another does not, the first
+  worker gives up waiting for the second (`torchrun`: `RendezvousTimeoutError`). A launcher
+  should run `podman pull` on every node with `blaunch` and wait, then start the workers.
 - **Ports.** Other nodes of the job can connect to a block of 5000 ports (10000-14999 on our
   nodes; a second sandbox on the same node gets 5000-9999). A listener that lets the system pick
   its port, which is what `torchrun` workers, NCCL and most of Ray do, gets one from the top 1000
@@ -453,8 +457,9 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   and the ports, or says that the network is the node's own.
 
 Measured, with the evidence in `ADMIN-NOTES.md`, "Multi-node jobs": two H200 nodes, 16 GPUs,
-482 GB/s sustained inside `--job-nodes --ib` against 483 GB/s unsandboxed; two L4 nodes, 6.3 GB/s
-inside `--host-net` against 6.4 to 6.7 GB/s unsandboxed.
+482 GB/s sustained inside `--job-nodes --ib` against 483 GB/s unsandboxed, with either wrapper;
+four H100 nodes, 32 GPUs, 378 (Bubblewrap) and 379 GB/s (podman) against 378 unsandboxed; two L4
+nodes, 6.3 GB/s inside `--host-net` against 6.4 to 6.7 GB/s unsandboxed.
 
 ## What it does and does not protect against
 
@@ -610,8 +615,8 @@ Five suites in `tests/`:
 - `sandbox-run.sh` refuses to run from `$HOME` or a directory above it (the working directory is
   bound read-write). Run it from a project directory.
 - Multi-node workers: `podman-run.sh --job-nodes` does not work with `--keep-id`. `--job-nodes` is
-  too slow where the data travels over TCP (use `--host-net` there). Tested on two nodes, whole
-  nodes, H200 and L4; not on more nodes, on B300, H100, A100 or RTX 6000, or with other jobs
-  sharing the node. csub has no multi-node job type, so an agent cannot yet submit one.
+  too slow where the data travels over TCP (use `--host-net` there). Tested on whole nodes: two
+  H200, four H100, two L4; not on more than four nodes, on B300, A100 or RTX 6000, or with other
+  jobs sharing the node. `podman-run.sh --host-net` on an Ethernet queue is not measured yet. csub has no multi-node job type, so an agent cannot yet submit one.
 - Not tested: a fresh `claude auth login` combined with the one-shot or loop modes.
 
