@@ -304,6 +304,13 @@ if [[ $WANT_HOSTNET -eq 1 ]]; then
   [[ -z "$_why" ]] || { echo "sandbox-run.sh: --host-net: not with $_why" >&2; exit 1; }
   echo "sandbox-run.sh: --host-net: this sandbox shares the node's network; nothing limits where it connects" >&2
 fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
+  _why=""
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }
+fi
 if [[ $WANT_JOBNET -eq 0 && ( ${#LISTEN_PORTS[@]} -gt 0 || -n "$NET_IFNAME" ) ]]; then
   echo "sandbox-run.sh: --listen and --ifname need --job-nodes (or --peers)" >&2; exit 1
 fi

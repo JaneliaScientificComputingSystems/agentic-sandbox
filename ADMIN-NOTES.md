@@ -1161,6 +1161,15 @@ needs the internet) and fixed ports inside the block.
 | Ray Train, CIFAR-10, 10 epochs, 2 H200 nodes, `--gpu --ib --job-nodes --shm-size 64g` (job 155646968) | pass: both nodes joined, 71.94% test accuracy |
 | H100, 4 nodes, 32 GPUs, sustained 60 s: unsandboxed 378.1 GB/s (job 155646822) | Bubblewrap 377.6 GB/s (155646823); podman 379.4 GB/s (155646969); all four nodes inside, login node unreachable from each |
 
+**Two faults the suite found in `podman-run.sh` (fixed).** A command that ended within about a
+second made the wrapper return 1 instead of the command's status, two times in six: the catatonit
+watchdog had already exited, `kill` on it failed, and `set -e` ended the script. The fault was
+older than these flags and showed only now because `--job-nodes` waits for the hook before it
+starts the watchdog. And the port lock was inherited by `podman run` and the container, so a
+second sandbox on the node could wait until the first one ended; the lock's descriptor is now
+closed on the `podman run` line. `tests/test-multinode.sh` checks both (28 checks pass for
+podman, job 155647171; 29 for Bubblewrap, job 155647170).
+
 **Image pull and start-up skew (podman).** A second H200 run failed with
 `RendezvousTimeoutError` (job 155646702): one node had the image and started its worker at once,
 the other spent two minutes pulling, and the first gave up after 100 s. Not a network fault. A
@@ -1171,6 +1180,13 @@ The H200 run printed `NCCL WARN Call to ibv_query_port_speed failed with error P
 supported` 128 times and ran at full speed. The Bubblewrap runs, with NCCL 2.27.3 from a venv,
 did not print it. Probably the image's newer NCCL asking for something this kernel's driver
 does not offer; not confirmed with the same image outside the sandbox.
+
+**Connections from outside the job (job 155647057, three CPU nodes, both wrappers).** A listener
+in a `--peers` sandbox naming one of the other two nodes. The named node connects and its data
+arrives. The third node's `connect()` succeeds, because the node's kernel completes the handshake
+with pasta's listening socket, but the listener never accepts it and no data arrives: inside,
+the reply has no route. So an outsider can tell that a port is forwarded and hold a connection
+open at the relay, and nothing more.
 
 **What `--job-nodes` improves over `--host-net`, beyond other hosts.** The node's loopback
 services and its abstract Unix sockets are not reachable from a private network namespace.

@@ -79,6 +79,9 @@ echo "2. exit status, stdin and the description for the agent"
 echo "from stdin" | "$W" --job-nodes --listen 40123 -- bash -c 'read -r x; [[ "$x" == "from stdin" ]] || exit 3; grep -q "Only the other nodes of this job" "$SANDBOX_README" || exit 4; grep -q "and on 40123" "$SANDBOX_README" || exit 5; exit 7' 2>/dev/null
 [[ $? -eq 7 ]] && ok "exit status, stdin and \$SANDBOX_README" || bad "exit status, stdin or \$SANDBOX_README"
 
+rcs=""; for _ in 1 2 3 4 5 6; do "$W" --job-nodes -- bash -c 'exit 7' </dev/null >/dev/null 2>&1; rcs+="$? "; done
+[[ "$rcs" == "7 7 7 7 7 7 " ]] && ok "exit status of a very short command, six times" || bad "exit status of a very short command: $rcs"
+
 echo "3. refusals"
 refuses "--allow with --job-nodes" "not with --allow" --job-nodes --allow pypi.org -- true
 refuses "--csub with --job-nodes" "not with --csub" --job-nodes --csub -- true
@@ -95,14 +98,18 @@ fi
 refuses "--host-net with --job-nodes" "not with --job-nodes" --host-net --job-nodes -- true
 refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
 refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
+refuses "--ib with --claude" "--ib: not with --claude" --ib --claude -- true
+refuses "--ib with --csub" "--ib: not with --csub" --ib --csub -- true
 
 echo "4. the other two networks"
 "$W" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null" 2>/dev/null && bad "default sandbox: no network" || ok "default sandbox: no network"
 "$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
 
 echo "5. two sandboxes on one node take different blocks of ports"
-for t in A B; do "$W" --peers "$(hostname)" -- bash -c "sleep 8; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
+for t in A B; do "$W" --peers "$(hostname)" ${MNT[@]+"${MNT[@]}"} -- bash -c "date +%s > $TR/start.$t; sleep 25; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
 wait
+# Both must have been running at the same time: the second does not wait for the first to end.
+d=$(( $(cat start.A 2>/dev/null || echo 0) - $(cat start.B 2>/dev/null || echo 999) )); [[ ${d#-} -lt 20 ]] && ok "the two ran side by side (started ${d#-} s apart)" || bad "the second sandbox waited for the first (${d#-} s apart)"
 [[ $PODMAN -eq 1 ]] && : > block.A.err && : > block.B.err   # podman reports its image check on stderr
 [[ -s block.A && -s block.B && "$(cat block.A)" != "$(cat block.B)" && ! -s block.A.err && ! -s block.B.err ]] \
   && ok "different blocks, no complaints from pasta ($(cat block.A | tr -d '\n'); $(cat block.B | tr -d '\n'))" || bad "port blocks: A='$(cat block.A)' B='$(cat block.B)' $(head -2 block.A.err block.B.err)"

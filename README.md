@@ -452,7 +452,10 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   Under podman the image must bring the user-space side (`libibverbs` and the mlx5 provider);
   `agentic-sandbox-gpu` does.
 - **Refused together.** `--job-nodes` and `--host-net` each refuse `--allow`, `--csub`, `--claude`
-  and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network.
+  and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network. `--ib`
+  refuses `--csub`, `--claude` and `--opencode` for the same reason.
+- **Connections in.** A host outside the job can open a TCP connection to the relay's ports, but
+  nothing it sends reaches the sandboxed program, and the program never sees the connection.
 - **What it tells the agent.** `$SANDBOX_README` lists the reachable nodes, this node's address
   and the ports, or says that the network is the node's own.
 

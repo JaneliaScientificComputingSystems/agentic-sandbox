@@ -18,6 +18,9 @@ the evidence behind each.
   `--ib` the image must contain `libibverbs` and the mlx5 provider. New file:
   `scripts/jobnet-hook.sh`, which must stay next to `podman-run.sh`.
 - **`tests/test-multinode.sh`** tests them as a two-node LSF job, for either wrapper.
+- **`podman-run.sh` fix:** a command that ended within about a second could make the wrapper
+  return 1 instead of the command's own exit status.
+- **`--ib`** refuses `--csub`, `--claude` and `--opencode` in both wrappers.
 - **Images rebuilt.** Both now contain OpenAI's Codex CLI and current Claude Code and opencode.
   `agentic-sandbox-gpu` adds Ray 2.60 (Train and Data), `tiktoken`, `scikit-image` and
   `pycocotools`, and stays on NVIDIA's PyTorch 26.07 base: 26.11 was built and measured 4 to 8%

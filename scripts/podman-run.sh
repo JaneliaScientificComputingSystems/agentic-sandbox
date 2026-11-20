@@ -256,6 +256,13 @@ if [[ $WANT_HOSTNET -eq 1 ]]; then
   [[ -z "$_why" ]] || { echo "podman-run.sh: --host-net: not with $_why" >&2; exit 1; }
   echo "podman-run.sh: --host-net: this container shares the node's network; nothing limits where it connects" >&2
 fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
+  _why=""
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "podman-run.sh: --ib: not with $_why" >&2; exit 1; }
+fi
 if [[ $WANT_JOBNET -eq 0 && ( ${#LISTEN_PORTS[@]} -gt 0 || -n "$NET_IFNAME" ) ]]; then
   echo "podman-run.sh: --listen and --ifname need --job-nodes (or --peers)" >&2; exit 1
 fi
@@ -1043,10 +1050,14 @@ PY
 # One sandbox at a time on this node does this and lets pasta bind: two that look at the same
 # instant would each get part of the same block. The lock is held from here until the hook has
 # run (pasta is listening by then) or podman has given up, never across the container's command.
-JOBNET_LOCKFD=""
+# File descriptor 9, closed again on the `podman run` line: a lock inherited by podman and the
+# container would stay held until the container ended, and a second sandbox on the node would
+# wait that long.
+JOBNET_LOCKED=0
 if [[ $WANT_JOBNET -eq 1 ]]; then
-  exec {JOBNET_LOCKFD}> "$SANDBOX_STATE_PARENT/net.lock"
-  flock "$JOBNET_LOCKFD"
+  exec 9> "$SANDBOX_STATE_PARENT/net.lock"
+  flock 9
+  JOBNET_LOCKED=1
   # Ports other nodes may connect to: a block of 5000 below the node's own range for outgoing
   # connections, so that nothing on the node hands one out by chance. Ports already listening
   # on the node are left out. A block that is mostly taken belongs to another sandbox on this
@@ -1109,15 +1120,15 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
-  podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
+  podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 9>&- &
 fi
 PODMAN_PID=$!
-if [[ -n "$JOBNET_LOCKFD" ]]; then
+if [[ $JOBNET_LOCKED -eq 1 ]]; then
   for ((_w = 0; _w < 1200; _w++)); do
     [[ -e "$JOB_DIR/net.starting" ]] && kill -0 "$PODMAN_PID" 2>/dev/null || break
     sleep 0.1
   done
-  exec {JOBNET_LOCKFD}>&-
+  exec 9>&-
   if [[ -e "$JOB_DIR/net.starting" && -s "$JOB_DIR/hook.log" ]]; then
     sed 's/^/podman-run.sh: --job-nodes: /' "$JOB_DIR/hook.log" >&2
   fi
@@ -1142,6 +1153,9 @@ WATCHDOG_PID=$!
 
 EXIT_CODE=0
 wait "$PODMAN_PID" || EXIT_CODE=$?
-kill "$WATCHDOG_PID" 2>/dev/null
+# `|| true`: the watchdog has already gone when podman finished before it first looked (a very
+# short command), and under `set -e` a failed kill would end the script here with status 1
+# instead of the command's own.
+kill "$WATCHDOG_PID" 2>/dev/null || true
 wait "$WATCHDOG_PID" 2>/dev/null || true
 exit "$EXIT_CODE"
