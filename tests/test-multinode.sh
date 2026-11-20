@@ -106,6 +106,8 @@ refuses "--ib with --csub" "--ib: not with --csub" --ib --csub -- true
 echo "4. the other two networks"
 "$W" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null" 2>/dev/null && bad "default sandbox: no network" || ok "default sandbox: no network"
 "$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
+# torchrun gives the other nodes the name this node's address reverse-resolves to.
+"$W" --host-net -- python3 -c 'import socket, sys; n = socket.getfqdn(); sys.exit(0 if "containers.internal" not in n and socket.gethostbyname(n) != "127.0.0.1" else 1)' 2>/dev/null && ok "--host-net: the node's own name resolves as on the node" || bad "--host-net: the node's name inside is not the node's"
 
 echo "5. two sandboxes on one node take different blocks of ports"
 for t in A B; do "$W" --peers "$(hostname)" ${MNT[@]+"${MNT[@]}"} -- bash -c "date +%s > $TR/start.$t; sleep 25; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
@@ -115,6 +117,8 @@ d=$(( $(cat start.A 2>/dev/null || echo 0) - $(cat start.B 2>/dev/null || echo 9
 [[ $PODMAN -eq 1 ]] && : > block.A.err && : > block.B.err   # podman reports its image check on stderr
 [[ -s block.A && -s block.B && "$(cat block.A)" != "$(cat block.B)" && ! -s block.A.err && ! -s block.B.err ]] \
   && ok "different blocks, no complaints from pasta ($(cat block.A | tr -d '\n'); $(cat block.B | tr -d '\n'))" || bad "port blocks: A='$(cat block.A)' B='$(cat block.B)' $(head -2 block.A.err block.B.err)"
+
+r="$(grep -o '[0-9]*-[0-9]*' block.A 2>/dev/null | head -1)"; [[ -n "$r" && $(( ${r#*-} - ${r%-*} )) -eq 1999 && ${r%-*} -ge 5000 ]] && ok "a block is 2000 ports, not below 5000 ($r)" || bad "block size: '$r'"
 
 echo "6. stopping"
 "$W" --job-nodes -- sleep 3221 2>/dev/null & P=$!

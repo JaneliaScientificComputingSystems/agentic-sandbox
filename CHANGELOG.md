@@ -3,6 +3,19 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-20
+
+- **`--job-nodes` / `--peers`: the port block is 2000 ports, not 5000**, in both wrappers:
+  13000-14999 on our nodes, and five such sandboxes fit on a node where two did. Ports the
+  system picks come from the top 1500 of the block (it was 1000). A program with fixed ports
+  must now take them from the lowest 500 of its block, which `$SANDBOX_README` names; anything
+  that hard-coded 10000-13999 must change (the Ray launcher in `gpu-cluster-recipes` did).
+- **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
+  own sandbox, for either wrapper.
+- **`podman-run.sh --host-net` fix:** the node's own `/etc/hosts` is used inside. With podman's
+  file the node's name resolved to `host.containers.internal`, which `torchrun` passed to the
+  other nodes as the master's address, and a two-node Ethernet job hung until it timed out.
+
 ## 2026-11-19
 
 - **`sandbox-run.sh --job-nodes`** (with `--peers`, `--listen`): one sandbox per node

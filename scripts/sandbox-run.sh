@@ -102,12 +102,14 @@
 # to anything else fails at once with "network unreachable". The sandbox then runs in a nested
 # user namespace, which holds no capability over the network namespace: the sandboxed process
 # cannot add a route. /etc/hosts inside lists the job's nodes (there is no DNS).
-#   Ports: connections FROM the job's other nodes are accepted on ports 10000-14999 (lower if
-#   the node's own range for outgoing connections starts below 15000) and on each --listen PORT.
-#   A listener that lets the system pick its port (bind to port 0: torchrun workers, NCCL, most
-#   of Ray) gets one from the top 1000 of that range, so it is reachable without any flag. A
-#   program that wants fixed ports must take them from the rest of the range (Ray: its node
-#   manager, object manager, agent and worker ports). A port in use on the node is skipped.
+#   Ports: connections FROM the job's other nodes are accepted on a block of 2000 ports and on
+#   each --listen PORT. The block is 13000-14999 on a node whose own range for outgoing
+#   connections starts at 15000; each further sandbox of this kind on the node takes the next
+#   block down, to 5000, so five fit. $SANDBOX_README inside names the block. A listener that lets
+#   the system pick its port (bind to port 0: torchrun workers, NCCL, most of Ray) gets one
+#   from the top 1500 of the block, so it is reachable without any flag. A program that wants
+#   fixed ports must take them from the lower 500 (Ray: its node manager, object manager, agent
+#   and worker ports). A port in use on the node is skipped.
 #   Speed: only connections set up through TCP cross the relay. With --ib, NCCL's data goes
 #   over RDMA verbs directly (measured: no difference to an unsandboxed job on H200 nodes).
 #   Without InfiniBand the data itself crosses the relay, which is slower.
@@ -360,7 +362,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       # stage has started (or pasta has given up), never across the sandboxed command.
       exec {_lockfd}> "$_markdir/net.lock"
       flock "$_lockfd"
-      # Ports other nodes may connect to: a block of 5000 below the node's own range for outgoing
+      # Ports other nodes may connect to: a block of 2000 below the node's own range for outgoing
       # connections, so that nothing on the node hands one out by chance. Ports already listening
       # on the node are left out (pasta would report each one it cannot bind). A block that is
       # mostly taken belongs to another sandbox on this node, so the next block down is tried.
@@ -368,11 +370,11 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       _top=14999; [[ "$_elo" -le "$_top" ]] && _top=$((_elo - 1))
       _listening="$(ss -Htln 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | sort -un || true)"
       _lo="" _hi="" _busy=""
-      for ((_h = _top; _h - 4999 >= 1024; _h -= 5000)); do
-        _b="$(awk -v lo=$((_h - 4999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
-        if [[ "$(grep -c . <<< "$_b" || true)" -lt 2500 ]]; then _lo=$((_h - 4999)); _hi=$_h; _busy="$_b"; break; fi
+      for ((_h = _top; _h - 1999 >= 5000; _h -= 2000)); do
+        _b="$(awk -v lo=$((_h - 1999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
+        if [[ "$(grep -c . <<< "$_b" || true)" -lt 1000 ]]; then _lo=$((_h - 1999)); _hi=$_h; _busy="$_b"; break; fi
       done
-      [[ -n "$_lo" ]] || jobnet_die "no free block of 5000 ports below $((_top + 1)) on $(hostname) (other sandboxes on this node hold them)"
+      [[ -n "$_lo" ]] || jobnet_die "no free block of 2000 ports between 5000 and $_top on $(hostname): sandboxes with --job-nodes or --peers hold them all, possibly other users' (five fit on a node). Submit again, or to nodes the job has to itself."
       # Excludes only: pasta then forwards the rest best effort.
       _spec="~1-$((_lo - 1)),~$((_hi + 1))-65535"
       for port in $_busy; do _spec+=",~$port"; done
@@ -437,8 +439,8 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   # Exactly one route per other node, and nothing else: fail closed on anything unexpected.
   [[ "$("$IP_BIN" -4 route show | grep -c .)" == "$_n" && -z "$("$IP_BIN" -4 route show default)" ]] \
     || jobnet_die "the routing table is not what was set: $("$IP_BIN" -4 route show | tr '\n' ';')"
-  # Listeners that let the system pick a port get one from the top 1000 of the forwarded range.
-  echo "$(( ${SANDBOX_NET_PORTS#* } - 999 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
+  # Listeners that let the system pick a port get one from the top 1500 of the forwarded range.
+  echo "$(( ${SANDBOX_NET_PORTS#* } - 1499 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
     || jobnet_die "could not set the port range"
   # pasta names its namespace pasta-<host>; software that looks itself up needs the real name.
   hostname "$SANDBOX_NET_HOSTNAME" 2>/dev/null || true
@@ -1050,7 +1052,7 @@ write_sandbox_readme() {
       [[ -n "$SANDBOX_NET_PEERS" ]] || echo "  - (none: this job has one node)"
       echo "- This node's address is $SANDBOX_NET_MYIP, on interface $SANDBOX_NET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
       echo "- Everything else (other hosts, the internet, package registries) fails at once with 'network unreachable'. Do not retry or look for a route."
-      echo "- Other nodes can connect to this one on ports ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be inside that range."
+      echo "- Other nodes can connect to this one on ports ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be in the lowest 500 of that range; the system hands out the rest."
     elif [[ $WANT_HOSTNET -eq 1 ]]; then
       echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
       echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."

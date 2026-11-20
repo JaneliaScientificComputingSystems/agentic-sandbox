@@ -437,13 +437,15 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   image takes about two minutes to pull. When one node has it and another does not, the first
   worker gives up waiting for the second (`torchrun`: `RendezvousTimeoutError`). A launcher
   should run `podman pull` on every node with `blaunch` and wait, then start the workers.
-- **Ports.** Other nodes of the job can connect to a block of 5000 ports (10000-14999 on our
-  nodes; a second sandbox on the same node gets 5000-9999). A listener that lets the system pick
-  its port, which is what `torchrun` workers, NCCL and most of Ray do, gets one from the top 1000
-  of the block and needs no flag. A port the launcher picked on the node needs `--listen PORT`
-  (`torchrun`'s master port). A program that wants fixed ports must take them from the rest of
-  the block: for Ray, pass `--node-manager-port`, `--object-manager-port`, the agent ports and
-  `--min/--max-worker-port` inside it, and `--node-ip-address`.
+- **Ports.** Other nodes of the job can connect to a block of 2000 ports (13000-14999 on our
+  nodes). Each further sandbox of this kind on the same node takes the next block down, to
+  5000, so five fit on a node; a sixth is refused. A listener that lets the system pick its
+  port, which is what `torchrun` workers, NCCL and most of Ray do, gets one from the top 1500 of
+  the block and needs no flag. A port the launcher picked on the node needs `--listen PORT`
+  (`torchrun`'s master port). A program that wants fixed ports must take them from the lowest
+  500 of the block: for Ray, pass `--node-manager-port`, `--object-manager-port`, the agent
+  ports and `--min/--max-worker-port` inside it, and `--node-ip-address`. The block is named in
+  `$SANDBOX_README` inside the sandbox.
 - **Why `--host-net` exists.** Without InfiniBand, NCCL sends its data over TCP, through the
   relay. A bandwidth test on two L4 nodes ran about 40 times slower that way (0.15 GB/s against
   6 GB/s). `--host-net` gives full speed and no network limit. What the worker can send out is
@@ -553,6 +555,7 @@ Five suites in `tests/`:
 | `test-proxy.py` | the allowlist proxy | anywhere (`python3 tests/test-proxy.py`); also on every push (GitHub Actions) |
 | `test-csub-policy.sh` | `csub-policy.sh` | anywhere (`bash tests/test-csub-policy.sh`); also on every push. It uses a stand-in for csub's sample policy, so it covers the edits and the refusals, not csub's reading of the result |
 | `test-multinode.sh` | `--job-nodes`, `--peers`, `--listen`, `--host-net` | as the job script of a two-node LSF job, from a shared directory: `bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o out tests/test-multinode.sh`. No GPU needed; `--ib` is not covered. With `SANDBOX_WRAPPER=podman-run.sh` in the environment of the `bsub` command (and `-W 30`) the same checks run against `podman-run.sh` |
+| `test-array.sh` | many elements of one LSF array job on one node, each in its own sandbox | as the elements of an array job plus a check job, all on one node (the commands are in its header). No GPU needed. With `SANDBOX_WRAPPER=podman-run.sh` for podman |
 
 `ssh-entry.sh` has no suite: it needs sshd, a key line and LSF together, and has been tested by hand.
 

@@ -94,7 +94,7 @@
 # for the design and the measurements). The mechanism differs. With --job-nodes podman starts
 # pasta itself (--network=pasta) with this wrapper's options, handed over in a per-job
 # containers.conf: no UDP, no gateway mapping, and TCP forwarded from the node's own address on
-# one block of 5000 ports below the node's range for outgoing connections. An OCI hook
+# one block of 2000 ports below the node's range for outgoing connections. An OCI hook
 # (jobnet-hook.sh, next to this script) then runs on the node between network setup and the
 # container's command and replaces the routes inside with one host route per node of the job.
 # The command runs without CAP_NET_ADMIN, so it cannot put a route back. --keep-id is refused
@@ -643,7 +643,10 @@ PODMAN_ARGS=(--rm --log-driver=none)
 if [[ $WANT_HOSTNET -eq 1 ]]; then
   # The node's network namespace. podman then binds the node's /sys read-only, which is where
   # NCCL reads the network card's details (without them it runs about a quarter slower).
-  PODMAN_ARGS+=(--network=host)
+  # The node's own /etc/hosts, too: podman otherwise adds "host.containers.internal" for the
+  # node's address, the node's name then reverse-resolves to that, and torchrun hands that name
+  # to the other nodes as the master's, where it means themselves.
+  PODMAN_ARGS+=(--network=host --no-hosts -v /etc/hosts:/etc/hosts:ro)
 elif [[ $WANT_JOBNET -eq 1 ]]; then
   # pasta, with the options written to a per-job containers.conf just before the launch (the
   # forwarding option contains commas, which --network=pasta:opt,opt would split). The hook
@@ -976,7 +979,7 @@ write_sandbox_readme() {
       [[ -n "$JOBNET_PEERS" ]] || echo "  - (none: this job has one node)"
       echo "- This node's address is $JOBNET_MYIP, on interface $JOBNET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
       echo "- Everything else (other hosts, the internet, package registries) fails at once with 'network unreachable'. Do not retry or look for a route."
-      echo "- Other nodes can connect to this one on ports $JOBNET_LO-$JOBNET_HI${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be inside that range."
+      echo "- Other nodes can connect to this one on ports $JOBNET_LO-$JOBNET_HI${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be in the lowest 500 of that range; the system hands out the rest."
     elif [[ $WANT_HOSTNET -eq 1 ]]; then
       echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
       echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."
@@ -1062,7 +1065,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   exec 9> "$SANDBOX_STATE_PARENT/net.lock"
   flock 9
   JOBNET_LOCKED=1
-  # Ports other nodes may connect to: a block of 5000 below the node's own range for outgoing
+  # Ports other nodes may connect to: a block of 2000 below the node's own range for outgoing
   # connections, so that nothing on the node hands one out by chance. Ports already listening
   # on the node are left out. A block that is mostly taken belongs to another sandbox on this
   # node, so the next block down is tried. (Same choice as sandbox-run.sh, same lock file.)
@@ -1070,11 +1073,11 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   _top=14999; [[ "$_elo" -le "$_top" ]] && _top=$((_elo - 1))
   _listening="$(ss -Htln 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | sort -un || true)"
   JOBNET_LO="" JOBNET_HI="" _busy=""
-  for ((_h = _top; _h - 4999 >= 1024; _h -= 5000)); do
-    _b="$(awk -v lo=$((_h - 4999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
-    if [[ "$(grep -c . <<< "$_b" || true)" -lt 2500 ]]; then JOBNET_LO=$((_h - 4999)); JOBNET_HI=$_h; _busy="$_b"; break; fi
+  for ((_h = _top; _h - 1999 >= 5000; _h -= 2000)); do
+    _b="$(awk -v lo=$((_h - 1999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
+    if [[ "$(grep -c . <<< "$_b" || true)" -lt 1000 ]]; then JOBNET_LO=$((_h - 1999)); JOBNET_HI=$_h; _busy="$_b"; break; fi
   done
-  [[ -n "$JOBNET_LO" ]] || jobnet_die "no free block of 5000 ports below $((_top + 1)) on $(hostname) (other sandboxes on this node hold them)"
+  [[ -n "$JOBNET_LO" ]] || jobnet_die "no free block of 2000 ports between 5000 and $_top on $(hostname): sandboxes with --job-nodes or --peers hold them all, possibly other users' (five fit on a node). Submit again, or to nodes the job has to itself."
   # Excludes only: pasta then forwards the rest best effort.
   _spec="~1-$((JOBNET_LO - 1)),~$((JOBNET_HI + 1))-65535"
   for port in $_busy; do _spec+=",~$port"; done
@@ -1090,8 +1093,8 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   printf '{"version": "1.0.0", "hook": {"path": "%s", "args": [%s]}, "when": {"always": true}, "stages": ["createRuntime"]}\n' \
     "$SCRIPT_DIR/jobnet-hook.sh" "$_hargs" > "$JOB_DIR/hooks/jobnet.json"
   : > "$JOB_DIR/net.starting"
-  # A listener on port 0 gets a port other nodes can reach: the top 1000 of the block.
-  PODMAN_ARGS+=(--sysctl "net.ipv4.ip_local_port_range=$((JOBNET_HI - 999)) $JOBNET_HI")
+  # A listener on port 0 gets a port other nodes can reach: the top 1500 of the block.
+  PODMAN_ARGS+=(--sysctl "net.ipv4.ip_local_port_range=$((JOBNET_HI - 1499)) $JOBNET_HI")
   # On top of the user's and the system's containers.conf, for this wrapper's podman calls only.
   export CONTAINERS_CONF_OVERRIDE="$JOB_DIR/containers.conf"
 fi

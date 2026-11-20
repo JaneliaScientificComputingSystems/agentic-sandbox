@@ -1071,18 +1071,18 @@ its connections on InfiniBand and Ethernet alike, and on Ethernet it sends its d
 **`--job-nodes`: what happens.**
 
 1. *Outer stage.* Resolve this node's address and interface, and the other nodes from
-   `LSB_MCPU_HOSTS` (or `--peers`). Choose a block of 5000 ports below the node's range for
-   outgoing connections (`ip_local_port_range` is 15000-65000 on our nodes, so 10000-14999),
+   `LSB_MCPU_HOSTS` (or `--peers`). Choose a block of 2000 ports below the node's range for
+   outgoing connections (`ip_local_port_range` is 15000-65000 on our nodes, so 13000-14999),
    leaving out ports that already listen; a block that is mostly taken belongs to another sandbox
-   on the node, so the next one down is used. One sandbox at a time per node does this, under
-   `flock`. Then start `pasta --config-net -4 -i IF -I IF -t ADDR/~1-9999,~15000-65535[,~busy]
+   on the node, so the next one down is used, as far as 5000 (five blocks). One sandbox at a time per node does this, under
+   `flock`. Then start `pasta --config-net -4 -i IF -I IF -t ADDR/~1-12999,~15000-65535[,~busy]
    [-t ADDR/PORT per --listen] -u none -T none -U none --no-map-gw -- sandbox-run.sh <same args>`.
    The excludes-only form makes pasta forward the block best effort.
 2. *Inner stage*, as root of pasta's user and network namespace. It first proves where it is
    (`/proc/self/uid_map` maps uid 0 to the calling user, one id): `SANDBOX_NET_STAGE` is only an
    environment variable, and as real root the next step would flush the node's routes. Then it
    flushes the routes, adds one `/32` route per other node, checks that the table holds exactly
-   those, sets the namespace's `ip_local_port_range` to the top 1000 of the block, and puts the
+   those, sets the namespace's `ip_local_port_range` to the top 1500 of the block, and puts the
    node's hostname back (pasta names its namespace `pasta-<host>`).
 3. *The sandbox.* bwrap without `--unshare-net`, with `--unshare-user --uid --gid`: a nested user
    namespace, which has no capability over the network namespace. `/etc/hosts` is replaced by the
@@ -1092,6 +1092,12 @@ its connections on InfiniBand and Ethernet alike, and on Ethernet it sends its d
 
 - *Best-effort block, not a fixed range.* `-t ADDR/20000-29999` failed at start: the nodes hand
   out 15000-65000 for outgoing connections, and one port was taken.
+- *2000 ports, 500 fixed and 1500 picked by the system.* The block was 5000 at first, which
+  allowed two such sandboxes per node. Measured on two H200 nodes with the 5000 block (jobs
+  155650244 and 155650245, sampling `/proc/net/tcp` inside the sandbox every second):
+  `torchrun` with 8 ranks per node peaked at 34 listening ports and 456 ports from the range
+  the system picks from; Ray (CIFAR-10, 16 workers) at 201 listening ports, 102 of them fixed,
+  and 602 from that range. The range the system picks from was 1000 then and is 1500 now.
 - *The lock and the second block.* Two sandboxes starting on one node in the same instant each
   bound part of the same block, with thousands of `Address already in use` lines from pasta.
 - *Signals to the whole tree.* A `TERM` to the wrapper, passed to the inner stage only, did
@@ -1191,6 +1197,42 @@ open at the relay, and nothing more.
 **What `--job-nodes` improves over `--host-net`, beyond other hosts.** The node's loopback
 services and its abstract Unix sockets are not reachable from a private network namespace.
 
+**Ethernet with podman, and a fault in `--host-net` (20 November 2026).** Two L4 nodes, 16 GPUs,
+through the torchrun launcher of `gpu-cluster-recipes`, sustained 60 s: Bubblewrap 6.49 GB/s (job
+155647726), podman 6.32 GB/s (job 155647873). The first podman run hung for 24 minutes and failed
+(job 155647725): with `--network=host` podman still writes its own `/etc/hosts`, with
+`host.containers.internal` for the node's address. The node's name then reverse-resolves to that
+name, `torchrun` hands it to the other node as the master's address, and there it means the
+other node itself. `--host-net` now passes `--no-hosts` and binds the node's `/etc/hosts`.
+`--job-nodes` was never affected, because it brings its own hosts file. `tests/test-multinode.sh`
+checks that the node's name resolves inside as it does on the node.
+
+**The 2000-port block (20 November 2026).** Suites with the new block, submitted together so
+that three such sandboxes met on one node: Bubblewrap 33 passed (job 155650371), podman 32
+passed (job 155650372). Two H200 nodes through the torchrun launcher: Bubblewrap 482.0 GB/s (job
+155650373), podman 482.2 GB/s (job 155650375). Ray, CIFAR-10, two H200 nodes: passes with both
+(jobs 155650376, 155650377). Peak use of the 1500 ports the system picks from: Ray 689,
+`torchrun` about 490. One node through the launchers (no network in the sandbox): `torchrun`
+passes on two GPUs (job 155652038), Ray passes (job 155652036). Four H100 nodes and Ethernet were
+not rerun with the new block.
+
+**Array jobs (20 November 2026).** `tests/test-array.sh`: 20 elements of one LSF array on one
+node, each in its own sandbox, the odd ones with `--allow` and so a proxy each. All 20 were
+inside at the same moment; each had its own `/tmp` and README, each `--allow` element reached
+its host through its own proxy and nothing else, and no state directory, proxy or container was
+left. Bubblewrap 11 of 11 (array 155650538), podman 12 of 12 (array 155650539), the two arrays
+on the same node at the same time. Run against the wrappers as they were before the multi-node
+work, one podman element in 20 returned 1 although its command had finished (array 155651534);
+not diagnosed, and consistent with the exit-status fault described above.
+
+**What the cluster now enforces (20 November 2026).** The LSF submission check on our cluster
+accepts a multi-node GPU job only on a `*_parallel` queue, and only with every slot of its
+nodes (`-app parallel-N` or `span[ptile=N]`, slots a multiple of N). The ordinary GPU queues
+are one node per job. So a multi-node GPU sandbox always has its nodes to itself: no other
+job's process shares the node's loopback with a `--host-net` sandbox, and one port block per
+node is all that is ever taken. On queues without that rule, five `--job-nodes` sandboxes fit
+on a node and a `--host-net` sandbox shares the node's network with its neighbours.
+
 **Open.**
 
 - More than four nodes; B300, A100 and RTX 6000 nodes; a node shared with other jobs.
@@ -1199,9 +1241,8 @@ services and its abstract Unix sockets are not reachable from a private network 
   improve but will not reach the node's own speed.
 - A limit for Ethernet queues at full speed would need a filter on `connect` (seccomp user
   notification with a supervisor outside the sandbox). Not built.
-- `podman-run.sh --host-net` on an Ethernet queue: jobs queued, no result yet.
 - `podman-run.sh --job-nodes` with `--keep-id`.
-- csub has no multi-node job type.
+- csub has no multi-node job type, and could not submit arrays when last reviewed.
 - No adversarial review of the pasta path yet.
 
 ## An agent off the cluster: `ssh-entry.sh` — design and evidence
