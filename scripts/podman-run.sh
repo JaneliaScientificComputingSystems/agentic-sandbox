@@ -347,7 +347,10 @@ SHARED_PAUSE_PIDFILE="$SHARED_RUNTIME_DIR/libpod/tmp/pause.pid"
 remove_stale_shared_pause_pidfile() {
   local p
   [[ -f "$SHARED_PAUSE_PIDFILE" ]] || return 0
-  p="$(cat "$SHARED_PAUSE_PIDFILE" 2>/dev/null)"
+  # `|| return 0`: a sibling job on this node can remove the file between the test above and
+  # this read. Under `set -e` the failed read would end the script with status 1: at start,
+  # before the command ever ran, or in the exit trap, replacing the command's own status.
+  p="$(cat "$SHARED_PAUSE_PIDFILE" 2>/dev/null)" || return 0
   if [[ -n "$p" ]] && ! kill -0 "$p" 2>/dev/null; then
     rm -f "$SHARED_PAUSE_PIDFILE"
     echo "podman-run.sh: removed stale shared pause pid file ($SHARED_PAUSE_PIDFILE -> dead pid $p)" >&2

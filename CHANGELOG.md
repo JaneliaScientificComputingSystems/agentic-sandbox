@@ -7,6 +7,9 @@ the evidence behind each.
 
 - **`podman-run.sh` fix:** the wrapper could return 1 although the command inside had succeeded
   (about one run in twenty in an array of 20). It now returns the command's own exit status.
+- **`podman-run.sh` fix:** with several podman jobs of one user on a node, a job could return 1
+  without running its command, or return 1 after its command had succeeded (2 of 60 starts, ten
+  at a time). A sibling job removed a pid file between this script's test for it and its read.
 - **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
   own sandbox, for either wrapper. Arrays needed no other change.
 
