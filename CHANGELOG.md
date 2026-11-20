@@ -3,6 +3,13 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-20
+
+- **`podman-run.sh` fix:** the wrapper could return 1 although the command inside had succeeded
+  (about one run in twenty in an array of 20). It now returns the command's own exit status.
+- **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
+  own sandbox, for either wrapper. Arrays needed no other change.
+
 ## 2026-11-16
 
 - **`scripts/csub-policy.sh`** writes `~/.config/csub/broker.toml`, replacing the hand edits of
