@@ -326,6 +326,13 @@ echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/
    the second permission in the Claude Code settings lets it fetch that page without asking. Then
    start the agent in that directory, with `claude` or `codex`.
 
+   Claude Code: the first start in that directory must be the interactive one (`claude`, not
+   `claude -p "..."`), and you must accept its question whether you trust the folder. Until you
+   have, Claude Code ignores the two permissions above and says so ("Ignoring 2
+   permissions.allow entries from .claude/settings.json: this workspace has not been trusted"),
+   and a `claude -p` run cannot use `ssh janelia-agent`. Once is enough; after that `claude -p`
+   works there too.
+
    The instruction file applies only when the agent is started in that directory. There, the agent
    still runs the code it writes, but on the cluster: each test or script goes through `ssh
    janelia-agent` and runs as a sandboxed job in the project directory, which takes from a few
