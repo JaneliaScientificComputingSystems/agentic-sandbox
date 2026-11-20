@@ -944,6 +944,8 @@ WATCHDOG_PID=$!
 
 EXIT_CODE=0
 wait "$PODMAN_PID" || EXIT_CODE=$?
-kill "$WATCHDOG_PID" 2>/dev/null
+# `|| true`: the watchdog ends by itself once podman is gone, and it can get there first. Under
+# `set -e` a failed kill would end the script here with status 1 instead of the command's own.
+kill "$WATCHDOG_PID" 2>/dev/null || true
 wait "$WATCHDOG_PID" 2>/dev/null || true
 exit "$EXIT_CODE"
