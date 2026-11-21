@@ -1,9 +1,9 @@
 # One-time setup
 
-Everything here is per account and done once. None of it runs on a login node, except the one file
-edit in §8 step 4: start an
-interactive job first (`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only) and do
-the setup there. The README assumes
+Everything here is per account and done once. Do it inside an interactive job
+(`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only), not on a login node.
+The exceptions are all in §8, where a login node only passes things on: the key is copied to it,
+one line is added to `~/.ssh/authorized_keys`, and the agent's ssh commands arrive there. The README assumes
 all of this is in place.
 
 ## 1. Get the wrappers
@@ -234,8 +234,10 @@ Note that csub policies cannot use `localhost/` images (they are not visible on 
 
 Skip this unless the agent runs on your laptop and should do its work on the cluster. The README's
 section "An agent on your laptop" says what this gives you. You need §1 and §6: the key line in step 4 uses
-`--csub`, and the instruction file in step 6 tells the agent to submit its jobs through csub. `LAPTOP` steps run in a terminal on the laptop, `CLUSTER` steps
-on the cluster as yourself.
+`--csub`, and the instruction file in step 6 tells the agent to submit its jobs through csub. To run the
+commands in a container image you also need §3: write the policy in step 1 with `--podman` in place
+of `--bwrap`, and add `--podman` to `OPTS` in step 4. `LAPTOP` steps run in a terminal on the laptop,
+`CLUSTER` steps on the cluster as yourself.
 
 1. `CLUSTER`, inside an interactive job: make the project directory, outside your home directory, and
    write the csub policy for it.
@@ -243,12 +245,11 @@ on the cluster as yourself.
 ```bash
 PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
 mkdir -p "$PROJECT"
-"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT
+"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT --replace   # plus every option you gave in §6
 ```
 
-   If you already wrote a policy in §6, this stops with `... exists; add --replace to overwrite it`.
-   The script writes the whole policy each time, so give it everything again: the options you used
-   in §6, plus `--rw $PROJECT`, plus `--replace`.
+   This replaces the policy from §6. The script writes the whole file each time, so repeat the
+   options you used there (`--rw`, `--ro`, `--allow`, limits) on this command line.
 
 2. `LAPTOP`: make a key for the agent only. It has no passphrase, because the agent must use it
    unattended; the key line in step 4 is what limits it.
@@ -293,7 +294,7 @@ command rm ~/agent_cluster.pub
 ```
 
    To let the agent reach a host or read another directory, put `--allow HOST` or `--ro DIR` after
-   `--csub`, and give the same options to `csub-policy.sh` with `--replace`. Both places are needed.
+   `--csub` (for `pip install`, `--allow pypi.org --allow files.pythonhosted.org`), and give the same options to `csub-policy.sh` with `--replace`. Both places are needed.
    Before the first run, set them in `OPTS`. Later, edit the existing line in
    `~/.ssh/authorized_keys`: running the block again would append a second line for the same key.
    For podman, add `--podman` before `--queue` and write the policy with `--podman`.
@@ -301,7 +302,7 @@ command rm ~/agent_cluster.pub
 5. `LAPTOP`: test by hand. Each command is a cluster job, so each takes up to a minute to start.
 
 ```bash
-ssh janelia-agent 'hostname; pwd'              # a compute node, then your project directory
+ssh janelia-agent 'hostname; pwd'              # a compute node (with --podman, a container id), then your project directory
 ssh janelia-agent 'ls ~/.ssh'                  # No such file or directory
 ssh janelia-agent 'bsub -V'                    # command not found
 ssh janelia-agent 'head -22 $SANDBOX_README'   # what the sandbox tells the agent

@@ -4,6 +4,9 @@
 # just a coding-agent GPU sandbox. Pushed as agentic-sandbox-gpu on GHCR (the original name,
 # kept as-is); the new default (lighter, no ML framework stack) is agentic-sandbox-lite,
 # built from ./Dockerfile.
+# 26.07, not the newest: 26.11 (PyTorch 2.15, NCCL 2.32.6) was built and measured on 2026-11-19
+# and ran the cross-node all-reduce benchmark 4% slower on two H200 nodes (462 against 482 GB/s)
+# and 8% slower on four H100 nodes (348 against 378). See ADMIN-NOTES.md, "The GHCR images".
 FROM nvcr.io/nvidia/pytorch:26.07-py3
 
 # Node.js for the CLIs (the base image doesn't ship it), plus rsync -- the one common dev
@@ -27,5 +30,39 @@ RUN curl -fsSL https://opencode.ai/install | bash && \
 # on /root plus read+execute on the two install trees only -- not a blanket loosening of /root.
 # Without this, --keep-id with --claude/--opencode worked on the lite image but not on this one.
 RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
+
+# Ray Train and Ray Data, for multi-node jobs, with the few extras
+# the gpu-cluster-recipes Ray examples import. The base image pins its own PyTorch through pip's
+# constraint file, so this adds packages and does not replace torch.
+RUN pip install --no-cache-dir "ray[train,data]" tiktoken scikit-image pycocotools
+
+# OpenAI's Codex CLI, from npm (a global install lands in /usr/lib/node_modules and /usr/bin,
+# readable by every user, so --keep-id needs nothing extra).
+RUN npm install -g @openai/codex && codex --version
+
+# The server half of sftp, which is what `scp` and `sftp` from a laptop talk to when the agent
+# works through ssh-entry.sh --podman. It runs inside the sandbox like every other command; no
+# daemon comes with it (the ssh client was already in the base image). The cluster's sshd asks for it at the RHEL path, so that path is linked
+# to Ubuntu's. (pip and venv are already in the base image.)
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-sftp-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /usr/libexec/openssh && \
+    ln -s /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server
+
+# NVIDIA's entrypoint prints a banner, licence text and driver checks on STDOUT before every
+# command. That puts some thirty lines in front of each command's own output and corrupts
+# anything that speaks a protocol over stdout: scp and sftp through ssh-entry.sh failed on it.
+# This wrapper runs NVIDIA's entrypoint unchanged, with its output on stderr, and hands stdout
+# back to the command.
+RUN printf '%s\n' \
+      '#!/bin/bash' \
+      'if [[ "${1:-}" == --restore-stdout ]]; then' \
+      '  shift; exec 1>&3 3>&-' \
+      '  if [[ $# -eq 0 ]]; then exec /bin/bash; else exec "$@"; fi' \
+      'fi' \
+      'exec 3>&1 1>&2' \
+      'exec /opt/nvidia/nvidia_entrypoint.sh "$0" --restore-stdout "$@"' \
+      > /usr/local/bin/quiet-entrypoint && chmod 755 /usr/local/bin/quiet-entrypoint
+ENTRYPOINT ["/usr/local/bin/quiet-entrypoint"]
 
 WORKDIR /work

@@ -8,7 +8,7 @@
 # nvidia-smi/the CUDA runtime API to work -- enough to prove GPU passthrough works and for
 # most agent coding tasks. Switch to -devel if agent-generated code needs to nvcc-compile
 # CUDA kernels itself; switch to -runtime if it links against cuDNN/cuBLAS without compiling.
-FROM nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04
 
 # Unlike Dockerfile.pytorch's base image, this one ships no dev toolchain at all -- not even
 # curl or git. Install exactly what's needed: curl (for the installers below),
@@ -35,5 +35,23 @@ RUN curl -fsSL https://opencode.ai/install | bash && \
 # Deliberately targeted, not a blanket `chmod -R o+rX /root`: only opens traversal on /root
 # itself plus read+execute on the two install trees these symlinks actually point into.
 RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
+
+# OpenAI's Codex CLI, from npm (a global install lands in /usr/lib/node_modules and /usr/bin,
+# readable by every user, so --keep-id needs nothing extra).
+RUN npm install -g @openai/codex && codex --version
+
+# What an agent that reaches this container through ssh-entry.sh --podman needs, so that it can do
+# here what it can do in the Bubblewrap sandbox:
+#  - pip and venv, to install Python packages into a venv in the project directory (the base
+#    image has python3 but neither);
+#  - the server half of sftp, which is what `scp` and `sftp` from the laptop talk to. It runs
+#    inside the sandbox like every other command. Ubuntu's package brings the ssh client with
+#    it as a dependency; no daemon comes with it. The cluster's sshd asks for the server at
+#    the RHEL path, so that path is linked to Ubuntu's.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip python3-venv openssh-sftp-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /usr/libexec/openssh && \
+    ln -s /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server
 
 WORKDIR /work

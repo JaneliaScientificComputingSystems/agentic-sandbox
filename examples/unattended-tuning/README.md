@@ -35,8 +35,8 @@ Metric: mean per-image F1 at IoU 0.5. The gain holds on the hidden set. The agen
 | 4 | dilated boundary targets | 0.862 |
 
 It kept trial 1, wrote its summary and stopped after 4 of 6 trials and 29 of 40 minutes, saying a fifth job
-would run past the limit with no time to finalise. (Its own `notes.md` and `FINAL.md` say it "stopped at the
-40-minute limit"; the transcript shows about 29 minutes used.) Two honest caveats: the one big gain came in trial 1, and
+would run past the limit with no time to finalise. (Its own `FINAL.md` says it "stopped at the
+40-minute limit" and `notes.md` says the same in other words; the transcript shows about 29 minutes used.) Two honest caveats: the one big gain came in trial 1, and
 trials 2 to 4 were judged on single-seed differences of 0.01 to 0.02, which is the size of the seed noise
 (the standard deviation across seeds of the same code is about 0.02). The iteration here is mostly "one good
 design, then variations that did not clearly help".

@@ -10,10 +10,10 @@
 #
 # Options:
 #   --image NAME    Image to run (default: agentic-sandbox-lite, the lightweight pre-built
-#                    image on GHCR -- pulled and kept current by this script, or build your own locally with
-#                    `podman build -t agentic-sandbox-lite:latest .` in this directory and
+#                    image on GHCR -- pulled and kept current by this script, or build your own
+#                    with `podman build -t agentic-sandbox-lite:latest .` in ../podman and
 #                    pass `--image localhost/agentic-sandbox-lite:latest`. For a heavier
-#                    image with PyTorch/cuDNN preinstalled, build ./Dockerfile.pytorch
+#                    image with PyTorch/cuDNN preinstalled, build Dockerfile.pytorch there
 #                    instead, or pass `--image ghcr.io/janeliascientificcomputingsystems/
 #                    agentic-sandbox-gpu:latest`)
 #   --ro PATH       Read-only bind (repeatable): -v PATH:PATH:ro
@@ -70,8 +70,8 @@
 #                    (width > your real gid, not just "a range") if you hit this.
 #   -h, --help      Show help
 #
-# As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro if you need your
-# real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
+# As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro on the subdirectory
+# of it that you need. UNLIKE sandbox-run.sh, there is no credential-path masking
 # here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
 # covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
 # PODMAN_ARGS below for the full story). So --rw/--ro on a path that IS or CONTAINS

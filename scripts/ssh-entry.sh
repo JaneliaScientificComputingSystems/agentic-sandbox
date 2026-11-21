@@ -59,7 +59,7 @@ if [[ $INNER -eq 1 ]]; then
   CMD="${AGENT_SSH_COMMAND:-}"
   # BSUB_QUIET was for the login-node bsub only: left set, it silences the "Job <n> is submitted"
   # line that csub's broker reads the job id from.
-  unset AGENT_SSH_COMMAND BSUB_QUIET
+  unset AGENT_SSH_COMMAND BSUB_QUIET LSF_INTERACTIVE_STDERR
   if [[ $PODMAN -eq 1 ]]; then
     # podman-run.sh binds nothing by default and starts in the image's own directory: bind
     # the project and enter it before running the command.
@@ -98,7 +98,16 @@ export BSUB_QUIET=1   # no "Job <n> is submitted" / "<<Waiting for dispatch>>" l
 BSUB=(bsub -n "$SLOTS" -W "$WALLTIME" -J agent-ssh)
 [[ -n "$QUEUE" ]] && BSUB+=(-q "$QUEUE")
 # A pty only for an interactive login with a terminal; commands get plain pipes.
-if [[ -z "$AGENT_SSH_COMMAND" && -t 0 ]]; then BSUB+=(-Is); else BSUB+=(-I); fi
+if [[ -z "$AGENT_SSH_COMMAND" && -t 0 ]]; then
+  BSUB+=(-Is)
+else
+  BSUB+=(-I)
+  # Without this, LSF sends an interactive job's stderr back on stdout. Everything the wrapper or
+  # the command writes to stderr (podman's "Trying to pull ...", a warning) then lands in the
+  # command's output, and in a file transfer it corrupts the stream: scp and sftp under --podman
+  # failed with "Received message too long". With it, stdout and stderr come back separately.
+  export LSF_INTERACTIVE_STDERR=y
+fi
 
 INNER_ARGV=("$SCRIPT_DIR/ssh-entry.sh" --inner --project "$PROJECT")
 [[ $PODMAN -eq 1 ]] && INNER_ARGV+=(--podman)

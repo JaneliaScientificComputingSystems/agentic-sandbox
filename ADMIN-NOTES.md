@@ -4,8 +4,9 @@ This is the "why," not the "how to use" — full test evidence, exact error text
 that was ruled out along the way, and the design rationale behind every choice in the main
 README. If you just want to *use* this repo, you don't need this file; see `README.md`.
 
-Sections are grouped by topic, not by date. Each carries its own dates, and an entry describes the
-state on its date, which later entries and `CHANGELOG.md` may have changed.
+Sections are grouped by topic, not by date. Most carry dates, and an entry describes the state when
+it was written, which later entries and `CHANGELOG.md` may have changed. Where an undated passage has
+been overtaken, a "Superseded" note in front of it says so.
 
 ## How bwrap actually works, mechanically
 
@@ -50,12 +51,18 @@ bwrap \
   with the user's normal ownership — not a sandbox-local illusion.
 
 `--dev /dev` gives a fresh, minimal `/dev`, not a bind of the host's — confirmed GPU devices
-are absent unless explicitly `--dev-bind`ed (moot now that GPU work goes through Podman).
+are absent unless explicitly `--dev-bind`ed (at the time GPU work went through podman only; `sandbox-run.sh --gpu` now binds them, see "bwrap `--gpu`").
 
 ### The $HOME-to-$PWD default change, and why
 
+> **Superseded in part.** Two things below no longer hold. Starting `sandbox-run.sh` from `$HOME`, or
+> from a directory above it, is now refused, so the `$PWD == $HOME` case described here cannot
+> occur. And a `$HOME` that is not bound gets no masks, so no empty `.ssh` or `.config/gcloud`
+> placeholders appear in it. See "Review follow-ups: masks, bind order, podman refusals, `/dev/shm`
+> (2026-11-09/10)" and README's troubleshooting.
+
 `sandbox-run.sh` used to always read-only-bind all of `$HOME`, with a denylist of known
-credential paths masked on top (see the credential-masking section above). Prompted by the
+credential paths masked on top (see the masking block in `sandbox-run.sh`). Prompted by the
 same session that found podman's masking equivalent doesn't actually work (see "The
 credential-masking attempt that didn't work" below): even where masking *does* work (bwrap),
 a denylist is still a standing liability — it protects against the specific paths we thought
@@ -205,6 +212,10 @@ observe/inject input across separate tool calls — a real human wouldn't need t
 - `opencode` (interactive TUI) also verified live — see the "Forbidden" gotcha below.
 
 ## Authenticating Claude Code — the rigorous login test
+
+> **Superseded in part.** This test was done when `~/.claude` was bound read-write. Today `--claude`
+> works on a per-job copy and binds only `~/.claude/.credentials.json`, and only if that file exists
+> at start, so a first login done inside the sandbox persists only in that case (README, Harnesses).
 
 Fresh `claude auth login` done entirely inside the sandbox was verified with real rigor, not
 just "seems like it should work":
@@ -525,7 +536,7 @@ node: `additionalimagestores` in the per-job `storage.conf` points at the
 shared one from the user's `storage.conf` as a **read-only** layer source, so the multi-GB image stays
 cached there — only each job's own writable container-layer state (locks, per-container
 metadata) is isolated. This benefit is node-scoped, not cluster-scoped: `storage.conf`'s
-`graphroot`/`runroot` point at `/scratch/$USER`, which per the README's one-time setup is
+`graphroot`/`runroot` point at `/scratch/$USER`, which per `SETUP.md` §3 is
 transient, node-local scratch, cleaned up on its own regular cycle — not an NFS-shared cache
 other nodes can see. A job landing on a different node, or one that lands after a cleanup
 sweep, still pays a fresh multi-GB pull regardless of this mechanism.
@@ -713,6 +724,18 @@ for the same account — both drive opencode against the same `~/.local/share/op
 `UnknownError`. Run them sequentially.
 
 ### The GHCR images
+
+> **Current state (2026-11-21).** Both images were rebuilt on 2026-11-19 (Codex added, the default
+> image moved to `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04`, the GPU image gained Ray 2.60 with
+> Train and Data, `tiktoken`, `scikit-image` and `pycocotools`) and again on 2026-11-21, when one
+> layer was added on top of the same cached layers: `openssh-sftp-server` in both, `python3-pip`
+> and `python3-venv` in the default image, and in the GPU image an entrypoint wrapper that runs
+> NVIDIA's entrypoint with its output on stderr. Sizes: about 2.1 GB and 26 GB. Verified from the
+> published tags on the cluster: `tests/test-podman.sh` 60 of 60 with the new default image; on the
+> GPU image `nvidia-smi` lists the job's GPU, `torch.cuda.is_available()` is true and a matrix
+> product runs on it, `ray` 2.60.0 imports, `--keep-id` works, and `claude` 2.1.329, `opencode`
+> 1.19.6 and `codex-cli` 0.171.0 run. The previous images stay on GHCR as `test-2026-11` (default)
+> and `test-2026-11-pt2607` (GPU). The entries below are the history.
 
 **`podman/Dockerfile.pytorch`** (the original default, built on
 `nvcr.io/nvidia/pytorch:26.07-py3` — CUDA 13.3.1, PyTorch 2.13, confirmed current as of the
@@ -1068,7 +1091,9 @@ to be in both the key line and the policy.
 
 - From a Mac through the key: `hostname; pwd` returns a compute node and the project directory;
   `ls ~/.ssh` fails with no such directory; `bsub -V` is not found; `curl` to an unlisted site fails.
-- The exit status and the three streams come back; `scp` into the project directory works.
+- The exit status and the three streams come back; `scp` into the project directory works. (Until
+  2026-11-21 stderr came back on stdout: LSF merges them for `bsub -I` unless
+  `LSF_INTERACTIVE_STDERR=y` is set, which the script now does. See the entry of that date below.)
 - `csub probe` and `csub submit --wait` work from the session (since 2026-11-21 the laptop instruction
   files tell agents not to use `--wait` from a laptop); a child job on another node runs in
   its own sandbox. With PyPI in the policy only, a job that needed it was refused with `host pypi.org
@@ -1080,10 +1105,66 @@ to be in both the key line and the policy.
   `CLAUDE.md`; whether Codex follows the same rule in `AGENTS.md` has not been checked.
 - `--podman`: sessions and a csub job ran in containers. `--ro` and `--allow` after ` -- ` with
   `--podman` have not been checked.
+- 2026-11-21, the project directory must be outside `$HOME`: with `--project` set to `$HOME`, a
+  directory under it, a symlink into it, `/` and `/groups`, the script refused on the login node with
+  exit 1 and submitted nothing; with a directory outside, the command ran in the sandbox. Run by
+  hand with `SSH_ORIGINAL_COMMAND` set, not through sshd.
+- 2026-11-21, `scp` under `--podman`. It failed for three reasons, found one after the other:
+  neither image had `sftp-server` (what `scp` talks to; it runs inside the sandbox); LSF returned the
+  job's stderr on stdout, so podman's "Trying to pull ..." landed in the transfer ("Received message
+  too long"); and the GPU image's NVIDIA entrypoint printed its banner on stdout. Fixed by adding
+  `openssh-sftp-server` to both images (linked at the RHEL path the cluster's sshd asks for), by
+  `LSF_INTERACTIVE_STDERR=y` in `ssh-entry.sh` for commands without a terminal, and by a small
+  entrypoint wrapper in the GPU image that sends the banner to stderr. Tested by running
+  `scp -D <script that execs ssh-entry.sh>` with `SSH_ORIGINAL_COMMAND=/usr/libexec/openssh/sftp-server`,
+  which is the forced-command path without sshd: a 3 MB random file went up and came back with the
+  same checksum under bwrap, under the default image and under the GPU image, from the published
+  `latest` tags. The old default image failed the same test with "Connection closed". With the fix,
+  `echo OUT; echo ERR >&2; exit 4` returns `OUT` on stdout, `ERR` on stderr and status 4.
+  `ssh ALIAS 'cat > FILE' < FILE` also works in both sandboxes. Not tested through a real sshd.
 
 **Not covered.** The script has no test suite. The agent's process on the laptop is outside all of
 this: what it can do there is up to the harness and the user. A key line is only as narrow as its
 options, so `--allow` and `--rw` there deserve the same care as on a wrapper command line.
+
+## Two holes found by review and closed (2026-11-21)
+
+A full read of the scripts, with the agent inside treated as adversarial, found two ways past the
+sandbox. Both were confirmed on the cluster with harmless probes before anything was changed.
+
+**The job's environment at `/proc/1/environ` (`sandbox-run.sh`).** `--clearenv` empties the
+environment of the command; `bwrap` itself runs as process 1 inside (`--unshare-pid`) with the
+environment it was started with. Probe: a canary variable exported in the job was absent from the
+command's environment and present in `/proc/1/environ`, with 167 other variables. Fix:
+`exec env -i LSB_JOBID=... LSB_JOBINDEX=... /path/to/bwrap ...`. Everything the command needs
+already arrives through `--setenv`, read from the wrapper's environment beforehand.
+
+**Host-side Python importing from the working directory (both wrappers).** `python -c` and
+`python -` put the current directory first on the module path. The wrappers ran three such
+snippets on the host from `$PWD`: the csub package lookup and the policy summary (with `--csub`),
+and in `podman-run.sh` the shared-store repair (every start). Probe: `csub.py` and `json.py` left
+in a test project ran outside the sandbox on the next `--csub` start, with `~/.ssh` visible. Fix:
+the lookup runs from `/` (not `-I`, so a csub installed with `pip --user` or found through
+`PYTHONPATH` is still found); the two standard-library snippets run with `python3 -I`; a broker
+given as `python -m ...` is started from `/`, while the `csub-broker` console script keeps the
+working directory, so a relative `--policy` path still resolves.
+
+**Evidence after the fix,** all on the cluster:
+
+- `tests/test-bwrap.sh`: 82 passed on `main` before, 87 with the fix (the five new checks). The new
+  checks run against the old scripts fail four times, as they should.
+- `tests/test-podman.sh`: 55 before, 60 with the fix; against the old scripts three new checks fail.
+- `tests/test-array.sh` with the fix: bwrap 11 of 11, podman 12 of 12.
+- By hand: exit status 7 and TERM (143) propagate; `--env`, `PATH` and a terminal session work;
+  `--allow` passes the listed host and reports the refused one; `--csub` probe, submit and a child
+  job (whose own process 1 carried two variables) work; csub reachable only through `PYTHONPATH`
+  with the broker as `python3 -m csub.broker` works; a relative `--policy` with `csub-broker` works;
+  seen from outside, each `bwrap` process carries `LSB_JOBID` and `LSB_JOBINDEX` and nothing else;
+  through `ssh-entry.sh` with planted modules in the project, under bwrap and `--podman`, none ran.
+
+**Not covered:** a broker command that is a shell wrapper around `python -m` is not recognised as
+Python and keeps the working directory. Claude Code and opencode were exercised by the suites'
+model sections only.
 
 ## Running under LSF — full evidence
 

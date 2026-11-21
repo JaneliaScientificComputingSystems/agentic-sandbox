@@ -5,6 +5,35 @@ the evidence behind each.
 
 ## 2026-11-21
 
+- **Security fix, `sandbox-run.sh`: the job's environment was readable inside the sandbox.**
+  `bwrap` stays inside as process 1, and it was started with the wrapper's whole environment, so
+  `/proc/1/environ` showed every variable of the job, including any API key or token exported
+  there. The command's own environment was clean, as documented; this was beside it. `bwrap` now
+  starts with the job id and array index only. If a key was exported in a job that ran an agent
+  under `sandbox-run.sh`, treat it as seen by that agent. `podman-run.sh` was not affected.
+- **Security fix, both wrappers: a Python file in the working directory could run outside the
+  sandbox.** With `--csub`, and in `podman-run.sh` on every start, the wrapper ran small Python
+  snippets on the host from the working directory, and Python looks there for modules first. An
+  agent that left a `csub.py`, `json.py` or `sqlite3.py` in its project had it run as you,
+  unsandboxed, the next time a sandbox started there; through `ssh-entry.sh` that is the agent's
+  next command. The snippets now run isolated from the working directory. If an agent has had
+  write access to a project used this way, look for such files in it.
+- **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on
+  stdout, so anything the wrapper or the command wrote to stderr (with `--podman`, "Trying to pull
+  ..." and an image id on every command) appeared in the command's output. Commands without a
+  terminal now get the two streams separately. If you parsed that mixed output, read stderr too.
+- **Images: `scp` and `sftp` work through `ssh-entry.sh --podman`.** Both images now carry
+  `sftp-server`. The default image also gained `pip` and `venv`, so a Python package can be
+  installed in it. The GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout
+  holds only its own output. `podman/Dockerfile` and `Dockerfile.pytorch` now match the published
+  images (they lacked the 2026-11-19 additions: Codex, Ray, the CUDA 13.5 base). Nodes pull the new
+  layers on the next run.
+- **Laptop instruction files:** `pip install` needs `pypi.org` and `files.pythonhosted.org` among
+  the allowed hosts, and the file says to ask for them. `AGENTS-podman.md` uses the image rule for
+  GPU jobs and says which description of the working directory to believe. Copy the new file to
+  your laptop to pick this up.
+- **`SETUP.md` §8 step 1** carries `--replace`, so it no longer stops when §6 already wrote a policy.
+
 - **`ssh-entry.sh` now refuses a project directory inside `$HOME`** (and `$HOME` itself, or a
   directory above it), on the login node, before it submits anything. The documents always said the
   project must be outside the home directory, but the script checked only that it existed, so a key
@@ -53,7 +82,7 @@ the evidence behind each.
   turns every `ssh cluster '<command>'` into an interactive LSF job that runs the command through
   `sandbox-run.sh` (or `podman-run.sh` with `--podman`) in one project directory. Only the script and
   `bsub` run on the login node. Documented on 2026-11-16: README, "An agent on your laptop".
-- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need csub PR #15; see README). The LSF-allocated GPUs (from
+- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need PR #15 of the csub repo, merged 2026-11-15; see README). The LSF-allocated GPUs (from
   `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
   `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is set to their
   numbering inside (`0..n-1`, in the order given; a subset such as the job's second GPU alone is `0`

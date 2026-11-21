@@ -38,7 +38,7 @@ not protect against](#what-it-does-and-does-not-protect-against).
 | `--claude` | `claude auth login` outside the sandbox | `SETUP.md` §4 |
 | `--opencode` | opencode installed and run once, and a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
 | `sandbox-run.sh --gpu` | nothing more; run it inside an LSF GPU job | `SETUP.md` §2 |
-| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and the two files in `config/` | `SETUP.md` §3 |
+| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**), plus `storage.conf` and `containers.conf` from `config/` | `SETUP.md` §3 |
 | `--csub` (optional) | csub installed and a policy, written by `scripts/csub-policy.sh` | `SETUP.md` §6 |
 | `ssh-entry.sh` (an agent on your laptop) | a dedicated ssh key, one line in `~/.ssh/authorized_keys`, and normally `--csub` | `SETUP.md` §8 |
 
@@ -99,7 +99,8 @@ The sandbox is identical in the three ways to run it; only the submission differ
 ## Adapting your project
 
 - **Start from the directory the agent may change.** `$PWD` is the only read-write path by default.
-  Don't start from `$HOME` (the wrapper refuses) or from this checkout (the wrapper re-binds its own
+  Don't start from `$HOME` or a directory above it (`sandbox-run.sh` refuses; `podman-run.sh` does
+  not mount the working directory at all) or from this checkout (the wrapper re-binds its own
   directory read-only if you do).
 - **Data in, results out.** `--ro /groups/lab/reference-data` for inputs, `--rw
   /groups/lab/project/results` for outputs: specific subdirectories, never `$HOME`. Write results to
@@ -271,7 +272,7 @@ agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I
 
 - **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
   `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are
-  relayed, so `scp` to the project directory works too. A job takes from seconds to a minute to
+  relayed, each on its own stream, so `scp` to the project directory works too, with `--podman` as well. A job takes from seconds to a minute to
   start, and nothing carries over between commands except files in the project directory.
 - **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
   in the job's environment, not on a command line.
@@ -309,9 +310,11 @@ Neither is required; `--image` takes any OCI image. A csub policy decides which 
 
 | Image | Base | Contents | Size | Use when |
 | --- | --- | --- | --- | --- |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, `git`, `rsync`, `python3` | 1.24 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, plus the same CLIs | several GB | real ML work, native extensions, "set up a venv and pip install" tasks |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, Codex, `git`, `rsync`, `python3` with `pip` and `venv`, `sftp-server` | about 2 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, NCCL 2.30, Ray 2.60 (Train and Data), `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, `sftp-server`, plus the same CLIs | 26 GB | real ML work, native extensions, anything that needs PyTorch |
 
+Both images carry `sftp-server`, so `scp` and `sftp` through `ssh-entry.sh --podman` work, and the
+GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout holds only its own output.
 `podman-run.sh` checks for a newer image on every run (a digest check; a download only if it changed).
 `--allow` needs `bash` and `python3` in the image for the in-container relay; a minimal image such as
 `alpine` fails with `executable file /bin/bash not found`.
@@ -332,7 +335,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   directory and cannot ask in a batch job, so the read is auto-rejected and the model may give up and
   exit 0. The sandbox is the boundary, so allow it: `export
   OPENCODE_CONFIG_CONTENT='{"permission":{"external_directory":"allow"}}'` and pass `--env
-  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh` (bwrap only: `podman-run.sh` has no `--env`). An agent that gives up
+  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh`. `podman-run.sh` has no `--env`; there the same permission would have to go
+  into `~/.config/opencode/opencode.json`, which the wrapper copies into the container (not tested). An agent that gives up
   still exits 0, so check for the output you expect, not the exit code.
 - **The Kimi K3 safeguard.** Requests to `kimi-k3` pass through a gateway guardrail (an LLM-as-judge
   for harmful content and jailbreaks) whatever the client. A refusal is either the gateway's
@@ -349,7 +353,7 @@ image.**
 
 | | `sandbox-run.sh --gpu` (bwrap) | `podman-run.sh --gpu` |
 | --- | --- | --- |
-| One-time setup | none | a subuid/subgid range from HPC and the two files in `config/` (`SETUP.md` §3) |
+| One-time setup | none | a subuid/subgid range from HPC, plus `storage.conf` and `containers.conf` from `config/` (`SETUP.md` §3) |
 | Start-up | seconds | an image pull (1.2 GB, or several GB) on each new node, and again after the hourly scratch cleanup |
 | Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
 | Credential masking | yes | no, which is why `$HOME` cannot be mounted |
@@ -523,7 +527,8 @@ Five suites in `tests/`:
   top-level sandbox the mount or `--allow` host if the child really needs it.
 - **`Permission denied (publickey)` through an `ssh-entry.sh` key**: the key line is wrong or past its
   `expiry-time`, or `~/.ssh` on the cluster is not mode 700. **`project directory ... does not
-  exist`**: fix `--project` in the key line.
+  exist`**: fix `--project` in the key line. **`project directory ... is your home directory, or inside
+  it, or above it`**: move the project outside `$HOME` and edit the key line.
 - **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
   policy or the `--allow` list, outside the sandbox.
 

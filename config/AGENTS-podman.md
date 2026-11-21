@@ -10,11 +10,13 @@ All computation, compilation and installation happens on the cluster, never on t
 - Each ssh command is a separate job on a compute node. It can take up to a minute to
   start. Nothing carries over between commands except files in the project directory.
 - Commands start in the project directory. Only that directory is readable and writable.
+  (The sandbox's description says the working directory is the image's own; for commands
+  sent through ssh janelia-agent this file is right.)
 - There is no bsub on the cluster side, and no network except the hosts the sandbox's
   description lists.
 - For anything longer than a few minutes, or needing more CPUs or a GPU, submit a job:
   ssh janelia-agent 'csub submit --cpus N --walltime MIN -q short -- <command>'
-  For a GPU add --gpus 1 and name a GPU queue in place of short; csub probe lists them.
+  For a GPU use the form in the image rule below.
   It prints the job id and returns. Check on the job with
   ssh janelia-agent 'csub status JOBID' and read its output with
   ssh janelia-agent 'csub logs JOBID'. Check no more often than once a minute, and with
@@ -36,4 +38,4 @@ All computation, compilation and installation happens on the cluster, never on t
   sandbox is right.
 - Commands and jobs run in a container image. For GPU work with PyTorch, submit with:
   --gpus 1 -q gpu_short --image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest
-- Use only the janelia-agent host. Do not use any other host, user name or key.
+- For ssh and scp, use only janelia-agent: no other ssh host, user name or key.
