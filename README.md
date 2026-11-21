@@ -15,7 +15,9 @@ live on the cluster as an ordinary user account.
 
 **Which document:** [`SETUP.md`](SETUP.md) first (one-time, per account) · this README to use the
 wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`ADMIN-NOTES.md`](ADMIN-NOTES.md)
-for the evidence and reasoning behind each decision · [`config/`](config/) for the files setup copies.
+for the evidence and reasoning behind each decision
+([`ADMIN-NOTES-history.md`](ADMIN-NOTES-history.md) for the superseded passages) · [`config/`](config/)
+for the files setup copies.
 
 **Which setup:**
 

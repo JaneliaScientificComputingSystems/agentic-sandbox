@@ -214,8 +214,8 @@ fi
 # exists as a mount point, exactly as it did when the real dir was bound. So opencode's config
 # AND data dirs use the HOME-dependent destination: default (no --keep-id) the container runs
 # as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
-# -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "Identity and $HOME under podman" for why
-# forcing identity without remapping failed.
+# -e HOME below), same convention as bwrap. See ADMIN-NOTES-history.md's "Identity and $HOME under
+# podman" for why forcing identity without remapping failed.
 # Per-job state directory: ONE place for everything this wrapper creates for a run --
 # podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/
 # (allowlist proxy socket + log). Mode 700, removed whole by cleanup(), nothing in /tmp.
@@ -331,7 +331,7 @@ chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
 
 # The prologue calls below (migrate / info / pull) run against the SHARED store with
 # XDG_RUNTIME_DIR UNSET, so podman derives its libpod tmp dir from its stable default
-# (${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp), NOT from this job's xdg-runtime dir. This
+# (<runtime dir>/libpod/tmp, see shared_runtime_dir below), NOT from this job's xdg-runtime dir. This
 # matters far more than it looks: podman records the tmp dir in the store's own database
 # (DBConfig.TmpDir) the first time it initializes that store, and every later invocation
 # that doesn't pass --tmpdir explicitly silently ADOPTS the recorded value. Confirmed live on

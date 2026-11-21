@@ -6,7 +6,8 @@ README. If you just want to *use* this repo, you don't need this file; see `READ
 
 Sections are grouped by topic, not by date. Most carry dates, and an entry describes the state when
 it was written, which later entries and `CHANGELOG.md` may have changed. Where an undated passage has
-been overtaken, a "Superseded" note in front of it says so.
+been overtaken, a "Superseded" note in front of it says so. Passages that describe a state the
+scripts have left are kept in `ADMIN-NOTES-history.md`, under the same headings.
 
 ## How bwrap actually works, mechanically
 
@@ -27,8 +28,8 @@ directly:
   sandbox backgrounds a helper process (like the network-allowlist relay), that process has
   no other parent to reap it once the main command exits. With the PID namespace unshared,
   the kernel kills every remaining process in it the moment its PID-1 process exits — a
-  kernel-guaranteed cleanup, not dependent on any script's own bookkeeping. See the LSF
-  section below for the real leak this fixed.
+  kernel-guaranteed cleanup, not dependent on any script's own bookkeeping. See "Cleanup bugs
+  in both wrappers, found and fixed the same way" below for the real leak this fixed.
 
 None of this changes cgroup membership (CPU/memory accounting, LSF job resource limits) —
 verified in the LSF section below.
@@ -55,56 +56,9 @@ are absent unless explicitly `--dev-bind`ed (at the time GPU work went through p
 
 ### The $HOME-to-$PWD default change, and why
 
-> **Superseded in part.** Two things below no longer hold. Starting `sandbox-run.sh` from `$HOME`, or
-> from a directory above it, is now refused, so the `$PWD == $HOME` case described here cannot
-> occur. And a `$HOME` that is not bound gets no masks, so no empty `.ssh` or `.config/gcloud`
-> placeholders appear in it. See "Review follow-ups: masks, bind order, podman refusals, `/dev/shm`
-> (2026-11-09/10)" and README's troubleshooting.
-
-`sandbox-run.sh` used to always read-only-bind all of `$HOME`, with a denylist of known
-credential paths masked on top (see the masking block in `sandbox-run.sh`). Prompted by the
-same session that found podman's masking equivalent doesn't actually work (see "The
-credential-masking attempt that didn't work" below): even where masking *does* work (bwrap),
-a denylist is still a standing liability — it protects against the specific paths we thought
-to list, not whatever shows up next (a new cloud CLI's config file, `.gnupg`, a password
-manager's store, etc.). Anthropic's own secure-deployment guide's actual pattern is to never
-mount the real home directory at all, not to mount it and mask around it.
-
-**Changed default**: `sandbox-run.sh` now binds `$PWD` (read-write) instead of `$HOME`
-(read-only). `$HOME` itself is no longer bound unless the caller explicitly `--rw`/`--ro`s
-it. `--claude`/`--opencode`/`--scratch` are unaffected — they were already narrow, explicit
-opt-ins, not part of this problem.
-
-**The masking logic was kept, not removed, and now applies to both `$PWD` and `$HOME`** —
-deliberately redundant with the allowlist-style default, for one specific reason: if a
-caller's `$PWD` happens to *be* `$HOME` (e.g. running `sandbox-run.sh` from a login shell
-without `cd`-ing anywhere first), the new default binds all of it too, same exposure as the
-old default. Masking `$HOME`'s known-sensitive subpaths regardless of whether it ends up
-bound via `$PWD` coincidentally or an explicit `--rw` closes that gap. **This masking was
-also made unconditional** (moved to run after all `--ro`/`--rw` processing, instead of
-before) — the old documented behavior ("an explicit `--ro`/`--rw` on one of these paths still
-overrides the mask") was dropped, since it's exactly the kind of accidental-or-deliberate
-re-exposure this whole change is meant to close off.
-
-**Verified live** (real LSF job, ordinary user, not root):
-- `$PWD` bound read-write by default: wrote a file from inside the sandbox, confirmed it
-  landed on the real filesystem afterward.
-- `$HOME` not exposing real content by default: from a `$PWD` other than `$HOME`, `$HOME`
-  inside the sandbox contains no real files — only empty masked placeholder directories may
-  auto-vivify (`.ssh`, `.config/gcloud` show up as empty dirs purely because the mask loop
-  needs *some* directory to hang the `--tmpfs` off of; both are dot-prefixed and invisible to
-  a plain `ls` anyway). Nothing from the user's actual home directory content is visible.
-- Masking applies to `$PWD` too, not just `$HOME`: created `.git-credentials` and
-  `.aws/credentials` inside a scratch project directory, confirmed both came back
-  empty/zero-byte inside the sandbox while the real files on disk were untouched.
-- Masking is genuinely unconditional: `--rw` explicitly targeting a masked path (e.g.
-  `--rw "$WORKDIR/.git-credentials"`) still returns 0 bytes, not the real content.
-- The `$PWD == $HOME` edge case specifically: ran with no `cd` (so `$PWD` was the login
-  shell's default, `$HOME`) — the real home directory content became visible (as expected,
-  since it's genuinely what was bound), but `.ssh`/`.config/gcloud` inside it were still
-  correctly masked (empty), confirming the redundant dual-root masking closes this case.
-- `--claude`/`--opencode` shortcuts unaffected — verified still mounting their specific
-  narrow paths correctly.
+This passage records why `sandbox-run.sh` stopped binding all of `$HOME` read-only and binds `$PWD`
+read-write instead. Today `$HOME` is not bound by default, and a start from `$HOME` or above it is
+refused. History: see `ADMIN-NOTES-history.md`, same heading.
 
 ## Network access — the mechanism and its evidence
 
@@ -158,25 +112,22 @@ documented network requirements (`code.claude.com/docs/en/network-config`): Clau
 not support SOCKS proxies at all, only `HTTPS_PROXY`/`HTTP_PROXY`. So the HTTP-only proxy
 isn't missing a leg for either of this repo's two worked examples.
 
-**Why plain Python instead of `socat` (and when that would flip):** `socat` wasn't installed on
-the LSF hosts checked when this was built, so plain stdlib Python (`asyncio`, already present
-on every host as part of the base OS) was the zero-dependency option at the time — not because
-installing `socat` fleet-wide would be hard; that's a straightforward package rollout the HPC
-team could do, just one that hasn't been decided on. Even if `socat` were rolled out, it's not
-actually a full replacement: it's a generic byte-shoveler with no concept of "only allow these
-hostnames" — it would only replace `relay.py`'s job (the raw TCP↔Unix-socket relay *inside* the
-sandbox), never `allowlist_proxy.py`'s (the actual policy enforcement, outside the sandbox).
-Anthropic's own `sandbox-runtime` makes the identical split — `socat` for the relay leg, a
-separate custom proxy for the allowlist logic — so adopting `socat` wouldn't simplify or remove
-the one piece that's actually security-relevant. `relay.py` itself is ~50 lines with zero HTTP
-parsing (it only pipes bytes), so there's very little surface for a hand-rolled version to get
-wrong in the first place.
+**Why plain Python instead of `socat` (and when that would flip):** `socat` wasn't installed on the
+LSF hosts checked when this was built, and stdlib Python (`asyncio`) is on every host as part of the
+base OS, so it was the zero-dependency option. Installing `socat` fleet-wide would be a
+straightforward package rollout for the HPC team, just one that hasn't been decided on. It would not
+be a full replacement either. `socat` is a generic byte-shoveler with no concept of "only allow
+these hostnames", so it could replace only `relay.py` (the raw TCP↔Unix-socket relay *inside* the
+sandbox), never `allowlist_proxy.py` (the policy enforcement, outside the sandbox). Anthropic's own
+`sandbox-runtime` makes the identical split: `socat` for the relay leg, a separate custom proxy for
+the allowlist logic. `relay.py` itself is 70 lines (58 of them non-blank) with zero HTTP parsing (it
+only pipes bytes), so a hand-rolled version has little to get wrong.
 
-**When this call would flip**: if `relay.py` were actually causing problems in practice — flaky
-half-closed-connection handling, weird hangs under load, anything a battle-tested tool like
-`socat` would meaningfully harden — that would justify pushing for fleet-wide `socat` and
-swapping `relay.py`'s internals for a thin wrapper around it. Nothing like that has come up; this
-is a reconsider-if-evidence-appears decision, not a permanent one.
+**When this call would flip**: if `relay.py` caused problems in practice (flaky
+half-closed-connection handling, hangs under load, anything a battle-tested tool like `socat` would
+harden), that would justify fleet-wide `socat` and making `relay.py` a thin wrapper around it.
+Nothing like that has come up. This is a reconsider-if-evidence-appears decision, not a permanent
+one.
 
 ## The three operating modes — evidence
 
@@ -213,30 +164,9 @@ observe/inject input across separate tool calls — a real human wouldn't need t
 
 ## Authenticating Claude Code — the rigorous login test
 
-> **Superseded in part.** This test was done when `~/.claude` was bound read-write. Today `--claude`
-> works on a per-job copy and binds only `~/.claude/.credentials.json`, and only if that file exists
-> at start, so a first login done inside the sandbox persists only in that case (README, Harnesses).
-
-Fresh `claude auth login` done entirely inside the sandbox was verified with real rigor, not
-just "seems like it should work":
-1. Logged out **outside** the sandbox (`claude auth logout`) — confirmed `loggedIn: false`.
-2. Verified **inside** the sandbox, before any login attempt, that it saw the same
-   logged-out state — proving the RW-bound `.claude` is the real file, not a stale view.
-3. Ran `claude auth login` **entirely inside** the sandbox, no reused credentials. Printed an
-   OAuth URL. Critically: the redirect URI is
-   `https://platform.claude.com/oauth/code/callback` — **not a localhost callback** — so the
-   generic "OAuth breaks under network-namespace isolation" concern (real for *some* other
-   flows, e.g. MCP server OAuth, per public reports) does not apply to `claude auth login`
-   itself. Goes straight to a manual "paste code here" prompt.
-4. A human opened that URL in their own real browser, outside the sandbox entirely (the
-   browser isn't part of the sandboxed process — doesn't need the proxy at all), and pasted
-   the resulting code into the sandboxed terminal's stdin.
-5. Login succeeded. Verified again from outside the sandbox afterward: `loggedIn: true`.
-
-The proxy's own log during this real (non-synthetic) login showed exactly `api.anthropic.com`
-(repeatedly) and `platform.claude.com` — `claude.ai` was never actually contacted through the
-proxy, since the browser step happens on the host's real network. One real attempt was also
-denied as expected: `http-intake.logs.us5.datadoghq.com` (Datadog telemetry).
+This section records a fresh `claude auth login` done inside the sandbox when `~/.claude` was bound
+read-write. Today `--claude` binds only `~/.claude/.credentials.json`, and only if that file exists
+at start. History: see `ADMIN-NOTES-history.md`, same heading.
 
 ## The opencode "Forbidden" gotcha — full root-cause
 
@@ -249,7 +179,9 @@ their compute node) directly. They showed repeated `DENY CONNECT models.opencode
 `DENY CONNECT opencode.ai`, with `litellm.int.janelia.org` never once successfully reached in
 that session. opencode's interactive TUI defaults to its own hosted free model ("OpenCode
 Zen") unless a model is explicitly specified, and that default model's own backend calls hit
-domains that were never meant to be in the LiteLLM allowlist.
+domains that were never meant to be in the LiteLLM allowlist. The log path is the one of that time.
+Today the log is `proxy/proxy.log` in the per-job state directory and is removed at exit, and the
+wrapper prints the denied hosts itself at exit when the command failed.
 
 **Fix, verified live**: launch with `-m litellm/kimi-k3` (or `--model litellm/kimi-k3`)
 explicitly. Confirmed: `opencode --model litellm/kimi-k3` inside the same sandbox/allowlist
@@ -286,45 +218,17 @@ Result: a normal conversational refusal from the model itself (*"I can't help wi
 hard limit for me regardless of how the request is packaged"*) — no exception, no
 `GuardrailRaisedException`, no HTTP 400.
 
+Later observations of the same prompt against Kimi K3: refusals came in both shapes, the gateway
+`GuardrailRaisedException` (`content_harm`, September) and model prose (October). On 2026-10-16
+three attempts were all model prose. Whether the gateway guardrail is still attached to the test
+key is unverified.
+
 ## GPU / device access — evidence
 
-> **Superseded in part (2026-11-03, merged 2026-11-14).** The conclusion below, that bwrap cannot
-> pass a GPU through, was wrong about the cause. The missing piece was sysfs: with the device nodes
-> bound **and** `/sys/devices` and `/sys/module` visible read-only, `nvidia-smi`, CUDA and PyTorch
-> work under bwrap. See "bwrap `--gpu`" further down. What follows is kept as the record of what
-> was tried at the time; podman remains the way to run a container image.
-
-**Confirmed, root-caused, tested live on a real GPU allocation (`gpu_l4` LSF queue).**
-
-What was ruled out with direct tests:
-- Device node visibility — not the cause. `--dev-bind /dev/nvidia0 /dev/nvidiactl
-  /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset` all showed up correctly inside
-  the sandbox.
-- Missing libraries/sockets — not the cause. Bound literally everything
-  `nvidia-container-cli list` (the NVIDIA Container Toolkit's own authoritative list) says is
-  required. Identical failure.
-- `/proc` handling — not the cause. Tried both a fresh private `/proc` and a real bind of the
-  host's. Identical failure.
-- User namespace alone — **not** the cause, the key isolating result. Plain `unshare --user
-  --map-root-user -- nvidia-smi -L` (no mount/root reconstruction, just a new user namespace)
-  succeeds and lists the GPU normally.
-
-The failure tracks specifically with bwrap building its own sandboxed root + mount namespace
-— every real bwrap sandbox does this by design. This matches the well-known industry pattern
-that GPU access inside any namespace-isolated process on modern data-center NVIDIA drivers
-generally requires the NVIDIA Container Toolkit's actual runtime integration.
-
-**Corroborating evidence this is known-hard industry-wide, not something we're missing:**
-Anthropic's own `sandbox-runtime` has no GPU/CUDA support at all, and there's an open,
-unresolved Anthropic feature request for exactly this:
-[anthropics/claude-code#13108](https://github.com/anthropics/claude-code/issues/13108) —
-every report there shows GPU access failing in sandbox mode, with no working example from
-anyone, official or community. A near-identical open OpenAI Codex issue,
-[openai/codex#19676](https://github.com/openai/codex/issues/19676), reports a simpler symptom
-(missing device nodes entirely) and is also unresolved. NVIDIA's
-own CDI documentation scopes support explicitly to *container runtimes* (podman, containerd,
-cri-o, the NVIDIA Container Runtime) — bwrap, which implements raw namespaces directly rather
-than an OCI-hook-capable runtime, is outside that scope by design, not by oversight.
+The passage that stood here records the first attempts to pass a GPU through bwrap. Its conclusion
+was wrong about the cause: GPUs work under bwrap with the device nodes bound and `/sys/devices` and
+`/sys/module` visible read-only (see "bwrap `--gpu`" below). History: see
+`ADMIN-NOTES-history.md`, same heading.
 
 ### The fix: Podman + NVIDIA CDI
 
@@ -347,285 +251,175 @@ GPU UUID afterward.
 
 ### Identity and $HOME under podman
 
-Unlike bwrap (where you're still "you" inside the sandbox), a podman container runs as
-**root** by default, with `$HOME=/root` — so `claude`/`opencode` looked for their config at
-`/root/.claude`/`/root/.config/opencode`, not the host's real path, even with the real files
-bind-mounted.
-
-- **First attempt**: `--userns=keep-id` (podman's built-in mechanism for mapping the
-  container back to your real host UID). Failed: `chowning container workdir: potentially
-  insufficient UIDs or GIDs available in user namespace` — the account running this hadn't
-  been provisioned a `/etc/subuid`/`/etc/subgid` range yet (confirmed on a live node: these
-  ranges exist and work fine here, but are granted per-account by HPC on request, not
-  cluster-wide or self-service).
-- **Second attempt**: `--user $(id -u):$(id -g)` plus `-e HOME=$HOME` (no namespace
-  remapping). Failed differently: exit 126 (permission denied) — the CLIs were installed as
-  root during the image build, and files created that way aren't readable/executable by a
-  different numeric UID.
-- **The fix that actually worked**: don't fight the container's identity at all — mount the
-  host's real config files to `/root/...` (where the container's actual user, root, already
-  looks), instead of to `$HOME/...`. Podman volume source and destination paths don't have to
-  match, unlike bwrap's convention of using identical paths throughout this repo.
+This section records three attempts to give `claude` and `opencode` their config in a root container.
+Today `--claude` finds its copy through `CLAUDE_CONFIG_DIR`, and `--opencode` mounts under `/root/...`,
+or under `$HOME/...` with `--keep-id`. History: see `ADMIN-NOTES-history.md`, same heading.
 
 ### --userns=keep-id, revisited — full evidence and the actual root cause
 
-The section above concluded `--userns=keep-id` failed for lack of a subuid/subgid range.
-Revisited with a range confirmed provisioned (width 65536) — it **still fails**, same error
-class, but now with the invoking account's exact real uid:gid in the message:
-```
-Error: chowning container ... workdir to container root: potentially insufficient UIDs or
-GIDs available in user namespace (requested <uid>:<gid> for ...): Check /etc/subuid and
-/etc/subgid if configured locally and run "podman system migrate"
-```
-
-**Isolated which value is the problem**, using `--userns=keep-id:uid=X,gid=Y` to test uid
-and gid independently:
-
-| Test | uid | gid | Result |
-|---|---|---|---|
-| A | 1000 (small) | `<gid>` (real) | **fails** |
-| B | `<uid>` (real) | 1000 (small) | **works** |
-| C | 65535 (range edge) | 1000 (small) | **works** |
-
-The account's real **uid** isn't the problem — it works right up to the range edge. The real
-**gid** is the entire cause.
-
-**Exact boundary**, sweeping gid values with a fixed small uid: 65534/65535/**65536** all
-work, **65537**/90000/`<gid>` all fail. The threshold is precisely the width of the granted
-subgid range (65536) — `keep-id`'s identity-mapping needs the target gid `≤` the range
-width, regardless of where the range is positioned. AD/LDAP here assigns primary GIDs well
-above the traditional 16-bit container UID/GID space (0-65535) this mapping needs to fit
-into; the account's real gid exceeds the granted range's width.
-
-**Resolved**: HPC widened all granted ranges to 131072 ("128k"), confirmed deployed live.
-Retested: `--userns=keep-id --user "$(id -u):$(id -g)"` succeeds — real uid/gid, no chown
-error.
-
-**One more issue surfaced once identity worked**: `claude`/`opencode` then failed with
-`Permission denied` (confirmed via each CLI's full path directly, not "not found"). Both are
-installed under `/root` by their native installers (`/root/.local/bin/claude`,
-`/root/.opencode/bin/opencode`, symlinked from `/usr/local/bin/`), and `/root` is `0700` by
-default — blocks traversal for a non-root process regardless of the target files' own
-permissions. Different failure mode from the "second attempt" above (`exit 126`, individual
-file permission denial) but the same root idea. Fixed in `podman/Dockerfile`:
-`chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode` — deliberately targeted
-(traversal on `/root` itself, read+execute on just the two install trees), not a blanket
-loosening.
-
-**Verified live end-to-end against the actual published GHCR image** (rebuilt and
-re-pushed, not just tested locally): `whoami` → the real account name, `$HOME` → the real home directory,
-`claude --version` → `2.1.267`, `opencode --version` → `1.18.30`.
-
-**Important correction**, found via the checked-in test suite's with/without-`--keep-id`
-matrix (`tests/test-podman.sh`): a file written to a `--rw`-mounted host directory lands
-with real ownership **even without `--keep-id`** — rootless podman's default mapping already
-writes bind-mounted files as the real invoking user; that part was never broken. What stays
-root-owned regardless of `--keep-id` is the *container's own internal storage* — confirmed
-separately, a `/tmp` file (not bind-mounted) showed `root root` in both cases.
-
-So `--keep-id`'s actual value is narrower than originally framed (that framing was borrowed
-from `janelia-mojo-sandbox`'s comment, which conflated the two): it changes the **process
-identity inside the container** (`whoami`, `$HOME` resolution) — which is what
-`--claude`/`--opencode` need to correctly mount at your real `$HOME/...` instead of
-`/root/...`. It does not fix bind-mounted file ownership, because that was never broken.
-`podman-run.sh --keep-id` still closes the "podman runs as root" gap from the Anthropic
-Docker-config comparison — just via in-container identity, not volume ownership.
-
-**The `janelia-mojo-sandbox` cross-check**: another account's real gid on that project
-(nearly identical to the one investigated above) also exceeded their pre-widening subgid
-range, so that project's `--keep-id` instructor mode was suspected to share this failure —
-never independently verified, only inferred from its README's claim. Moot now: the widening
-covered that account too. Still worth testing their instructor mode live to confirm, rather
-than taking the README's claim on faith either way.
+This section records why `--userns=keep-id` failed with a subgid range 65536 wide. Today the ranges
+are 131072 wide and `--keep-id` works. It changes the identity inside the container, not the ownership
+of bind-mounted files. History: see `ADMIN-NOTES-history.md`, same heading.
 
 **Implementation**: `--userns=keep-id --user "$(id -u):$(id -g)" -e HOME=$HOME`.
-`--claude`/`--opencode`'s mount destination depends on `--keep-id`'s final state, decided
-once after the full argument parse so flag order never matters — verified: `--claude
---keep-id` and `--keep-id --claude` produce identical results. Regression-checked: default
-(no `--keep-id`) behavior unaffected.
+`--opencode`'s mount destination depends on `--keep-id`'s final state (`$HOME/...` with it,
+`/root/...` without), decided once after the full argument parse so flag order never matters.
+`--claude`'s no longer does: its per-job copy is mounted at its own path and found through
+`CLAUDE_CONFIG_DIR`. Verified when both depended on it: `--claude --keep-id` and
+`--keep-id --claude` produce identical results. Regression-checked: default (no `--keep-id`)
+behavior unaffected.
 
 ### The credential-masking attempt that didn't work — full evidence
 
-`sandbox-run.sh` masks credential paths inside `$HOME` (empty `--tmpfs` over `.ssh`/`.aws`/
-etc., an empty file bound over `.git-credentials`/`.npmrc`/etc.) by appending the mask after
-the base bind, so the later mount shadows the earlier one — real Linux mount-stacking,
-verified working (see "Filesystem access — evidence" above). Tried the identical approach in
-`podman-run.sh`, since `--rw "$HOME"` otherwise exposes the same credentials with zero
-protection.
+`sandbox-run.sh` masks credential paths inside `$HOME` (empty `--tmpfs` over `.ssh`/`.aws`/etc., an
+empty file bound over `.git-credentials`/`.npmrc`/etc.) by appending the mask after the base bind,
+so the later mount shadows the earlier one. That is real Linux mount-stacking, verified working (see
+"Filesystem access — evidence" above). The identical approach was tried in `podman-run.sh`, since
+`--rw "$HOME"` otherwise exposes the same credentials with zero protection.
 
-**Confirmed broken, not just untested.** Live session, `--rw "$HOME"` plus a `--tmpfs` mask
-on `$HOME/.ssh` appended after it (same ordering strategy as the working bwrap fix):
+**Confirmed broken, not just untested.** Live session, `--rw "$HOME"` plus a `--tmpfs` mask on
+`$HOME/.ssh` appended after it (same ordering strategy as the working bwrap fix):
 ```
 root@46dd0ffe1811:/work# ls -al $HOME/.ssh
 -rw------- 1 root nogroup   1675 id_rsa
 -rw-r--r-- 1 root nogroup    411 id_rsa.pub
 -rw------- 1 root nogroup 123732 known_hosts
 ```
-Real, live SSH keys — not masked. `df -h` in the same container showed the `tmpfs`
-genuinely present in the mount table at `$HOME/.ssh`, but file access through it still
-resolved to the real content underneath.
+Real SSH keys, not masked. `df -h` in the same container showed the `tmpfs` present in the mount
+table at `$HOME/.ssh`, but file access through it still resolved to the real content underneath.
 
 **Confirmed via file content, not just listing**, isolating `.config/gcloud`:
 ```bash
 podman run --rm -v "$HOMEDIR:$HOMEDIR:rw" --tmpfs "$HOMEDIR/.config/gcloud" "$IMG" \
   bash -c 'cat "$HOMEDIR/.config/gcloud/credentials.db"'
 ```
-Returned `SQLite format 3 ...` — the real, live database, byte-identical size (12288) to the
-file on disk (untouched afterward — the mask never hid it, didn't corrupt it either).
+Returned `SQLite format 3 ...`, the real database, byte-identical in size (12288) to the file on
+disk. The file was untouched afterward: the mask neither hid it nor corrupted it.
 
-**Ruled out**: mount order (`--tmpfs` before vs. after the `-v` bind — identical result
-either way); mount syntax (`--tmpfs DEST` shorthand vs. unified `--mount
-type=tmpfs,destination=DEST` — identical); tmpfs itself not working (a `--tmpfs` with no
-overlapping `-v` at all worked correctly in isolation — a file written inside it didn't
-persist across a fresh run).
+**Ruled out**: mount order (`--tmpfs` before or after the `-v` bind gives an identical result).
+Mount syntax (`--tmpfs DEST` shorthand and unified `--mount type=tmpfs,destination=DEST` are
+identical). tmpfs itself not working (a `--tmpfs` with no overlapping `-v` worked correctly in
+isolation, and a file written inside it didn't persist across a fresh run).
 
-**Best-available explanation** (not verified against podman/crun source, but consistent
-with every test above): podman/crun likely treats a `-v` bind of a whole directory tree as
-one mount covering everything beneath it, rather than applying each mount as an
-independent, sequential, overridable syscall the way bwrap does. bwrap's masking works
-specifically because it builds the sandbox's mount namespace as a strict sequence of
-individual `mount()` calls — a later call at an already-covered path genuinely shadows the
-earlier one. Podman/crun's OCI runtime handling doesn't appear to preserve that
-override-by-recency behavior for a mount nested inside an already-bound ancestor.
+**Best-available explanation** (not verified against podman/crun source, but consistent with every
+test above): podman/crun likely treats a `-v` bind of a whole directory tree as one mount covering
+everything beneath it. bwrap builds the sandbox's mount namespace as a strict sequence of individual
+`mount()` calls, so a later call at an already-covered path shadows the earlier one. Podman/crun's
+OCI runtime handling doesn't appear to preserve that override-by-recency for a mount nested inside
+an already-bound ancestor.
 
-**Decision**: removed the masking code from `podman-run.sh` entirely rather than ship it
-broken — a `--tmpfs` that shows correctly in `df -h` while the real credentials stay fully
-readable underneath is worse than no masking, since it looks protected and isn't.
-`podman-run.sh` now documents (header comment, README's "How the sandbox works" and GPU sections)
-that `$HOME` (or any path containing it) must never go to `--rw`/`--ro` — there's no safe
-partial-exposure mechanism the way bwrap has. Matches Anthropic's own secure-deployment
-guide's actual pattern: their hardened Docker example never mounts the real home directory
-at all — the container gets its own fresh `--tmpfs /home/agent`, only the specific project
-directory is mounted, with an explicit warning against `~/.ssh`/`~/.aws`/`~/.config`. They
-solve this by never posing the problem, not by masking around it.
+**Decision**: the masking code was removed from `podman-run.sh` entirely rather than shipped broken.
+A `--tmpfs` that shows correctly in `df -h` while the real credentials stay fully readable
+underneath is worse than no masking, since it looks protected and isn't. `podman-run.sh` then
+documented (header comment, README's "How the sandbox works" and GPU sections) that `$HOME` (or any
+path containing it) must never go to `--rw`/`--ro`, because there is no safe partial-exposure
+mechanism the way bwrap has. Since `2ab3526` it refuses those mounts (see "Review follow-ups"
+below). This matches Anthropic's own secure-deployment guide: their hardened Docker example never
+mounts the real home directory at all. The container gets its own fresh `--tmpfs /home/agent`, only
+the specific project directory is mounted, and there is an explicit warning against
+`~/.ssh`/`~/.aws`/`~/.config`.
 
 ### The concurrency/storage gotcha, and prior art
 
-Rootless podman keeps per-user state under fixed local paths, and if multiple podman
-invocations from the same user land on the same node at the same time (or podman's cached
-state goes stale after a node reboot), they can corrupt each other's storage. This is a
-documented, already-solved problem in Janelia's own fork of the Harbor agent-evaluation
-framework (`JaneliaScientificComputingSystems/harbor`, `hpc/` directory) — their fix, applied
-here too:
+Rootless podman keeps per-user state under fixed local paths. If several podman invocations from
+the same user land on the same node at the same time (or podman's cached state goes stale after a
+node reboot), they can corrupt each other's storage. Janelia's own fork of the Harbor
+agent-evaluation framework (`JaneliaScientificComputingSystems/harbor`, `hpc/` directory) documents
+the problem and its fix, applied here too:
 ```bash
 unset XDG_RUNTIME_DIR
 podman system migrate 2>/dev/null || true
 podman info >/dev/null 2>&1 || podman system reset -f
 ```
-The `migrate` half is baked into `scripts/podman-run.sh` (runs on every invocation). The
-`reset -f` half was later dropped by both wrappers: with several jobs packed onto one node the
-shared store may be in active use by a sibling's `additionalimagestores`, so an unhealthy
-`podman info` now just disables the image cache for this invocation instead (see "Ported from
-the Harbor fork" below). The `containers/storage.conf` pointing
-`graphroot`/`runroot` at `/scratch/$USER/podman-storage` and `/scratch/$USER/podman-run`
-(keeps podman's own large image/container data off small home-directory quotas) is still a
-manual, one-time, per-user setup step — there's no way to bake a per-user config file
-override into the wrapper the same way, since it's podman's own global config location, not
-something the wrapper's invocation can override per-call.
+The `migrate` half is baked into `scripts/podman-run.sh` (runs on every invocation). The `reset -f`
+half was later dropped by both wrappers: with several jobs packed onto one node the shared store may
+be in active use by a sibling's `additionalimagestores`, so an unhealthy `podman info` now just
+disables the image cache for this invocation (see "Ported from the Harbor fork" below). The
+`containers/storage.conf` pointing `graphroot`/`runroot` at `/scratch/$USER/podman-storage` and
+`/scratch/$USER/podman-run` (keeps podman's own large image/container data off small home-directory
+quotas) is still a manual, one-time, per-user setup step. It is podman's own global config location,
+which the wrapper's invocation cannot override per call.
 
-**Fixed**: `podman-run.sh` now gives every invocation its own graphroot/runroot under
-`/scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/podman` (`manual-<pid>`
-outside LSF; it was `podman-jobs/<job>` until the 2026-10-08 state-dir layout),
-written to a per-job `storage.conf` and handed to podman via `CONTAINERS_STORAGE_CONF`
-(originally `--root`/`--runroot` flags on `podman run`; switched to the environment variable so
-every podman call the script makes — including the `podman rm`/`podman unshare` in cleanup —
-is scoped the same way). That shared root/runroot is what corrupted under concurrent access —
-isolating it removes the collision risk entirely, without needing exclusive-host or
-whole-node reservation at all. It doesn't cost a re-pull for another job landing on the *same*
-node: `additionalimagestores` in the per-job `storage.conf` points at the
-shared one from the user's `storage.conf` as a **read-only** layer source, so the multi-GB image stays
-cached there — only each job's own writable container-layer state (locks, per-container
-metadata) is isolated. This benefit is node-scoped, not cluster-scoped: `storage.conf`'s
-`graphroot`/`runroot` point at `/scratch/$USER`, which per `SETUP.md` §3 is
-transient, node-local scratch, cleaned up on its own regular cycle — not an NFS-shared cache
-other nodes can see. A job landing on a different node, or one that lands after a cleanup
-sweep, still pays a fresh multi-GB pull regardless of this mechanism.
+**Fixed**: `podman-run.sh` gives every invocation its own graphroot/runroot under
+`/scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/podman` (`manual-<pid>` outside
+LSF; it was `podman-jobs/<job>` until the 2026-10-08 state-dir layout), written to a per-job
+`storage.conf` and handed to podman via `CONTAINERS_STORAGE_CONF` (originally `--root`/`--runroot`
+flags on `podman run`; the Harbor section below says why that changed). The shared root/runroot is
+what corrupted under concurrent access, so isolating it removes the collision risk without
+exclusive-host or whole-node reservation. It doesn't cost a re-pull for another job landing on the
+*same* node: `additionalimagestores` in the per-job `storage.conf` points at the shared store from
+the user's `storage.conf` as a **read-only** layer source, so the multi-GB image stays cached there
+and only each job's own writable container-layer state (locks, per-container metadata) is isolated.
+The benefit is node-scoped, not cluster-scoped: `storage.conf`'s `graphroot`/`runroot` point at
+`/scratch/$USER`, which per `SETUP.md` §3 is transient, node-local scratch, cleaned up on its own
+regular cycle, not an NFS-shared cache other nodes can see. A job landing on a different node, or
+one that lands after a cleanup sweep, still pays a fresh multi-GB pull.
 
 Verified live, two concurrent `podman-run.sh` invocations pinned to the same node, no
-`-x`/whole-node reservation: both completed successfully with no storage errors, and each saw
-the already-pulled image instantly via the additional store rather than re-pulling it.
+`-x`/whole-node reservation: both completed successfully with no storage errors, and each saw the
+already-pulled image instantly via the additional store rather than re-pulling it.
 
-**Why this wasn't the design from the start**: it was identified as the correct fix early on
-(confirmed working via a manual `podman --root ... --runroot ... info` check) but not built
-into the wrapper immediately — whole-node reservation was the safe, already-verified interim
-answer while this got built and tested under real concurrent load, which is what the two rough
-edges below came from.
+**Rough edge #1 — lingering `catatonit` blocks `podman run` itself from returning.** `catatonit`
+(podman's tiny container-init) occasionally isn't reaped by podman's own monitor process after the
+container's command finishes. It gets reparented to PID 1 first, and then podman's own bookkeeping
+(`podman ps`/`rm -f`) no longer sees it at all. This is an independently confirmed, pre-existing
+issue on this cluster: Janelia's Harbor/LSF fork (`hpc/README.md`) hits the identical thing and
+works around it with a blanket `trap "pkill -u $USER catatonit 2>/dev/null" EXIT` in `.bashrc`. That
+is safe for them because their documented model is one podman job per node at a time, so "every
+catatonit this user owns on this node" and "my catatonit" are the same set. It is **not** safe here:
+with *multiple* podman jobs per node, a blanket kill could kill a sibling job's still-running
+container.
 
-**Rough edge #1 — lingering `catatonit` blocks `podman run` itself from returning.**
-`catatonit` (podman's tiny container-init) occasionally doesn't get reaped by podman's own
-monitor process after the container's command finishes — it gets reparented to PID 1 first,
-at which point podman's own bookkeeping (`podman ps`/`rm -f`) no longer sees it at all. This is
-an independently-confirmed, pre-existing issue on this exact cluster: Janelia's own Harbor/LSF
-fork (`hpc/README.md`) hits the identical thing and works around it with a blanket
-`trap "pkill -u $USER catatonit 2>/dev/null" EXIT` in `.bashrc`. That blanket fix is safe for
-them because their own documented model is one podman job per node at a time — "every
-catatonit this user owns on this node" and "my catatonit" are the same set. It is **not** safe
-here, since the whole point of this section is running *multiple* podman jobs per node
-concurrently — a blanket kill could kill a sibling job's still-running container.
+Confirmed live (two real, separate LSF jobs pinned to the same GPU node): without killing it, the
+job hung in `RUN` for minutes after the container's command had printed all its output and exited.
+`podman run` itself was still blocked on the orphaned process, so a post-hoc cleanup trap (which
+only runs once `podman run` returns) never fired. Fixed with a **concurrent watchdog**: `podman run`
+launches in the background, and a sibling subshell polls for and kills any orphaned `catatonit`
+belonging to *this job specifically* while the main wait is in progress. Two conditions are both
+required (checking only one is unsafe, see rough edge #2): `PPID == 1` (actually orphaned, not just
+referencing our path while still healthy) **and** an environment (`/proc/<pid>/environ`) that
+references this job's unique storage path (so it's never a sibling's). The match was originally on
+`/proc/<pid>/mountinfo`. See "Ported from the Harbor fork" below for why that never fired.
 
-Confirmed live (submitted two real, separate LSF jobs pinned to the same GPU node): without
-killing it, the job hung in `RUN` for minutes after the container's own command had already
-printed all its output and exited — `podman run` itself was still blocked waiting on the
-now-orphaned process, so a post-hoc cleanup trap (which only runs once `podman run` returns)
-never got a chance to fire. Fixed with a **concurrent watchdog** — `podman run` now launches
-in the background, a sibling subshell polls for and kills any orphaned `catatonit` belonging
-to *this job specifically* while the main wait is still in progress, scoped by two conditions
-together (both required — confirmed live that checking only one is unsafe, see rough edge #2):
-`PPID == 1` (actually orphaned, not just referencing our path while still healthy) **and** its
-environment (`/proc/<pid>/environ`) references this job's unique storage path (so it's never a
-sibling's). The match was originally on `/proc/<pid>/mountinfo`; see "Ported from the Harbor
-fork" below for why that never actually fired.
+**Rough edge #2 — a real exit-code bug, unrelated to `catatonit`, found while testing #1.** The
+first attempt at rough edge #1 checked *only* the mount-namespace condition, with no PPID check.
+Confirmed live that this is unsafe: it also matches our *own* container's healthy `catatonit` while
+it is still running (its mount namespace also references our job's storage path), so the watchdog
+could SIGKILL our own container mid-shutdown, before it reported its real exit status. Symptom:
+`podman-run.sh` exited `1` on every run, whether the command inside exited `0`, `42`, or anything
+else. Adding the `PPID == 1` condition (kill only if BOTH match) fixed this cause.
 
-**Rough edge #2 — a real exit-code bug, unrelated to `catatonit`, found while testing #1.**
-The very first attempt at rough edge #1 checked *only* the mount-namespace condition, no PPID
-check. Confirmed live this is unsafe on its own: it also matches our *own* container's
-perfectly healthy `catatonit` while it's still legitimately running (a healthy catatonit's
-mount namespace obviously also references our own job's storage path) — so the watchdog could
-SIGKILL our own container mid-shutdown, before it reported its real exit status. Symptom: every
-run's `podman-run.sh` exit code came back as `1`, regardless of whether the actual command
-inside exited `0`, `42`, or anything else. Adding the `PPID == 1` condition on top (kill only
-if BOTH match) fixed this specific cause.
+The wrong-exit-code symptom **persisted after that fix**, which surfaced a second, unrelated bug:
+bash's `EXIT` trap uses the **trap function's own last command's exit status** as the script's real
+exit code, overriding whatever value was passed to `exit N`, unless the trap itself calls `exit`
+explicitly. `cleanup()`'s last line was `[[ -e "$JOB_STORAGE_DIR" ]] && echo "...still busy..." >&2`.
+In the common, successful case where cleanup had already removed that directory, the test is false,
+and the line, the trap and the script exit `1`. Confirmed live via `bash -x`: the trace showed
+`+ exit 0` (the correct code, reached) immediately followed by an observed exit status of `1`. Fixed
+by making `cleanup()`'s last statement an unconditional `true`, and converting the bare
+`[[ ]] && echo` idiom to a proper `if`/`fi`. **Lesson for any future edit to this trap**: the last
+line of `cleanup()` is load-bearing for every exit code this script ever returns. Never let it be a
+condition that can evaluate false.
 
-But the wrong-exit-code symptom **persisted after that fix**, which is what surfaced a second,
-completely unrelated bug: bash's `EXIT` trap uses the **trap function's own last command's
-exit status** as the script's real exit code, silently overriding whatever value was passed to
-`exit N`, unless the trap itself calls `exit` explicitly. `cleanup()`'s last line was
-`[[ -e "$JOB_STORAGE_DIR" ]] && echo "...still busy..." >&2` — in the common, successful case
-where cleanup already removed that directory, this test evaluates false, giving the whole
-line (and thus the trap, and thus the script) exit status `1` — regardless of what the real
-command actually exited with. Confirmed live via `bash -x`: the trace showed `+ exit 0` (the
-correct code, genuinely reached) immediately followed by the trap silently turning the
-process's real, observed exit status into `1` anyway. Fixed by making sure `cleanup()`'s
-actual last statement is always an unconditional `true`, and converting the bare
-`[[ ]] && echo` idiom to a proper `if`/`fi` so it can never be mistaken for the function's
-final word again. **Lesson for any future edit to this trap**: the last line of `cleanup()` is
-load-bearing for every exit code this script ever returns — never let it be a condition that
-can evaluate false.
+**Rough edge #3 — backgrounding `podman run` silently drops stdin.** The watchdog needs `podman run`
+launched with `&`. Confirmed live that this broke stdin: `echo "x" | podman-run.sh -- cat` produced
+no output, because bash redirects a backgrounded job's stdin from `/dev/null` whatever the job was
+passed (a piped file, a real tty). It would have broken piping input into a container, and likely
+degraded real interactive sessions (`claude`/`opencode`) too, despite `-it` being set correctly on
+the podman command. The problem is one layer up, in how the wrapper invokes podman. Fixed by
+capturing the original stdin on a separate file descriptor (`exec 3<&0`) before anything
+backgrounds, then redirecting the backgrounded podman command to it (`<&3`). Verified live:
+`echo "x" | podman-run.sh -- cat` prints `x`.
 
-**Rough edge #3 — backgrounding `podman run` silently drops stdin.** The watchdog fix above
-requires launching `podman run` with `&` so the concurrent watchdog subshell can run alongside
-it. Confirmed live this broke stdin entirely: `echo "x" | podman-run.sh -- cat` produced no
-output at all once `podman run` moved to the background — bash redirects a backgrounded job's
-stdin from `/dev/null` regardless of what the job itself was passed (a piped file, a real tty,
-whatever). This would have silently broken piping input into a container, and likely degraded
-real interactive sessions (`claude`/`opencode`) too, despite `-it` being set correctly on the
-podman command itself — the problem is one layer up, in how the wrapper script invokes podman,
-not in podman's own flags. Fixed by capturing the original stdin on a separate file descriptor
-(`exec 3<&0`) before anything backgrounds, then explicitly redirecting the backgrounded podman
-command to it (`<&3`) — verified live: `echo "x" | podman-run.sh -- cat` now correctly prints
-`x`.
-
-Verified together, end to end, on real hardware across two separate 8-job batches (8 separate
-LSF jobs pinned to the same 8-GPU node, one real GPU each, no exclusive/whole-node
-reservation; the second batch ran actual GPU work — a PyTorch matmul loop per job, staggered
-60–300s durations, not just `nvidia-smi`/`echo`): all 16 completed `DONE` with correct exit
-codes, and **zero** lingering `catatonit`/`conmon`/`podman` processes on the host in either
-batch — the process-level fix holds up under real load. The storage-dir cleanup is weaker than
-"rare": about 2 of 8 jobs per batch left a small leftover dir (a few KB of lock/metadata
-files, no image data) that didn't clear within the 30s retry window, consistently across both
-batches — call it roughly 1 in 4, not a rare edge case. Still low-severity (no live process,
-no real disk cost, self-clears on `/scratch`'s own cleanup cycle) but worth being honest about
-the actual frequency rather than implying it's unusual.
+Verified together, end to end, on real hardware across two separate 8-job batches (8 separate LSF
+jobs pinned to the same 8-GPU node, one real GPU each, no exclusive/whole-node reservation; the
+second batch ran actual GPU work, a PyTorch matmul loop per job with staggered 60–300s durations,
+not just `nvidia-smi`/`echo`): all 16 completed `DONE` with correct exit codes, and **zero**
+lingering `catatonit`/`conmon`/`podman` processes on the host in either batch. The storage-dir
+cleanup is weaker: about 2 of 8 jobs per batch, roughly 1 in 4 and consistent across both batches,
+left a small leftover dir (a few KB of lock/metadata files, no image data) that didn't clear within
+the 30s retry window. Low severity: no live process, no real disk cost, and it self-clears on
+`/scratch`'s own cleanup cycle.
 
 ### Ported from the Harbor fork (2026-09-23)
 
@@ -681,8 +475,9 @@ invocations pinned to one node with `bsub -m`)**: 11/12 pass, the one failure be
 invoking account's expired Claude OAuth session (now correctly reported as a FAIL — the test
 previously matched only `^Error:` and passed on "Failed to authenticate"). Both concurrent
 invocations ran to completion, every job dir was removed, no `catatonit` survived, and the LSF
-job ended the same second the script did (no lingering RUN). Two bugs found and fixed on the
-way, both also present in the Harbor wrapper:
+job ended the same second the script did (no lingering RUN). Three bugs found and fixed on the
+way. The first and the third were recorded then as also present in the Harbor wrapper. The second
+was found and added later:
 
 - **The shared store's DB gets stamped with a per-job tmp dir.** Podman records its libpod tmp
   dir in the store's own database (`DBConfig.TmpDir` in `<graphroot>/db.sql`) when it first
@@ -696,8 +491,10 @@ way, both also present in the Harbor wrapper:
   per-job value is exported together with `CONTAINERS_STORAGE_CONF` afterwards, the sweep also
   matches the prologue's shared pause process by our own `LSB_JOBID` environ entry, and
   `repair_shared_store_tmpdir` rewrites an already-poisoned `DBConfig.TmpDir` back to podman's
-  stable default (`${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp`) — a one-column sqlite update,
-  since podman offers nothing short of `system reset` for this.
+  stable default (`<runtime dir>/libpod/tmp`, with the runtime dir derived as the next bullet
+  says) — a one-column sqlite update, since podman offers nothing short of `system reset` for
+  this. The first version of the repair wrote `${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp`, which
+  commit `c7d43f2` corrected.
 - **Killing the shared pause process leaves a `pause.pid` podman 5.8.2 may not recover from.**
   The sweep's `LSB_JOBID` branch (needed so the prologue's shared pause doesn't hold the LSF
   job in RUN) leaves `<runtime dir>/libpod/tmp/pause.pid` naming a dead pid. Confirmed live on
@@ -736,44 +533,26 @@ for the same account — both drive opencode against the same `~/.local/share/op
 > GPU image `nvidia-smi` lists the job's GPU, `torch.cuda.is_available()` is true and a matrix
 > product runs on it, `ray` 2.60.0 imports, `--keep-id` works, and `claude` 2.1.329, `opencode`
 > 1.19.6 and `codex-cli` 0.171.0 run. The previous images stay on GHCR as `test-2026-11` (default)
-> and `test-2026-11-pt2607` (GPU). The entries below are the history.
+> and `test-2026-11-pt2607` (GPU). The earlier entries are the history, in
+> `ADMIN-NOTES-history.md` under the same heading.
 
-**`podman/Dockerfile.pytorch`** (the original default, built on
-`nvcr.io/nvidia/pytorch:26.07-py3` — CUDA 13.3.1, PyTorch 2.13, confirmed current as of the
-build date via NVIDIA's own release notes — plus Node.js, `@anthropic-ai/claude-code`, and
-opencode). Verified live in one build+run job: `nvidia-smi -L` returned a real GPU UUID,
-`claude --version` → `2.1.197 (Claude Code)`, `opencode --version` → `1.18.23`.
+The PyTorch base stays at 26.07. A build on `nvcr.io/nvidia/pytorch:26.11-py3` (PyTorch 2.15,
+CUDA 13.5, NCCL 2.32.6) worked but was slower in `test_torchrun_ibstress.py`, a cross-node
+all-reduce benchmark. The build and the measurement were made on 2026-11-19 on the `multi-node`
+branch, under `podman-run.sh` with that branch's multi-node options, same wrapper and settings for
+both images:
 
-Pushed to `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` — confirmed
-live via the GitHub API that the package exists after push (`podman push` reported `Writing
-manifest to image destination`, the standard success line). The GHCR copy is the exact same
-image pushed straight from the verified build, not a separately-built artifact.
+| Nodes | 26.07 (NCCL 2.30.7) | 26.11 (NCCL 2.32.6) |
+| --- | --- | --- |
+| 2 x H200, 16 GPUs, sustained 60 s | 482.0 GB/s (twice) | 462.4 GB/s |
+| 4 x H100, 32 GPUs, sustained 60 s | 379.4 GB/s | 361.7 GB/s |
 
-Made public alongside the repo so `podman pull` needs no `podman login` first.
+The cause was not looked for. Both images print `NCCL WARN Call to ibv_query_port_speed failed`,
+so that warning is not it.
 
-**`podman/Dockerfile`** (now the default, renamed from `Dockerfile.lite`; the
-above became `Dockerfile.pytorch`): bare `nvcr.io/nvidia/cuda:13.3.0-base-ubuntu22.04` (same
-CUDA version as the PyTorch image's toolkit) plus Node.js, Claude Code, and opencode, no ML
-framework stack. Built and verified live via a real LSF GPU job as an ordinary user (not
-root): GPU passthrough confirmed (`nvidia-smi --query-gpu=name,driver_version` → `NVIDIA L4,
-610.43.02`), `claude --version` → `2.1.267 (Claude Code)`, `opencode --version` → `1.18.30`.
-Final image size **1.24GB**, vs. the PyTorch image's multi-GB footprint (`podman images`
-confirmed both side by side on the same node).
-
-Pushed to `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` from that
-same build (tag + push, not a separate rebuild) — confirmed via the GitHub API that the
-package exists, then made public via the GHCR web UI (no REST API endpoint exists for
-changing a container package's visibility — confirmed live: `PATCH
-/orgs/.../packages/container/...` 404s even though `GET` on the identical path succeeds).
-`podman-run.sh`'s default `--image` now points here instead of `agentic-sandbox-gpu`.
-
-**Rebuilt 2026-10-08** (`agentic-sandbox-gpu:latest`, digest `sha256:3a88ffe0…`): added the
-same `chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode` the lite image has had
-since 2026-09-10, so `--keep-id` can run both CLIs on this image too (previously
-`Permission denied`: `/root` is 0700 and the `/usr/local/bin` symlinks point into it). Built
-with `--no-cache` so the installers fetched current CLIs: `claude --version` → `2.1.294`,
-`opencode --version` → `1.18.35`. Verified live on `gpu_l4` under `--keep-id` against the
-published tag: both CLIs run as the real uid, `torch.cuda.is_available()` → `True`.
+The comment written into `podman/Dockerfile.pytorch` that day gave 348 against 378 GB/s for the
+four-node case (8% slower), which does not match the row above (5% slower). The two were not
+reconciled, so the comment now says 5 to 8%.
 
 ### bwrap `--gpu` (2026-11-03)
 
@@ -819,7 +598,8 @@ needs `sandbox_scripts_dir` pointing at this checkout (the default
 from a `--csub` sandbox in `/nrs/das/...`: `csub submit --walltime 5 --gpus 1 -q gpu_short --wait --
 nvidia-smi -L` ran as LSF job 155187444 "via bwrap" on a different GPU (UUID differs from the
 parent's) and printed one L4, exit 0. The child's own `sandbox-run.sh --gpu` took its allocation
-from the job's `CUDA_VISIBLE_DEVICES`.
+from the job's `CUDA_VISIBLE_DEVICES`. The csub change was merged on 2026-11-15 as csub PR #15
+(`CHANGELOG.md`, entry of 2026-11-14).
 
 Review before merging (2026-11-14, as an ordinary user through `bsub`, two L4s on an 8-GPU node):
 the sandbox had two `/dev/nvidiaN` nodes and `mknod` failed for every minor; `/sys` held only
@@ -832,7 +612,7 @@ does not exist inside (`cuInit` 100, "No CUDA GPUs are available"). The value is
 rank among the bound ones. On that node `cuda/12-latest` (12.9) had no `cuda_runtime.h`; the 13.x
 toolkits did.
 
-### `--csub`: the seam to Stephan Saalfeld's csub broker (2026-10-12)
+## `--csub`: the seam to Stephan Saalfeld's csub broker (2026-10-12)
 
 csub (saalfeldlab/csub) is a policy-checked job broker: a sandboxed client sends a JSON
 request, a broker running as the user outside the sandbox validates it against
@@ -869,7 +649,7 @@ without `span[hosts=1]`, csub's own per-job wrapper has only an EXIT trap so a `
 leaks its broker, canonical-path rule for mounts, and no `CLAUDE.md` in the repo though
 referenced.
 
-### `--csub` envelope: closing the mount-claim gap (2026-10-31)
+## `--csub` envelope: closing the mount-claim gap (2026-10-31)
 
 Until csub #12/#13, the broker checked a client's `CSUB_MOUNTS` and `--cwd` against the policy's
 `allowed_roots` only, so a sandboxed agent could have a child job mount any directory under a
@@ -902,7 +682,7 @@ broker, an `--agent opencode` child accepted with `--allow litellm.int.janelia.o
 without it ("host ... is not allowed in the parent job"), and no state dir or broker left after
 the early exits.
 
-### Review follow-ups: masks, bind order, podman refusals, `/dev/shm` (2026-11-09/10)
+## Review follow-ups: masks, bind order, podman refusals, `/dev/shm` (2026-11-09/10)
 
 A full review of `main` at `265b038` found two high-severity defects in `sandbox-run.sh`, three
 medium ones across the wrappers and the proxy, and a list of small ones. Everything below was
@@ -963,11 +743,10 @@ size a real training job needs was not measured, and the reporter was asked to c
 (added in `2ab3526`). Two failures seen on the way were environmental: an expired Claude login
 (both suites, until re-login), and the 3-question opencode loop returning two answers once.
 
-**Still open from that review:** CONNECT reaches any port on an allowed host; opencode's cache and
-state dirs are bound read-write; `podman run` drops no capabilities and sets no pids limit; images
-are pulled by `:latest`.
+**Still open from that review:** carried in the "Left open" list under "Review findings closed
+after the two holes (2026-11-21)".
 
-### Podman logging forced off in the wrapper (2026-11-10)
+## Podman logging forced off in the wrapper (2026-11-10)
 
 The compute nodes' podman (5.8.2) defaults to `log_driver = "journald"`: conmon is started with
 `-l journald` and copies the container's whole pty stream into the node's journal, and rsyslog
@@ -989,7 +768,7 @@ starts podman itself). For those the fix is the user's `containers.conf`, or a n
 `/etc/containers/containers.conf` with `[containers] log_driver = "none"`, which applies to
 everyone who has not set the option themselves.
 
-### Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
+## Per-job state layout — one dir on scratch, nothing in /tmp (2026-10-08)
 
 Policy: the wrappers must not write to `/tmp` on the nodes. Constraints that shaped the
 layout: a Unix socket cannot be bound on NFS (so the proxy socket must be node-local); the
@@ -1025,40 +804,37 @@ that inherits the wrapper's stdout keeps any `$(...)`/pipe around the wrapper op
 `sleep` ends (it hung the podman smoke test for a full hour; stdio must be detached), and
 killing such a subshell orphans its current `sleep` (kill the children first).
 
-### Cleanup bugs in both wrappers, found and fixed the same way
+## Cleanup bugs in both wrappers, found and fixed the same way
 
-**bwrap (`sandbox-run.sh`)**: two separate leaks, both found by testing "does anything
-survive a *normal* job exit," not just a `bkill`.
-- The host-side allowlist proxy, started with plain `&`, was found still running on the exec
-  host well after its job showed `Successfully completed` — because normal job completion
-  does **not** sweep the cgroup for stragglers the way `bkill` actively does (verified as two
-  genuinely different code paths, not an assumption). Fixed with a `trap cleanup EXIT` in the
-  wrapper, and making sure the final `bwrap` invocation is *not* `exec`'d (an earlier version
-  used `exec bwrap ...`, which replaces the wrapper script's own process image and would have
-  skipped the trap entirely).
-- A second, sneakier leak: the in-sandbox relay, backgrounded with `&` before `exec "$@"`
-  replaces that shell, had no parent left to clean it up once the main wrapped command
-  exited — multiple orphaned `relay.py` processes, each still holding a sandbox network
-  namespace open, were found surviving across several completed jobs from earlier testing.
-  Fixed by adding `--unshare-pid`: when the namespace's PID-1 process (bwrap's own tiny
-  reaper) exits, the kernel forcibly kills everything else left in that namespace.
-  Verified fixed: a normal-exit job left neither the host-side proxy nor the in-sandbox relay
-  running, and a live opencode+Kimi K3 query (`15+3` → `18`) still worked with
-  `--unshare-pid` added.
+**bwrap (`sandbox-run.sh`)**: two separate leaks, both found by testing "does anything survive a
+*normal* job exit," not just a `bkill`.
+- The host-side allowlist proxy, started with plain `&`, was still running on the exec host well
+  after its job showed `Successfully completed`. Normal job completion does **not** sweep the cgroup
+  for stragglers the way `bkill` does (verified as two different code paths). Fixed with a
+  `trap cleanup EXIT` in the wrapper, and by making sure `bwrap` does not replace the wrapper's
+  own process. An earlier version used `exec bwrap ...`, which replaces the wrapper script's own
+  process image and would have skipped the trap entirely. Today `bwrap` is `exec`'d inside a
+  subshell (`run_bwrap`), so the wrapper's EXIT trap still runs.
+- The in-sandbox relay, backgrounded with `&` before `exec "$@"` replaces that shell, had no parent
+  left to clean it up once the main wrapped command exited. Multiple orphaned `relay.py` processes,
+  each still holding a sandbox network namespace open, had survived several completed jobs from
+  earlier testing. Fixed by adding `--unshare-pid`: when the namespace's PID-1 process (bwrap's own
+  tiny reaper) exits, the kernel kills everything else left in that namespace. Verified fixed: a
+  normal-exit job left neither the host-side proxy nor the in-sandbox relay running, and a live
+  opencode+Kimi K3 query (`15+3` → `18`) still worked with `--unshare-pid` added.
 
-**Podman (`podman-run.sh`)**: an early version had the exact same class of two bugs.
-- An array-expansion quirk (`"${VOLUMES[@]:-}"` on a declared-but-empty array expands to one
-  stray empty-string element, not zero elements) injected a bogus empty argument into the
-  `podman run` command, which podman misparsed as the image name — `Error: parsing reference
-  "": repository name must have at least one component`. Fixed by guarding with
-  `[[ ${#VOLUMES[@]} -gt 0 ]] &&` instead of relying on the `:-` fallback.
-- The same `exec`-skips-trap bug as bwrap's, fixed the same way (no `exec` on the branch that
-  starts a background proxy).
-- Podman containers get their own PID namespace by default (unlike bwrap, which needed the
-  explicit `--unshare-pid` fix above) — so the in-container backgrounded relay is cleaned up
-  by the kernel automatically, no extra flag needed on podman's side for that half of it.
-  Confirmed live: after the fixes, a normal-exit job left neither the host-side proxy nor the
-  container running.
+**Podman (`podman-run.sh`)**: an early version had the same class of bugs.
+- An array-expansion quirk: `"${VOLUMES[@]:-}"` on a declared-but-empty array expands to one stray
+  empty-string element, not zero elements. That put an empty argument into the `podman run` command,
+  which podman read as the image name: `Error: parsing reference "": repository name must have at
+  least one component`. Fixed by guarding with `[[ ${#VOLUMES[@]} -gt 0 ]] &&` instead of relying on
+  the `:-` fallback.
+- The same `exec`-skips-trap bug as bwrap's, fixed the same way (no `exec` on the branch that starts
+  a background proxy).
+- Podman containers get their own PID namespace by default (unlike bwrap, which needed the explicit
+  `--unshare-pid` fix above), so the kernel cleans up the in-container backgrounded relay with no
+  extra flag. Confirmed live: after the fixes, a normal-exit job left neither the host-side proxy
+  nor the container running.
 
 ## An agent off the cluster: `ssh-entry.sh` — design and evidence
 
@@ -1235,6 +1011,8 @@ nodes, so another user cannot create `/scratch/<you>` first.
 - `examples/unattended-tuning`: the labels of the "hidden" test set are in the file handed to the
   agent's own `train.py`.
 - Refusal tests that assert only exit status 1, and the smaller input checks in `csub-policy.sh`.
+- From the 2026-11-09/10 review: CONNECT reaches any port on an allowed host; opencode's cache and
+  state dirs are bound read-write; `podman run` drops no capabilities and sets no pids limit.
 
 ## Running under LSF — full evidence
 
@@ -1287,31 +1065,5 @@ usernames and group names, not just raw UID/GID numbers.
 
 ## README restructured; verification record (2026-10-16)
 
-`README.md` was rewritten as a use document (339 lines, from 905): quick start, a flag chooser,
-one "how it works" section, `--csub`, an image table, a consolidated security model with explicit
-non-protections, testing, troubleshooting. One-time setup moved to `SETUP.md`, behaviour changes
-to `CHANGELOG.md`. The dated "confirmed live" statements it used to carry are recorded here so
-nothing is lost:
-
-- `$HOME` stopped being bound by default on 2026-09-10 (previously always, read-only).
-- `--keep-id` verified end to end on 2026-09-10 once HPC widened the account's subuid/subgid range
-  to 131072; a standard 65536-wide range fails with "potentially insufficient UIDs or GIDs".
-- podman creates `/scratch/$USER/podman-run` and `podman-storage` itself on a node it has never
-  run on; no manual `mkdir`.
-- A file written from the default (container-root) identity to a `--rw` path lands owned by the
-  real user (test 11b); `--keep-id` changes only the identity seen from inside.
-- `agentic-sandbox-gpu:latest` rebuilt 2026-10-08 with the `/root` chmod; `claude --version`
-  2.1.294, `opencode --version` 1.18.35; `--keep-id` CLIs verified against the published tag.
-- LSF cgroup GPU fencing: a 1-GPU job on an 8-GPU `gpu_l4` node sees one GPU inside a
-  `gpu=all` container; `nvidia-smi -i 1` on the host reports no device; `CUDA_VISIBLE_DEVICES`
-  is `0` in every 1-GPU job (2026-10-08).
-- Two concurrent podman jobs pinned to one node ran to completion with isolated state (2026-10-08).
-- Running from the checkout: the wrapper re-binds `scripts/` read-only (PR #5, test 13).
-- Fresh `claude auth login` inside the sandbox verified rigorously (logged out outside first).
-- Kimi K3 refusals observed in both shapes on the same prompt: gateway `GuardrailRaisedException`
-  (`content_harm`, September) and model prose (October). On 2026-10-16 three attempts were all
-  model prose; whether the gateway guardrail is still attached to the test key is unverified.
-- `--csub` verified 2026-10-12 and again 2026-10-16: probe, submit with wait, status, policy
-  rejection (rc 3), grandchild; nothing left behind.
-- The in-sandbox `/run/sandbox/README.md` verified 2026-10-16 under both wrappers with `--csub`
-  and `--claude`; the `CLAUDE.md` pointer lands in the per-job copy only.
+This section lists the dated "confirmed live" statements that `README.md` carried until it was
+rewritten as a use document. History: see `ADMIN-NOTES-history.md`, same heading.

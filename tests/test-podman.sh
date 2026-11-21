@@ -10,7 +10,7 @@
 #
 # User-agnostic: uses $USER/$HOME/$(whoami) throughout, no hardcoded account names.
 # --keep-id tests require a /etc/subuid//etc/subgid range wider than the invoking account's
-# real GID -- see ADMIN-NOTES.md's "--userns=keep-id, revisited" section if those fail. The
+# real GID -- see ADMIN-NOTES-history.md's "--userns=keep-id, revisited" section if those fail. The
 # --csub section runs only when csub-broker is on PATH and CSUB_TEST_ROOT is set. Whatever is
 # skipped is counted in the summary line.
 set -uo pipefail
