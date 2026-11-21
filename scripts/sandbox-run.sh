@@ -185,7 +185,7 @@ while [[ $# -gt 0 ]]; do
     --opencode)
       WANT_OPENCODE=1
       # Same reasoning as --claude above: opencode's own installer puts the actual binary
-      # under ~/.opencode/bin/opencode, separate from its four XDG state dirs above.
+      # under ~/.opencode/bin/opencode, separate from its XDG dirs (config, data, state, cache).
       # Read-only, same rationale.
       RO_TRY_BINDS+=("$HOME/.opencode")
       PATH_PREPEND+="$HOME/.opencode/bin:"

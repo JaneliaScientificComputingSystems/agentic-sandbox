@@ -1,6 +1,7 @@
 # One-time setup
 
-Everything here is per account and done once. None of it runs on a login node: start an
+Everything here is per account and done once. None of it runs on a login node, except the one file
+edit in §8 step 4: start an
 interactive job first (`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only) and do
 the setup there. The README assumes
 all of this is in place.
@@ -257,8 +258,8 @@ ssh-keygen -t ed25519 -N '' -C agent-cluster -f ~/.ssh/agent_cluster
 ```
 
 3. `LAPTOP`: add an alias to `~/.ssh/config`, with your cluster user name, and copy the public half of
-   the key over with your own login. The last three lines keep the agent from ever using your
-   personal key.
+   the key over with your own login. Of the last three lines, the first two keep the agent
+   from ever using your personal key, and `BatchMode` makes ssh fail where it would otherwise prompt.
 
 ```
 Host janelia-agent

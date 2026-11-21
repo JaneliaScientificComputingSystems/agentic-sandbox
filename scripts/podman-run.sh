@@ -10,7 +10,7 @@
 #
 # Options:
 #   --image NAME    Image to run (default: agentic-sandbox-lite, the lightweight pre-built
-#                    image on GHCR -- `podman pull` it first, or build your own locally with
+#                    image on GHCR -- pulled and kept current by this script, or build your own locally with
 #                    `podman build -t agentic-sandbox-lite:latest .` in this directory and
 #                    pass `--image localhost/agentic-sandbox-lite:latest`. For a heavier
 #                    image with PyTorch/cuDNN preinstalled, build ./Dockerfile.pytorch
@@ -70,7 +70,7 @@
 #                    (width > your real gid, not just "a range") if you hit this.
 #   -h, --help      Show help
 #
-# Unlike sandbox-run.sh, $HOME is NOT bound by default here -- use --rw/--ro if you need your
+# As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro if you need your
 # real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
 # here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
 # covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
@@ -201,7 +201,7 @@ fi
 # exists as a mount point, exactly as it did when the real dir was bound. So opencode's config
 # AND data dirs use the HOME-dependent destination: default (no --keep-id) the container runs
 # as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
-# -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "identity/HOME saga" for why
+# -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "Identity and $HOME under podman" for why
 # forcing identity without remapping failed.
 # Per-job state directory: ONE place for everything this wrapper creates for a run --
 # podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/

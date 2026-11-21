@@ -35,7 +35,8 @@ Metric: mean per-image F1 at IoU 0.5. The gain holds on the hidden set. The agen
 | 4 | dilated boundary targets | 0.862 |
 
 It kept trial 1, wrote its summary and stopped after 4 of 6 trials and 29 of 40 minutes, saying a fifth job
-would run past the limit with no time to finalise. Two honest caveats: the one big gain came in trial 1, and
+would run past the limit with no time to finalise. (Its own `notes.md` and `FINAL.md` say it "stopped at the
+40-minute limit"; the transcript shows about 29 minutes used.) Two honest caveats: the one big gain came in trial 1, and
 trials 2 to 4 were judged on single-seed differences of 0.01 to 0.02, which is the size of the seed noise
 (the standard deviation across seeds of the same code is about 0.02). The iteration here is mostly "one good
 design, then variations that did not clearly help".
@@ -93,8 +94,8 @@ Both fail the same way: the allowlist proxy refuses the connection. Two things t
 Copy `scripts/env.sh.example` to `env.sh`, edit it (`R`, `HOLDOUT`, `MODEL_HOST`, `SANDBOX`) and `source` it before
 running anything below.
 
-**Step 0. Prerequisites** (see `SETUP.md`): rootless podman works, csub is installed and the broker policy
-`~/.config/csub/broker.toml` exists, and a LiteLLM key for `kimi-k3` is in `~/.config/opencode/opencode.json`.
+**Step 0. Prerequisites** (see `SETUP.md`): rootless podman works, csub is installed (step 3 writes its
+policy), and a LiteLLM key for `kimi-k3` is in `~/.config/opencode/opencode.json`.
 
 **Step 1. Data** (`scripts/prepare_data.py`). On a machine with internet and numpy and pillow in a venv, run it:
 it downloads BBBC038 (83 MB), keeps the 334 grayscale 256x256 fluorescence images and writes `train.npz`

@@ -4,6 +4,9 @@ This is the "why," not the "how to use" — full test evidence, exact error text
 that was ruled out along the way, and the design rationale behind every choice in the main
 README. If you just want to *use* this repo, you don't need this file; see `README.md`.
 
+Sections are grouped by topic, not by date. Each carries its own dates, and an entry describes the
+state on its date, which later entries and `CHANGELOG.md` may have changed.
+
 ## How bwrap actually works, mechanically
 
 bwrap doesn't create a "container" in the Docker/Podman sense. It uses Linux namespaces
@@ -477,7 +480,7 @@ override-by-recency behavior for a mount nested inside an already-bound ancestor
 **Decision**: removed the masking code from `podman-run.sh` entirely rather than ship it
 broken — a `--tmpfs` that shows correctly in `df -h` while the real credentials stay fully
 readable underneath is worse than no masking, since it looks protected and isn't.
-`podman-run.sh` now documents (header comment, README's Filesystem access / GPU sections)
+`podman-run.sh` now documents (header comment, README's "How the sandbox works" and GPU sections)
 that `$HOME` (or any path containing it) must never go to `--rw`/`--ro` — there's no safe
 partial-exposure mechanism the way bwrap has. Matches Anthropic's own secure-deployment
 guide's actual pattern: their hardened Docker example never mounts the real home directory
@@ -1066,7 +1069,8 @@ to be in both the key line and the policy.
 - From a Mac through the key: `hostname; pwd` returns a compute node and the project directory;
   `ls ~/.ssh` fails with no such directory; `bsub -V` is not found; `curl` to an unlisted site fails.
 - The exit status and the three streams come back; `scp` into the project directory works.
-- `csub probe` and `csub submit --wait` work from the session; a child job on another node runs in
+- `csub probe` and `csub submit --wait` work from the session (since 2026-11-21 the laptop instruction
+  files tell agents not to use `--wait` from a laptop); a child job on another node runs in
   its own sandbox. With PyPI in the policy only, a job that needed it was refused with `host pypi.org
   is not allowed in the parent job`; with `--allow` in the key line as well, it ran.
 - `--ro /nrs/ml_datasets` in the key line and the policy: listed read-only in `$SANDBOX_README`,
@@ -1130,7 +1134,7 @@ both directly via `bwrap` and through the wrapper: `whoami`/`id` correctly resol
 usernames and group names, not just raw UID/GID numbers.
 
 
-### README restructured; verification record (2026-10-16)
+## README restructured; verification record (2026-10-16)
 
 `README.md` was rewritten as a use document (339 lines, from 905): quick start, a flag chooser,
 one "how it works" section, `--csub`, an image table, a consolidated security model with explicit

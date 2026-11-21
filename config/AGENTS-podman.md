@@ -14,6 +14,7 @@ All computation, compilation and installation happens on the cluster, never on t
   description lists.
 - For anything longer than a few minutes, or needing more CPUs or a GPU, submit a job:
   ssh janelia-agent 'csub submit --cpus N --walltime MIN -q short -- <command>'
+  For a GPU add --gpus 1 and name a GPU queue in place of short; csub probe lists them.
   It prints the job id and returns. Check on the job with
   ssh janelia-agent 'csub status JOBID' and read its output with
   ssh janelia-agent 'csub logs JOBID'. Check no more often than once a minute, and with

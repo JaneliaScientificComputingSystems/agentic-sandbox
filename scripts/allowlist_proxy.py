@@ -4,7 +4,8 @@
 Runs OUTSIDE the bwrap sandbox, with real network access, listening on a
 Unix domain socket (not a TCP port) so it can be bind-mounted into exactly
 one sandbox at a time. This is the host-side half of the bwrap
-network-allowlist pattern -- see the main README's "Network access" section.
+network-allowlist pattern -- see "Network, default-deny" in the README
+and "Network access" in ADMIN-NOTES.md.
 
 Supports:
   - HTTPS via CONNECT (checks the CONNECT target host against the allowlist,

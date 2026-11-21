@@ -11,7 +11,8 @@ the evidence behind each.
   line could hand the agent `~/.ssh` or a harness's settings directory read-write. If your key line
   names a project under your home directory, move the project and edit the line.
 - **Laptop instruction files:** the rule against `--wait` now says it holds even though the
-  sandbox's own description lists `--wait`. Copy the new file to your laptop to pick this up.
+  sandbox's own description lists `--wait`, and the submit rule shows how to ask for a GPU. Copy the
+  new file to your laptop to pick this up.
 
 - **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`):
   the agent now submits without `--wait` and checks with `csub status` no more often than once a
@@ -52,7 +53,7 @@ the evidence behind each.
   turns every `ssh cluster '<command>'` into an interactive LSF job that runs the command through
   `sandbox-run.sh` (or `podman-run.sh` with `--podman`) in one project directory. Only the script and
   `bsub` run on the login node. Documented on 2026-11-16: README, "An agent on your laptop".
-- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from
+- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need csub PR #15; see README). The LSF-allocated GPUs (from
   `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
   `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is set to their
   numbering inside (`0..n-1`, in the order given; a subset such as the job's second GPU alone is `0`

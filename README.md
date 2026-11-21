@@ -99,8 +99,8 @@ The sandbox is identical in the three ways to run it; only the submission differ
 ## Adapting your project
 
 - **Start from the directory the agent may change.** `$PWD` is the only read-write path by default.
-  Don't start from `$HOME` or from this checkout (the wrapper re-binds its own directory read-only if
-  you do).
+  Don't start from `$HOME` (the wrapper refuses) or from this checkout (the wrapper re-binds its own
+  directory read-only if you do).
 - **Data in, results out.** `--ro /groups/lab/reference-data` for inputs, `--rw
   /groups/lab/project/results` for outputs: specific subdirectories, never `$HOME`. Write results to
   durable storage. `/scratch` is node-local and wiped hourly on nodes where you have no job, so a
@@ -148,9 +148,9 @@ own mode, whatever the flag order: a `--rw` inside a `--ro` tree is writable for
 and a `--ro` inside a `--rw` tree (or inside `$PWD`) stays read-only.
 
 **Credential masking (bwrap only).** Directly under every bound root (`$PWD`, `$HOME` if bound, every
-`--ro`/`--rw`/`--scratch` path), `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud` and `.docker`
+`--ro`/`--rw`/`--scratch` path), `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud`, `.docker` and others
 appear as empty directories, and `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`, `.env`,
-`.env.local` as empty files. The same names under `$HOME` are masked
+`.env.local` and others as empty files. The same names under `$HOME` are masked
 whenever they are inside a bound root (from `~/.config`, `gcloud/` is empty), and a root that is one
 of those `$HOME` locations, or inside one, is refused, as is `~/.claude` itself read-write. Only
 paths that exist at start are masked, and under a project root only direct children: a `.env` two
@@ -290,7 +290,8 @@ agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I
   Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`, saved under either name). They point the agent at
   `$SANDBOX_README`, the sandbox's own description, with `ssh janelia-agent 'cat $SANDBOX_README'`.
 - **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions and `bkill -g /csub/$USER 0` the jobs it
-  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date.
+  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date (the
+  date is the first day the key is refused).
 
 What this does not change: the agent's own process runs on the laptop with whatever that harness
 allows there. The sandbox bounds what it can do on the cluster, not on the laptop. Give the key no
@@ -331,7 +332,7 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   directory and cannot ask in a batch job, so the read is auto-rejected and the model may give up and
   exit 0. The sandbox is the boundary, so allow it: `export
   OPENCODE_CONFIG_CONTENT='{"permission":{"external_directory":"allow"}}'` and pass `--env
-  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh` (tested under bwrap, not podman). An agent that gives up
+  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh` (bwrap only: `podman-run.sh` has no `--env`). An agent that gives up
   still exits 0, so check for the output you expect, not the exit code.
 - **The Kimi K3 safeguard.** Requests to `kimi-k3` pass through a gateway guardrail (an LLM-as-judge
   for harmful content and jailbreaks) whatever the client. A refusal is either the gateway's
@@ -348,7 +349,7 @@ image.**
 
 | | `sandbox-run.sh --gpu` (bwrap) | `podman-run.sh --gpu` |
 | --- | --- | --- |
-| One-time setup | none | a subuid/subgid range from HPC and a `storage.conf` (`SETUP.md` §3) |
+| One-time setup | none | a subuid/subgid range from HPC and the two files in `config/` (`SETUP.md` §3) |
 | Start-up | seconds | an image pull (1.2 GB, or several GB) on each new node, and again after the hourly scratch cleanup |
 | Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
 | Credential masking | yes | no, which is why `$HOME` cannot be mounted |
