@@ -290,9 +290,9 @@ s_13() {
     check "--csub: child job ran from inside the container" "$OUT" "1"
     check "--csub: no broker left behind" "$(brokers)" "$BASE_BROKERS"
     mkdir -p "$CW/planted"; plant_modules "$CW/planted"
-    OUT=$(cd "$CW/planted" && "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    OUT=$(cd "$CW/planted" && "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
     check "--csub: Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
-    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
     check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
     check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
@@ -368,19 +368,19 @@ s_18() {
   # The wrapper runs a small Python repair of the shared store on the host at every start, from
   # the working directory, with or without --csub.
   mkdir -p "$TR/planted"; plant_modules "$TR/planted"
-  OUT=$(cd "$TR/planted" && "$PODMAN_RUN" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$TR/planted" | grep -c RAN)")
+  OUT=$(cd "$TR/planted" && "$PODMAN_RUN" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$TR/planted/*.RAN" | wc -l)")
   check "Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
 }
 
 s_19() {
   echo "=== 19. TERM to the wrapper's process group cleans up (the bkill/walltime path) ==="
   setsid "$PODMAN_RUN" --allow example.com -- sleep 300 >/dev/null 2>&1 &
-  local wp=$! i rc
-  for i in $(seq 1 120); do [[ "$(conmons)" -ge 1 ]] && break; sleep 1; done
+  local wp=$! rc
+  for _ in $(seq 1 120); do [[ "$(conmons)" -ge 1 ]] && break; sleep 1; done
   check "container is running before the signal" "$(conmons)" "1"
   kill -TERM -- "-$wp" 2>/dev/null
   wait "$wp" 2>/dev/null; rc=$?
-  for i in $(seq 1 30); do [[ "$(state_dirs)" == "$BASE_STATE" && "$(conmons)" == 0 ]] && break; sleep 1; done
+  for _ in $(seq 1 30); do [[ "$(state_dirs)" == "$BASE_STATE" && "$(conmons)" == 0 ]] && break; sleep 1; done
   check "wrapper exits 143 after TERM" "$rc" "143"
   check "no container, no proxy, no state dir left" "$(conmons),$(proxies),$(state_dirs)" "0,$BASE_PROXIES,$BASE_STATE"
 }

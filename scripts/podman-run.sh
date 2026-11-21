@@ -345,7 +345,8 @@ unset XDG_RUNTIME_DIR
 # here, before the prologue, to heal a node an earlier job left in that state, and in the
 # sweep itself right after the kill. A live pid (a sibling's pause) is never touched.
 shared_runtime_dir() {
-  local d="/run/user/$(id -u)"
+  local d
+  d="/run/user/$(id -u)"
   if [[ -d "$d" && -O "$d" ]]; then echo "$d"; else echo "${TMPDIR:-/tmp}/storage-run-$(id -u)"; fi
 }
 SHARED_RUNTIME_DIR="$(shared_runtime_dir)"
@@ -379,13 +380,11 @@ podman system migrate 2>/dev/null || true
 # defensive: the shared graphroot lives under /scratch, which is swept on a periodic cleanup
 # cron that can delete blobs out from under a live store's metadata DB, so `podman info`
 # genuinely can go unhealthy mid-run through no fault of any job here.
-SHARED_STORE_HEALTHY=1
 SHARED_GRAPHROOT=""
 if podman info >/dev/null 2>&1; then
   SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || SHARED_GRAPHROOT=""
 else
   echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
-  SHARED_STORE_HEALTHY=0
 fi
 
 # Repair a shared-store DB already stamped with some job's per-job tmp dir by an earlier

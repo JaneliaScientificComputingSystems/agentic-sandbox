@@ -80,7 +80,7 @@ n=$(grep -l "http=200 " res.* 2>/dev/null | wc -l); [[ $n -eq $odd ]] && ok "eve
 # 301 or a 503 from the other host) means the request got out.
 n=$(grep -l "http=200 blocked=000 " res.* 2>/dev/null | wc -l); [[ $n -eq $odd ]] && ok "no --allow element reached a host outside its list ($n refused)" || bad "only $n of $odd --allow elements were refused example.com: $(grep -ho 'blocked=[^ ]*' res.* | sort | uniq -c | tr '\n' ';')"
 n=$(grep -l "http=none " res.* 2>/dev/null | wc -l); [[ $n -eq $((N - odd)) ]] && ok "the other elements had no network flag" || bad "unexpected: $n"
-n=$(ls "$STATE" 2>/dev/null | grep -c "^$J-" || true); [[ $n -eq 0 ]] && ok "no state directory left for the job in $STATE" || bad "$n state directories left: $(ls "$STATE" | grep "^$J-" | head -3 | tr '\n' ' ')"
+n=$(compgen -G "$STATE/$J-*" | wc -l); [[ $n -eq 0 ]] && ok "no state directory left for the job in $STATE" || bad "$n state directories left: $(compgen -G "$STATE/$J-*" | head -3 | tr '\n' ' ')"
 # Processes of this array only: another job of yours on the node may be running its own.
 ours() { local n=0 pid; for pid in $(pgrep -u "$USER" "$@"); do grep -azq "^LSB_JOBID=$J\$" "/proc/$pid/environ" 2>/dev/null && n=$((n + 1)); done; echo $n; }
 n=$(ours -f 'allowlist_proxy.py'); [[ $n -eq 0 ]] && ok "no proxy of the job left running" || bad "$n proxies of the job still running"

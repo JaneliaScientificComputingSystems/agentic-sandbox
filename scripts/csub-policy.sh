@@ -100,6 +100,7 @@ SAMPLE="$CSUB_DIR/deploy/broker.janelia.toml"
 
 # csub expands a leading ~/ itself, which keeps the file free of the account name.
 SCRIPTS="$SCRIPT_DIR"
+# shellcheck disable=SC2088  # a literal "~/" on purpose: csub expands it, the shell must not
 [[ "$SCRIPTS" == "$HOME"/* ]] && SCRIPTS="~/${SCRIPTS#"$HOME"/}"
 
 toml_list() {  # "a" "b" -> ["a", "b"]

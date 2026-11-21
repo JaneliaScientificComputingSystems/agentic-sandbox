@@ -27,8 +27,7 @@ TR="/scratch/$USER/test-bwrap-$$"
 # The working directory is a neutral scratch directory, never $HOME: started from a login
 # shell's default cwd, $PWD would be $HOME itself, which the wrapper refuses (section 22).
 TEST_CWD="$TR/cwd"
-mkdir -p "$TEST_CWD"
-cd "$TEST_CWD"
+mkdir -p "$TEST_CWD" && cd "$TEST_CWD" || { echo "test-bwrap.sh: cannot use $TEST_CWD (is /scratch/$USER writable here?)" >&2; exit 2; }
 EXTRA_CLEANUP=()
 cleanup_tests() { cd /; rm -rf "$TR" ${EXTRA_CLEANUP[@]+"${EXTRA_CLEANUP[@]}"}; }
 trap cleanup_tests EXIT
@@ -276,9 +275,9 @@ s_17() {
     check "--csub: policy rejection reaches the agent (rc 3)" "$OUT" "3"
     check "--csub: no broker left behind" "$(brokers)" "$BASE_BROKERS"
     mkdir -p "$CW/planted"; plant_modules "$CW/planted"
-    OUT=$(cd "$CW/planted" && "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    OUT=$(cd "$CW/planted" && "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
     check "--csub: Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
-    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
     check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
     check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
