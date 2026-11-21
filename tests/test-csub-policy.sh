@@ -81,6 +81,11 @@ refuses "6 missing directory"    "no such directory"     --bwrap --rw "$T/nothin
 refuses "6 odd character"        "unsupported character" --bwrap --rw "$T/pr oj"
 refuses "6 the home directory"   "home directory"        --bwrap --rw "$T/home"
 refuses "6 above the home"       "home directory"        --bwrap --rw "$T"
+refuses "6 home, trailing slash" "home directory"        --bwrap --rw "$T/home/"
+refuses "6 home through .."      "home directory"        --bwrap --rw "$T/proj/../home"
+refuses "6 the root directory"   "home directory"        --bwrap --rw /
+ln -s "$T/home" "$T/link-to-home"
+refuses "6 symlink to the home"  "home directory"        --bwrap --rw "$T/link-to-home"
 refuses "6 upper-case host"      "not a hostname"        --bwrap --rw "$T/proj" --allow PyPI.org
 refuses "6 host with a scheme"   "not a hostname"        --bwrap --rw "$T/proj" --allow https://pypi.org
 refuses "6 limit not a number"   "not a whole number"    --bwrap --rw "$T/proj" --gpus two

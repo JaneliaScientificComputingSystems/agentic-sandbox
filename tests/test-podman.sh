@@ -140,10 +140,10 @@ s_5() {
   need_llm "Claude Code one-shot" || return 0
   OUT=$("$PODMAN_RUN" --gpu --scratch --claude \
     --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- \
-    claude -p "who am i speaking to?" --model sonnet 2>&1)
+    claude -p "who am i speaking to?" --model sonnet 2>&1); RC=$?
   # See test-bwrap.sh's comment on this same check -- don't assert on specific wording.
-  if echo "$OUT" | grep -qE "^(Error|error):|Failed to authenticate"; then
-    echo "FAIL: claude one-shot (sandbox/tool error): $OUT"
+  if [[ $RC -ne 0 ]] || echo "$OUT" | grep -qE "^(bwrap|sandbox-run\.sh|podman-run\.sh|Error|error|API Error):|Failed to authenticate"; then
+    echo "FAIL: claude one-shot (exit $RC, or a sandbox/tool error): $OUT"
     FAIL=$((FAIL + 1))
   elif [[ -n "$OUT" ]]; then
     echo "PASS: claude one-shot ($OUT)"
@@ -363,6 +363,8 @@ s_18() {
   check "exported variable not forwarded; \$HOME and /scratch/\$USER absent" "$OUT" "unset,home-absent,scratch-absent,"
   OUT=$(SANDBOX_TEST_SECRET=leaked "$PODMAN_RUN" -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n"' 2>/dev/null | tail -1)
   check "no process inside the container carries the host variable" "$OUT" "0"
+  OUT=$(http_proxy=http://user:secret@proxy.invalid:3128 https_proxy=http://user:secret@proxy.invalid:3128 "$PODMAN_RUN" -- bash -c 'echo "${http_proxy:-unset},${https_proxy:-unset},${HTTP_PROXY:-unset}"' 2>/dev/null | tail -1)
+  check "the host's proxy variables are not copied into the container" "$OUT" "unset,unset,unset"
   # The wrapper runs a small Python repair of the shared store on the host at every start, from
   # the working directory, with or without --csub.
   mkdir -p "$TR/planted"; plant_modules "$TR/planted"

@@ -132,7 +132,9 @@ refuse_wide_mount() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --image) need_arg "$@"; IMAGE="$2"; shift 2 ;;
+    --image) need_arg "$@"
+      [[ "$2" != -* ]] || { echo "podman-run.sh: --image $2: not an image name" >&2; exit 1; }
+      IMAGE="$2"; shift 2 ;;
     --ro|--rw)
       need_arg "$@"
       # Canonical, existing path: a relative or symlinked argument would otherwise be mounted
@@ -227,7 +229,7 @@ JOB_STORAGE_DIR="$JOB_DIR/podman"
 # say) must not leave them on /scratch. Plain rm is enough on those paths: nothing has run
 # against the per-job store yet, so there is no container, pause process or subuid-owned
 # layer to tear down. cleanup() replaces this trap once there can be.
-early_cleanup() { rm -rf "$JOB_DIR"; true; }
+early_cleanup() { rm -rf "$JOB_DIR" 2>/dev/null || true; }
 trap early_cleanup EXIT
 # bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
 # how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
@@ -272,7 +274,10 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
   OPENCODE_CFG="$SANDBOX_CFG_ROOT/opencode-config"
   if [[ -d "$HOME/.config/opencode" ]]; then
-    cp -R "$HOME/.config/opencode" "$OPENCODE_CFG"
+    # -H: if ~/.config/opencode is itself a symlink (a dotfile manager), copy what it points to.
+    # A plain -R copies the link, and the "copy" bound into the container is then the real
+    # directory, read-write: exactly what the copy exists to prevent.
+    cp -RH "$HOME/.config/opencode" "$OPENCODE_CFG"
   else
     mkdir -p "$OPENCODE_CFG"
   fi
@@ -377,7 +382,7 @@ podman system migrate 2>/dev/null || true
 SHARED_STORE_HEALTHY=1
 SHARED_GRAPHROOT=""
 if podman info >/dev/null 2>&1; then
-  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
+  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || SHARED_GRAPHROOT=""
 else
   echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
   SHARED_STORE_HEALTHY=0
@@ -507,8 +512,13 @@ kill_orphaned_catatonit_for_this_job() {
   for pid in $(pgrep -u "$USER" -x catatonit 2>/dev/null); do
     [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "1" ]] || continue
     if grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null \
-       || grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null
+       || { grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null \
+            && grep -azq "^LSB_JOBINDEX=${LSB_JOBINDEX:-0}\$" "/proc/$pid/environ" 2>/dev/null; }; then
+      # The elements of an array job share LSB_JOBID, so the index is matched too: without it
+      # every element's watchdog killed its siblings' pause processes. `|| true`: the process
+      # may be gone between pgrep and here, and a failed kill must not end the caller (the
+      # watchdog subshell, or the EXIT trap in the middle of cleanup).
+      kill -9 "$pid" 2>/dev/null || true
     fi
   done
   # The shared pause we may just have killed leaves a pid file podman 5.8 can't get past --
@@ -525,7 +535,9 @@ kill_orphaned_catatonit_for_this_job() {
 # here, not left to the user's containers.conf, so it cannot be forgotten. --events-backend=none
 # (a global option, so it sits before the subcommand on each call that would emit events: pull,
 # run, rm) does the same for podman's container create/start/died events.
-PODMAN_ARGS=(--rm --network=none --log-driver=none)
+# --http-proxy=false: podman otherwise copies the host's http_proxy/https_proxy/no_proxy into the
+# container, credentials in the URL included, and nothing else of the host environment goes in.
+PODMAN_ARGS=(--rm --network=none --log-driver=none --http-proxy=false)
 # Without -i, podman leaves stdin closed -- an interactive shell/TUI inside hits EOF and
 # exits immediately (looks like the container "won't stay open", but it ran fine and exited
 # on its own). Only add -t when a real terminal is attached; podman errors on -t under a
@@ -595,14 +607,17 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -c '^\[allowlist_proxy\] DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $4}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
 cleanup() {
   local rc=$?   # the script's exit status on entry; see the denied-host summary below
+  # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
+  # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
+  trap '' TERM INT USR2
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
   # code, silently overriding whatever `exit N` triggered it -- bash only honors the original
   # N if the EXIT trap itself doesn't leave a nonzero status behind. Confirmed live: an
@@ -666,7 +681,7 @@ cleanup() {
   # xdg-runtime/libpod/tmp (alive, alive.lck, exits/, persist/, rootless-netns/ -- all owned by
   # the invoking user, all trivially removable a minute later), leaving that subtree behind.
   for _ in $(seq 1 5); do
-    rm -rf "$JOB_DIR" 2>/dev/null
+    rm -rf "$JOB_DIR" 2>/dev/null || true   # a busy subtree must not end the trap: retry below
     [[ -e "$JOB_DIR" ]] || break
     sleep 1
     kill_orphaned_catatonit_for_this_job
@@ -717,7 +732,15 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   declare -A _mmode=()
   _paths=()
-  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  _add_mount() {
+    # The list is handed on as path:mode,path:mode. A comma or colon inside a path would be read
+    # as a separator and put a directory this sandbox does not have into the envelope.
+    if [[ "$1" == *,* || "$1" == *:* ]]; then
+      echo "podman-run.sh: --csub: '$1' contains a comma or a colon, which the mount list passed to csub cannot carry; use a path without them" >&2
+      exit 1
+    fi
+    [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"
+  }
   for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
   for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
   # A read-only mount inside a read-write one cannot be expressed to csub (the nested entry is
@@ -750,6 +773,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     for e in "${_pre[@]}"; do
       [[ -n "$e" ]] || continue
       ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      # Compared as text below, so "/proj/../other" must not pass for something under /proj.
+      if [[ "$ep" != /* || "/$ep/" == */../* || "/$ep/" == */./* ]]; then
+        echo "podman-run.sh: --csub: CSUB_MOUNTS entry '$e' is not a plain absolute path" >&2
+        exit 1
+      fi
       ok=0
       for d in "${_der[@]:-}"; do
         [[ -n "$d" ]] || continue

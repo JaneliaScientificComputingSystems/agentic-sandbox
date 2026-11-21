@@ -19,11 +19,20 @@ itself and any subdomain: "example.com" allows "api.example.com" but not
 "evil-example.com" or "example.com.evil.net". Any port is allowed on an
 allowed host.
 
+A name on the list is not trusted to point anywhere: it is resolved once, here,
+and refused when it resolves to a loopback, link-local, multicast, unspecified
+or reserved address (a service on this node, the 169.254 metadata range). The
+connection then goes to the address that was checked. Private addresses are
+allowed, because the cluster's own services live there. An address given
+literally on the allowlist, and the name localhost, are taken as meant.
+
 Usage:
     python3 allowlist_proxy.py /run/agent-proxy.sock litellm.int.janelia.org example.com
 """
 import asyncio
+import ipaddress
 import re
+import socket
 import sys
 from typing import Optional, Tuple
 
@@ -33,6 +42,29 @@ from typing import Optional, Tuple
 MAX_HEADER_BYTES = 64 * 1024
 MAX_HEADER_LINES = 200
 HEADER_TIMEOUT = 30.0
+CONNECT_TIMEOUT = 30.0
+# The sandboxed process chooses what gets logged and how often. Keep each value short and the
+# log bounded, so that it cannot be used to fill the node's scratch disk.
+MAX_LOGGED_VALUE = 200
+MAX_LOG_LINES = 20000
+_log_lines = 0
+
+
+def log(msg: str):
+    global _log_lines
+    _log_lines += 1
+    if _log_lines > MAX_LOG_LINES:
+        if _log_lines == MAX_LOG_LINES + 1:
+            print(f"[allowlist_proxy] log limit of {MAX_LOG_LINES} lines reached; further requests are not logged",
+                  file=sys.stderr, flush=True)
+        return
+    print(f"[allowlist_proxy] {msg}", file=sys.stderr)
+
+
+def short(value) -> str:
+    """A client-chosen value, safe and short enough to log."""
+    text = repr(value)
+    return text if len(text) <= MAX_LOGGED_VALUE else text[:MAX_LOGGED_VALUE] + "...(truncated)"
 
 
 async def pipe(reader, writer):
@@ -139,6 +171,54 @@ def split_hostport(hostport: str, default_port: int) -> Optional[Tuple[str, int]
     return host, port
 
 
+def is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def address_refused(address: str) -> bool:
+    """True for an address no allowed NAME may resolve to."""
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved
+
+
+def name_taken_as_meant(host: str) -> bool:
+    """An address literal or localhost: the user allowed exactly that, so no address check."""
+    host = normalize_host(host)
+    return is_ip_literal(host) or host == "localhost" or host.endswith(".localhost")
+
+
+async def open_checked(host: str, port: int):
+    """Resolve once, refuse addresses an allowed name must not point at, connect to a checked one.
+
+    Returns (reader, writer). Raises PermissionError when every address is refused and OSError
+    when none can be reached.
+    """
+    loop = asyncio.get_running_loop()
+    if name_taken_as_meant(host):
+        return await asyncio.wait_for(asyncio.open_connection(host, port), CONNECT_TIMEOUT)
+    # A name with a dot is looked up as written (trailing dot), so the resolver cannot append
+    # the node's search domains to a name that does not exist.
+    lookup = host + "." if "." in host else host
+    infos = await loop.getaddrinfo(lookup, port, type=socket.SOCK_STREAM)
+    usable = [(fam, sa[0]) for fam, _, _, _, sa in infos if not address_refused(sa[0])]
+    if not usable:
+        raise PermissionError(", ".join(sorted({sa[0] for *_, sa in infos})) or "no address")
+    last = None
+    for fam, addr in usable:
+        try:
+            return await asyncio.wait_for(asyncio.open_connection(addr, port, family=fam), CONNECT_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as e:
+            last = e
+    raise OSError(str(last))
+
+
 async def _reject(writer, status: bytes):
     writer.write(b"HTTP/1.1 " + status + b"\r\nConnection: close\r\n\r\n")
     await writer.drain()
@@ -163,25 +243,29 @@ async def handle_client(reader, writer, allowlist):
         try:
             headers = await read_headers(reader)
         except (ValueError, asyncio.TimeoutError, asyncio.LimitOverrunError) as e:
-            print(f"[allowlist_proxy] BAD headers from peer={peer}: {e}", file=sys.stderr)
+            log(f"BAD headers from peer={peer}: {e}")
             await _reject(writer, b"400 Bad Request")
             return
 
         if method == "CONNECT":
             hp = split_hostport(target, 443)
             if hp is None:
-                print(f"[allowlist_proxy] BAD CONNECT target {target!r} (peer={peer})", file=sys.stderr)
+                log(f"BAD CONNECT target {short(target)} (peer={peer})")
                 await _reject(writer, b"400 Bad Request")
                 return
             host, port = hp
             if not host_allowed(host, allowlist):
-                print(f"[allowlist_proxy] DENY CONNECT {host}:{port} (peer={peer})", file=sys.stderr)
+                log(f"DENY CONNECT {host[:MAX_LOGGED_VALUE]}:{port} (peer={peer})")
                 await _reject(writer, b"403 Forbidden")
                 return
-            print(f"[allowlist_proxy] ALLOW CONNECT {host}:{port} (peer={peer})", file=sys.stderr)
+            log(f"ALLOW CONNECT {host}:{port} (peer={peer})")
             try:
-                remote_reader, remote_writer = await asyncio.open_connection(host, port)
-            except OSError:
+                remote_reader, remote_writer = await open_checked(host, port)
+            except PermissionError as e:
+                log(f"DENY CONNECT {host[:MAX_LOGGED_VALUE]}:{port} resolves to {str(e)[:MAX_LOGGED_VALUE]} (peer={peer})")
+                await _reject(writer, b"403 Forbidden")
+                return
+            except (OSError, asyncio.TimeoutError):
                 await _reject(writer, b"502 Bad Gateway")
                 return
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -200,18 +284,22 @@ async def handle_client(reader, writer, allowlist):
             headers = first_line + headers
             hp = split_hostport(hostport, 80) if hostport else None
             if hp is None:
-                print(f"[allowlist_proxy] DENY HTTP bad/missing Host {hostport!r} (peer={peer})", file=sys.stderr)
+                log(f"BAD HTTP Host header {short(hostport)} (peer={peer})")
                 await _reject(writer, b"400 Bad Request")
                 return
             host, port = hp
             if not host_allowed(host, allowlist):
-                print(f"[allowlist_proxy] DENY HTTP {host}:{port} (peer={peer})", file=sys.stderr)
+                log(f"DENY HTTP {host[:MAX_LOGGED_VALUE]}:{port} (peer={peer})")
                 await _reject(writer, b"403 Forbidden")
                 return
-            print(f"[allowlist_proxy] ALLOW HTTP {host}:{port} (peer={peer})", file=sys.stderr)
+            log(f"ALLOW HTTP {host}:{port} (peer={peer})")
             try:
-                remote_reader, remote_writer = await asyncio.open_connection(host, port)
-            except OSError:
+                remote_reader, remote_writer = await open_checked(host, port)
+            except PermissionError as e:
+                log(f"DENY HTTP {host[:MAX_LOGGED_VALUE]}:{port} resolves to {str(e)[:MAX_LOGGED_VALUE]} (peer={peer})")
+                await _reject(writer, b"403 Forbidden")
+                return
+            except (OSError, asyncio.TimeoutError):
                 await _reject(writer, b"502 Bad Gateway")
                 return
             remote_writer.write(headers)
@@ -221,7 +309,7 @@ async def handle_client(reader, writer, allowlist):
                 pipe(remote_reader, writer),
             )
     except Exception as e:
-        print(f"[allowlist_proxy] error: {e}", file=sys.stderr)
+        log(f"error: {short(str(e))}")
     finally:
         if remote_writer is not None:
             remote_writer.close()

@@ -80,7 +80,7 @@ fi
 
 # On the login node: submit, and nothing else.
 [[ -d "$PROJECT" ]] || die "project directory $PROJECT does not exist"
-PROJECT="$(cd "$PROJECT" && pwd -P)"
+PROJECT="$(cd -- "$PROJECT" && pwd -P)" || die "cannot enter the project directory"
 # The project is the one directory the agent gets read-write. Under $HOME it could be ~/.ssh or
 # the directory of a harness's settings; the wrappers refuse $HOME itself but not what is in it.
 HOME_P="$(cd "$HOME" 2>/dev/null && pwd -P)" || HOME_P="$HOME"

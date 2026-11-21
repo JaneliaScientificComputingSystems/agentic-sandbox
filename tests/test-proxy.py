@@ -68,6 +68,41 @@ check("control character in host refused", proxy_mod.split_hostport("evil\x00.ex
 check("non-hex in bracketed literal refused", proxy_mod.split_hostport("[evil host]:443", 443), None)
 check("underscore and hyphen in host accepted", proxy_mod.split_hostport("my_host-1.example.com:443", 443), ("my_host-1.example.com", 443))
 
+for addr, want in (("127.0.0.1", True), ("127.9.9.9", True), ("::1", True), ("169.254.169.254", True),
+                   ("fe80::1", True), ("0.0.0.0", True), ("224.0.0.1", True), ("::ffff:127.0.0.1", True),
+                   ("10.36.1.5", False), ("192.168.1.1", False), ("8.8.8.8", False), ("2606:4700::1111", False)):
+    check(f"address {addr} refused for a name: {want}", proxy_mod.address_refused(addr), want)
+check("an address literal is taken as meant", proxy_mod.name_taken_as_meant("127.0.0.1"), True)
+check("localhost is taken as meant", proxy_mod.name_taken_as_meant("LocalHost."), True)
+check("an ordinary name is checked", proxy_mod.name_taken_as_meant("api.github.com"), False)
+check("a lookalike of localhost is checked", proxy_mod.name_taken_as_meant("localhost.evil.net"), False)
+check("long logged value is cut", len(proxy_mod.short("a" * 5000)) < 260, True)
+
+
+async def resolved_address_checks():
+    loop = asyncio.get_running_loop()
+    asked = []
+
+    async def fake(host, port, **kw):
+        asked.append(host)
+        table = {"rebind.example.com.": ["127.0.0.1"], "meta.example.com.": ["169.254.169.254", "::1"]}
+        return [(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port))
+                for a in table[host]]
+
+    loop.getaddrinfo = fake
+    for name in ("rebind.example.com", "meta.example.com"):
+        try:
+            await proxy_mod.open_checked(name, 80)
+            got = "connected"
+        except PermissionError as e:
+            got = "refused: " + str(e)
+        check(f"allowed name {name} that resolves to a refused address is not connected",
+              got.startswith("refused: "), True)
+    check("names with a dot are looked up as written (trailing dot)", asked, ["rebind.example.com.", "meta.example.com."])
+
+
+asyncio.run(resolved_address_checks())
+
 
 # --- end-to-end through a real proxy process ------------------------------------------
 

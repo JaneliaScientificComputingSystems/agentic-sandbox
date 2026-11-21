@@ -5,6 +5,32 @@ the evidence behind each.
 
 ## 2026-11-21
 
+- **Proxy: an allowed name is checked for where it points.** `--allow NAME` used to connect to
+  whatever the name resolved to. The proxy now resolves it once, refuses loopback, link-local
+  (169.254), multicast, unspecified and reserved addresses, and connects to the address it checked.
+  A name with a dot is looked up as written, so the node's search domains are not appended to it.
+  Private addresses still work, because the cluster's own services live there. To reach a service
+  on the node itself, allow `localhost` or the address literally.
+- **Proxy: the log is bounded.** Logged values are cut to 200 characters and the log stops at
+  20000 lines, so a sandboxed process cannot fill the node's scratch disk through it. A request
+  with a bad or missing `Host` header is logged as `BAD`, no longer as a denied host, and the
+  denied-host summary reads only the proxy's own lines.
+- **`podman-run.sh`: cleanup holds under races.** A process that vanished between being found and
+  being killed, a directory that was still busy, or a second signal from `bkill` could end the
+  cleanup early: the state directory stayed behind (with the copy of `~/.claude.json`) and the job
+  returned 1. In an array job each element's watchdog also matched its siblings' pause processes;
+  it now matches the array index too.
+- **`podman-run.sh`:** the host's `http_proxy`, `https_proxy` and `no_proxy` are no longer copied
+  into the container (podman does that by default); `--opencode` copies the target of a symlinked
+  `~/.config/opencode`, where it used to bind the real directory read-write; an `--image` value
+  that starts with `-` is refused.
+- **`--csub` in both wrappers:** a mount path that contains a comma or a colon is refused, and so is
+  a preset `CSUB_MOUNTS` entry with `..` in it. Either could put a directory the sandbox does not
+  have into the list handed to csub.
+- **`csub-policy.sh` checks the physical path.** `--rw "$HOME/"`, `--rw /`, a path through `..` and
+  a symlink into the home directory used to pass the home-directory check, which compared text.
+  The policy now holds the physical path.
+
 - **Security fix, `sandbox-run.sh`: the job's environment was readable inside the sandbox.**
   `bwrap` stays inside as process 1, and it was started with the wrapper's whole environment, so
   `/proc/1/environ` showed every variable of the job, including any API key or token exported

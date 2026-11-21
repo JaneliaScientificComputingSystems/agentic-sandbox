@@ -1166,6 +1166,52 @@ working directory, so a relative `--policy` path still resolves.
 Python and keeps the working directory. Claude Code and opencode were exercised by the suites'
 model sections only.
 
+## Review findings closed after the two holes (2026-11-21)
+
+The same review produced smaller findings. Those fixed here, each read against the code first:
+
+- **Proxy.** It connected to whatever an allowed name resolved to. It now resolves once
+  (`open_checked`), refuses loopback, link-local, multicast, unspecified and reserved addresses,
+  connects to the checked address with a 30 s timeout, and looks a dotted name up with a trailing
+  dot. `localhost` and address literals on the allowlist are taken as meant. Private ranges are not
+  refused: `litellm.int.janelia.org` is one. Log values are cut to 200 characters and the log to
+  20000 lines; a bad `Host` header is logged as `BAD`.
+- **`podman-run.sh` cleanup.** Under `set -e`, an unguarded `kill -9` (process gone since `pgrep`)
+  or `rm -rf` (subtree still busy) ended the EXIT trap, and a TERM arriving during cleanup ran its
+  own `exit`. All three left the per-job directory behind and turned the exit status into 1. The
+  watchdog's `LSB_JOBID` match also covered sibling elements of an array; it now needs the same
+  `LSB_JOBINDEX`.
+- **`podman-run.sh`, smaller:** `--http-proxy=false`; `cp -RH` for a symlinked opencode config; a
+  second `podman info` that could end the script; `--image` values starting with `-`.
+- **`--csub`:** commas and colons in mount paths, `..` in a preset `CSUB_MOUNTS`.
+- **`csub-policy.sh`:** paths are made physical before the home and `/scratch` checks.
+- **`ssh-entry.sh`:** a failed `cd` into the project is now an error of its own.
+- **Tests that could pass on a broken sandbox:** the jailbreak section took "Connection refused"
+  for a refusal; the Claude one-shot sections ignored the exit status; `test-array.sh` noticed a
+  leak only if the answer was exactly 200.
+
+**Evidence,** on the cluster: `test-proxy.py` 64 passed, `test-csub-policy.sh` 51, `test-bwrap.sh`
+87, `test-podman.sh` 61, `test-array.sh` 11 (bwrap) and 12 (podman). Through the changed proxy,
+`pypi.org` and `litellm.int.janelia.org` answered 200 and `example.com` was refused.
+
+**Found sound or not applicable here:** `/scratch` is root-owned and not world-writable on the
+nodes, so another user cannot create `/scratch/<you>` first.
+
+**Left open,** by decision or for lack of a test:
+
+- A read-write mount two or more levels above the checkout lets the agent rename the checkout's
+  parent and put its own scripts in place; the read-only re-bind covers only the directory itself.
+- The check of a `--ro`/`--rw` path and the mount itself are seconds apart (a second sandbox with
+  write access to the parent could swap the directory for a symlink in between).
+- `podman-run.sh` accepts credential directories under `$HOME` (`--rw ~/.ssh`) that
+  `sandbox-run.sh` refuses, and runs `podman system migrate` on the shared store at every start.
+- The proxy does not re-check a second plain-HTTP request on a kept-alive connection (the peer is
+  always the checked host), has no cap on connections and no idle timeout on tunnels.
+- The images are built from unpinned installers, and `latest` is pulled on every run.
+- `examples/unattended-tuning`: the labels of the "hidden" test set are in the file handed to the
+  agent's own `train.py`.
+- Refusal tests that assert only exit status 1, and the smaller input checks in `csub-policy.sh`.
+
 ## Running under LSF — full evidence
 
 - LSF puts every job in its own cgroup v2 leaf (`/lsf/Janelia/job.<id>/leaf`). bwrap's

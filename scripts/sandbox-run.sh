@@ -584,9 +584,9 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -c '^\[allowlist_proxy\] DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $4}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
@@ -659,7 +659,15 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # (the last one named wins for one path).
   declare -A _mmode=()
   _paths=()
-  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  _add_mount() {
+    # The list is handed on as path:mode,path:mode. A comma or colon inside a path would be read
+    # as a separator and put a directory this sandbox does not have into the envelope.
+    if [[ "$1" == *,* || "$1" == *:* ]]; then
+      echo "sandbox-run.sh: --csub: '$1' contains a comma or a colon, which the mount list passed to csub cannot carry; use a path without them" >&2
+      exit 1
+    fi
+    [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"
+  }
   _add_mount "$PWD" rw
   for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
   for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
@@ -697,6 +705,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     for e in "${_pre[@]}"; do
       [[ -n "$e" ]] || continue
       ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      # Compared as text below, so "/proj/../other" must not pass for something under /proj.
+      if [[ "$ep" != /* || "/$ep/" == */../* || "/$ep/" == */./* ]]; then
+        echo "sandbox-run.sh: --csub: CSUB_MOUNTS entry '$e' is not a plain absolute path" >&2
+        exit 1
+      fi
       ok=0
       for d in "${_der[@]}"; do
         dp="${d%:*}"; dm="${d##*:}"

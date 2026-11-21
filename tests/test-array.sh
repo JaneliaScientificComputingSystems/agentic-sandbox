@@ -76,7 +76,9 @@ n=$(grep -l "marks=1 " res.* 2>/dev/null | wc -l); [[ $n -eq $N ]] && ok "each e
 n=$(grep -l "readme=yes" res.* 2>/dev/null | wc -l); [[ $n -eq $N ]] && ok "each element had its \$SANDBOX_README" || bad "no README in: $(grep -L 'readme=yes' res.* | tr '\n' ' ')"
 odd=$(( (N + 1) / 2 ))
 n=$(grep -l "http=200 " res.* 2>/dev/null | wc -l); [[ $n -eq $odd ]] && ok "every --allow element reached its allowed host through its own proxy ($n)" || bad "$n of $odd --allow elements reached pypi.org: $(grep -h 'http=' res.* | sort | uniq -c | tr '\n' ';')"
-n=$(grep -c "http=200 blocked=200" res.* 2>/dev/null | awk -F: '{s += $2} END {print s + 0}'); [[ $n -eq 0 ]] && ok "no --allow element reached a host outside its list" || bad "$n elements reached example.com"
+# 000 is what curl reports when the proxy refuses the tunnel. Any other answer (a 200, but also a
+# 301 or a 503 from the other host) means the request got out.
+n=$(grep -l "http=200 blocked=000 " res.* 2>/dev/null | wc -l); [[ $n -eq $odd ]] && ok "no --allow element reached a host outside its list ($n refused)" || bad "only $n of $odd --allow elements were refused example.com: $(grep -ho 'blocked=[^ ]*' res.* | sort | uniq -c | tr '\n' ';')"
 n=$(grep -l "http=none " res.* 2>/dev/null | wc -l); [[ $n -eq $((N - odd)) ]] && ok "the other elements had no network flag" || bad "unexpected: $n"
 n=$(ls "$STATE" 2>/dev/null | grep -c "^$J-" || true); [[ $n -eq 0 ]] && ok "no state directory left for the job in $STATE" || bad "$n state directories left: $(ls "$STATE" | grep "^$J-" | head -3 | tr '\n' ' ')"
 # Processes of this array only: another job of yours on the node may be running its own.
