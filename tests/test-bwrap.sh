@@ -51,6 +51,16 @@ check() {
 skip() { echo "SKIP: $1"; SKIP=$((SKIP + 1)); }
 need_llm() { [[ -z "${SKIP_LLM:-}" ]] || { skip "$1 (SKIP_LLM is set)"; return 1; }; }
 
+# Files an agent could leave in its working directory so that the wrapper's own host-side Python
+# imports them on the next start, outside the sandbox. Each writes a marker next to itself when
+# it is imported; the marker must never appear.
+plant_modules() {  # $1 = directory
+  local m
+  for m in csub json sqlite3 os; do
+    printf '%s\n' 'import sys' "open(__file__ + '.RAN', 'a').write('imported outside the sandbox\\n')" 'sys.exit(99)' > "$1/$m.py"
+  done
+}
+
 # "Nothing left behind" is measured against what was there when the suite started, not against
 # zero: another sandbox of the same account on this node is not this suite's failure.
 state_dirs() { ls -A "/scratch/$USER/.agentic-sandbox" 2>/dev/null | wc -l | tr -d ' '; }
@@ -184,6 +194,12 @@ s_10() {
   OUT=$(SANDBOX_TEST_SECRET=leaked SANDBOX_TEST_WANTED=ok "$SANDBOX_RUN" --env SANDBOX_TEST_WANTED -- \
     bash -c 'echo "${SANDBOX_TEST_SECRET:-unset},${SANDBOX_TEST_WANTED:-unset},${TMPDIR:-unset}"')
   check "env cleared except --env" "$OUT" "unset,ok,/tmp"
+  # The command's own environment is only half of it: bwrap stays inside as PID 1, and what IT
+  # was started with is readable at /proc/1/environ. No process inside may carry the variable.
+  OUT=$(SANDBOX_TEST_SECRET=leaked "$SANDBOX_RUN" -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n,$(cat /proc/1/comm),$(tr "\0" "\n" < /proc/1/environ | grep -vc "^LSB_JOB")"')
+  check "no process inside carries a host variable (bwrap is PID 1; its environment holds the job id at most)" "$OUT" "0,bwrap,0"
+  OUT=$(SANDBOX_TEST_SECRET=leaked "$SANDBOX_RUN" --allow example.com -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n"')
+  check "same with --allow (the relay runs inside too)" "$OUT" "0"
 }
 
 s_11() {
@@ -254,6 +270,12 @@ s_17() {
     OUT=$(cd "$CW" && "$SANDBOX_RUN" --csub -- bash -c 'CSUB_MOUNTS=$HOME:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo $?')
     check "--csub: policy rejection reaches the agent (rc 3)" "$OUT" "3"
     check "--csub: no broker left behind" "$(brokers)" "$BASE_BROKERS"
+    mkdir -p "$CW/planted"; plant_modules "$CW/planted"
+    OUT=$(cd "$CW/planted" && "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    check "--csub: Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
+    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
+    check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
       # A directory under the same allowed root that the sandbox does not mount: the policy would
       # accept the claim, the envelope must not (rc 3; without the envelope this exits 0).

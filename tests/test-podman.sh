@@ -28,6 +28,16 @@ trap cleanup_tests EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Files an agent could leave in its working directory so that the wrapper's own host-side Python
+# imports them on the next start, outside the sandbox. Each writes a marker next to itself when
+# it is imported; the marker must never appear.
+plant_modules() {  # $1 = directory
+  local m
+  for m in csub json sqlite3 os; do
+    printf '%s\n' 'import sys' "open(__file__ + '.RAN', 'a').write('imported outside the sandbox\\n')" 'sys.exit(99)' > "$1/$m.py"
+  done
+}
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -279,6 +289,12 @@ s_13() {
     OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && csub submit --walltime 5 --wait --name t13 -- sh -c 'echo child-ok' 2>&1 | grep -c child-ok" 2>&1 | tail -1)
     check "--csub: child job ran from inside the container" "$OUT" "1"
     check "--csub: no broker left behind" "$(brokers)" "$BASE_BROKERS"
+    mkdir -p "$CW/planted"; plant_modules "$CW/planted"
+    OUT=$(cd "$CW/planted" && "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    check "--csub: Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
+    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$CW/planted" | grep -c RAN)")
+    check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
+    check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
       mkdir -p "$DECOY"
       OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?" 2>&1 | tail -1)
@@ -345,6 +361,13 @@ s_18() {
   echo "=== 18. No host environment, nothing of the host outside the mounts ==="
   OUT=$(SANDBOX_TEST_SECRET=leaked "$PODMAN_RUN" -- bash -c "echo \"\${SANDBOX_TEST_SECRET:-unset}\"; test -e '$HOME' && echo home-VISIBLE || echo home-absent; test -e /scratch/$USER && echo scratch-VISIBLE || echo scratch-absent" 2>/dev/null | tail -3 | tr '\n' ',')
   check "exported variable not forwarded; \$HOME and /scratch/\$USER absent" "$OUT" "unset,home-absent,scratch-absent,"
+  OUT=$(SANDBOX_TEST_SECRET=leaked "$PODMAN_RUN" -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n"' 2>/dev/null | tail -1)
+  check "no process inside the container carries the host variable" "$OUT" "0"
+  # The wrapper runs a small Python repair of the shared store on the host at every start, from
+  # the working directory, with or without --csub.
+  mkdir -p "$TR/planted"; plant_modules "$TR/planted"
+  OUT=$(cd "$TR/planted" && "$PODMAN_RUN" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(ls "$TR/planted" | grep -c RAN)")
+  check "Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
 }
 
 s_19() {

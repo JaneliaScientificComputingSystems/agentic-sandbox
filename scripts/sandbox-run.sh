@@ -629,7 +629,18 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # in the sandbox, ahead of the python's own.
   CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
   [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
-  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Host-side Python must never import from the working directory: that is the directory the
+  # agent can write, and a csub.py or json.py planted there would run OUTSIDE the sandbox, as
+  # you, on the next start. `python -c` and `python -` put the current directory first on the
+  # module path, so the csub lookup runs from / (not -I: a csub installed with `pip --user` or
+  # found through PYTHONPATH must still be found), and a broker given in the `python -m ...` form
+  # is started from / as well. The usual csub-broker console script is not affected (its module
+  # path starts at its own bin directory) and keeps the working directory.
+  CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  CSUB_BROKER_CWD=.
+  case "$(basename -- "${CSUB_BROKER%% *}")" in
+    python*) CSUB_BROKER_CWD=/ ;;
+  esac
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "sandbox-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -709,7 +720,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # envelope that allows nothing"). CSUB_ENVELOPE=off accepts a policy-only broker explicitly.
   CSUB_ENV_ARGS=()
   if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
-    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+    if ! (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER --help) 2>&1 | grep -q -- --envelope-mount; then
       echo "sandbox-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
     fi
@@ -723,12 +734,12 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
+  (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!
   wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
   # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
   # PATH: bwrap takes the LAST --setenv, so this one must carry the --claude/--opencode CLI
   # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(
@@ -796,7 +807,7 @@ write_sandbox_readme() {
       echo "  then \`csub status\`, \`csub logs <id>\`, \`csub kill <id>\`. A child's output lands in <cwd>/.csub/jobs/<id>/stdout and stderr."
       echo "- Jobs are refused with a policy_violation error when they ask for something the policy does not allow. Read the message and adjust; do not probe or guess."
       if [[ -n "${CSUB_PROBE_JSON:-}" && -s "$CSUB_PROBE_JSON" ]]; then
-        python3 - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
+        python3 -I - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
@@ -857,7 +868,17 @@ run_bwrap() {
     fd="${fd##*/}"
     if [[ "$fd" -gt 2 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
   done
-  exec bwrap "$@"
+  # --clearenv empties the environment of the COMMAND only. bwrap itself stays inside the sandbox
+  # as PID 1, and the environment it was started with is readable there at /proc/1/environ: every
+  # variable of the job, API keys and tokens included. So bwrap is started with an environment of
+  # its own that holds only the job's id and array index (not secrets; they let someone on the
+  # node trace a bwrap process back to its job). What the command gets is unchanged: that comes
+  # from the --setenv arguments, which were read from this script's environment above.
+  local bwrap_bin keep=()
+  bwrap_bin="$(command -v bwrap)" || { echo "sandbox-run.sh: bwrap not found on PATH" >&2; exit 127; }
+  [[ -n "${LSB_JOBID:-}" ]] && keep+=("LSB_JOBID=$LSB_JOBID")
+  [[ -n "${LSB_JOBINDEX:-}" ]] && keep+=("LSB_JOBINDEX=$LSB_JOBINDEX")
+  exec env -i ${keep[@]+"${keep[@]}"} "$bwrap_bin" "$@"
 }
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then

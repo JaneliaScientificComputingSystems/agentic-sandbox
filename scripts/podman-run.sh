@@ -401,7 +401,9 @@ fi
 repair_shared_store_tmpdir() {
   local db="$1/db.sql" want="$SHARED_RUNTIME_DIR/libpod/tmp"
   [[ -f "$db" ]] || return 0
-  python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" "$SANDBOX_STATE_PARENT/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
+  # -I: this runs on the host from the working directory, which the agent may be able to write
+  # (ssh-entry.sh --podman starts there); without it a planted sqlite3.py would run outside.
+  python3 -I - "$db" "$want" "/scratch/$USER/podman-jobs/" "$SANDBOX_STATE_PARENT/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
 import sqlite3, sys
 db, want = sys.argv[1:3]
 bad_prefixes = tuple(sys.argv[3:])
@@ -689,7 +691,18 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   fi
   CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
   [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
-  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Host-side Python must never import from the working directory: that is the directory the
+  # agent can write, and a csub.py or json.py planted there would run OUTSIDE the sandbox, as
+  # you, on the next start. `python -c` and `python -` put the current directory first on the
+  # module path, so the csub lookup runs from / (not -I: a csub installed with `pip --user` or
+  # found through PYTHONPATH must still be found), and a broker given in the `python -m ...` form
+  # is started from / as well. The usual csub-broker console script is not affected (its module
+  # path starts at its own bin directory) and keeps the working directory.
+  CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  CSUB_BROKER_CWD=.
+  case "$(basename -- "${CSUB_BROKER%% *}")" in
+    python*) CSUB_BROKER_CWD=/ ;;
+  esac
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "podman-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -760,7 +773,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # was previously a warning that an unattended run never reads.
   CSUB_ENV_ARGS=()
   if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
-    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+    if ! (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER --help) 2>&1 | grep -q -- --envelope-mount; then
       echo "podman-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
     fi
@@ -774,12 +787,12 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "podman-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
+  (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
   CSUB_PID=$!
   wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
   # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
   # Only the csub package (and tomli, which it needs on a python without tomllib, i.e. the
   # image's 3.10) go into the container, under a directory of their own -- not the whole host
   # venv site-packages: that put a python-3.9 venv's pip, setuptools and friends ahead of the
@@ -848,7 +861,7 @@ write_sandbox_readme() {
       echo "  then \`csub status\`, \`csub logs <id>\`, \`csub kill <id>\`. A child's output lands in <cwd>/.csub/jobs/<id>/stdout and stderr."
       echo "- Jobs are refused with a policy_violation error when they ask for something the policy does not allow. Read the message and adjust; do not probe or guess."
       if [[ -n "${CSUB_PROBE_JSON:-}" && -s "$CSUB_PROBE_JSON" ]]; then
-        python3 - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
+        python3 -I - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
