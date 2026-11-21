@@ -46,19 +46,22 @@ CONNECT_TIMEOUT = 30.0
 # The sandboxed process chooses what gets logged and how often. Keep each value short and the
 # log bounded, so that it cannot be used to fill the node's scratch disk.
 MAX_LOGGED_VALUE = 200
+MAX_LOG_LINE = 600
 MAX_LOG_LINES = 20000
-_log_lines = 0
+# Denials have a budget of their own: the wrappers show them to the user at exit, and a flood of
+# allowed requests must not be able to use up the lines before a denial is recorded.
+_log_lines = {"DENY": 0, "other": 0}
 
 
 def log(msg: str):
-    global _log_lines
-    _log_lines += 1
-    if _log_lines > MAX_LOG_LINES:
-        if _log_lines == MAX_LOG_LINES + 1:
-            print(f"[allowlist_proxy] log limit of {MAX_LOG_LINES} lines reached; further requests are not logged",
+    kind = "DENY" if msg.startswith("DENY ") else "other"
+    _log_lines[kind] += 1
+    if _log_lines[kind] > MAX_LOG_LINES:
+        if _log_lines[kind] == MAX_LOG_LINES + 1:
+            print(f"[allowlist_proxy] log limit of {MAX_LOG_LINES} lines reached ({kind}); further ones are not logged",
                   file=sys.stderr, flush=True)
         return
-    print(f"[allowlist_proxy] {msg}", file=sys.stderr)
+    print(f"[allowlist_proxy] {msg[:MAX_LOG_LINE]}", file=sys.stderr)
 
 
 def short(value) -> str:
@@ -201,12 +204,19 @@ async def open_checked(host: str, port: int):
     when none can be reached.
     """
     loop = asyncio.get_running_loop()
+    host = host.rstrip(".")
     if name_taken_as_meant(host):
-        return await asyncio.wait_for(asyncio.open_connection(host, port), CONNECT_TIMEOUT)
+        try:
+            return await asyncio.wait_for(asyncio.open_connection(host, port), CONNECT_TIMEOUT)
+        except PermissionError as e:   # refused by the local system, not by the address check
+            raise OSError(str(e)) from None
     # A name with a dot is looked up as written (trailing dot), so the resolver cannot append
     # the node's search domains to a name that does not exist.
     lookup = host + "." if "." in host else host
-    infos = await loop.getaddrinfo(lookup, port, type=socket.SOCK_STREAM)
+    try:
+        infos = await loop.getaddrinfo(lookup, port, type=socket.SOCK_STREAM)
+    except UnicodeError as e:          # an empty or over-long label: not a name that can resolve
+        raise OSError(f"not a resolvable name: {e}") from None
     usable = [(fam, sa[0]) for fam, _, _, _, sa in infos if not address_refused(sa[0])]
     if not usable:
         raise PermissionError(", ".join(sorted({sa[0] for *_, sa in infos})) or "no address")

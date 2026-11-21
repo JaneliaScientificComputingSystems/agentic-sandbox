@@ -36,6 +36,9 @@ All computation, compilation and installation happens on the cluster, never on t
   a queue or sizing a job: curl -s https://hpc.int.janelia.org/docs/ai-agent-hints.md
   Where it says bsub, use csub. Where it differs from the sandbox's description, the
   sandbox is right.
+- For Python packages, make a venv in the project directory and pip install into it. That
+  needs pypi.org and files.pythonhosted.org among the hosts the sandbox's description lists.
+  If they are missing, ask the user to add them; do not download packages on this laptop.
 - Commands and jobs run in a container image. For GPU work with PyTorch, submit with:
   --gpus 1 -q gpu_short --image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest
 - For ssh and scp, use only janelia-agent: no other ssh host, user name or key.

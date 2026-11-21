@@ -162,7 +162,10 @@ and on one that contains `/scratch/$USER/.agentic-sandbox`.
 
 **Network, default-deny.** Without `--allow` there is no network. `scripts/allowlist_proxy.py` runs
 outside the sandbox on a Unix socket and allows `CONNECT`/HTTP to the listed hostnames and their
-subdomains, **on any port**, refusing everything else. The socket is bound into the sandbox and
+subdomains, **on any port**, refusing everything else. A listed name is not trusted to point
+anywhere: the proxy resolves it and refuses it (403) when it resolves to a loopback, link-local
+(169.254), multicast or reserved address, so an allowed name cannot be used to reach services on
+the node. Private addresses are allowed, since the cluster's own services have them. The socket is bound into the sandbox and
 `scripts/relay.py` exposes it on loopback; `http_proxy`/`https_proxy` (both cases) and `no_proxy` are
 set. There is no direct route out: no raw TCP, no package registries you didn't list. But a
 `CONNECT` tunnel to a listed host's non-HTTP port (its ssh port, say) is permitted, so list only
@@ -232,7 +235,9 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   envelope (podman with only `/scratch` mounted and no `--allow`, say) or a csub without it, the
   wrapper refuses to start; `CSUB_ENVELOPE=off` accepts a broker bounded by the policy alone. Keep
   `allowed_roots` as narrow as the project either way.
-- Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). Without `bsub` on the host,
+- Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). `CSUB_BROKER_CMD` names
+  another broker command; anything but the `csub-broker` command itself is started from `/`, so a
+  relative `--policy` path in it does not resolve. Without `bsub` on the host,
   `--csub` fails at start; csub's `csub relay` is the tool for that case.
 - **The limits are per job, checked at submit.** A job asks for slots, GPUs and a walltime; the broker
   refuses one above `max_slots`, `max_gpus` or `max_walltime_min`. `max_estimated_cost_usd` is the same
@@ -272,7 +277,8 @@ agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I
 
 - **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
   `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are
-  relayed, each on its own stream, so `scp` to the project directory works too, with `--podman` as well. A job takes from seconds to a minute to
+  relayed, each on its own stream, so `scp` to the project directory works too, with `--podman` as well
+  (tested through the forced command, not yet through a real sshd). A job takes from seconds to a minute to
   start, and nothing carries over between commands except files in the project directory.
 - **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
   in the job's environment, not on a command line.
@@ -306,7 +312,8 @@ Verified live under bwrap, with Claude Code and Codex on a Mac between them: com
 
 ## Images (podman)
 
-Neither is required; `--image` takes any OCI image. A csub policy decides which images child jobs may use.
+Neither is required; `--image` takes any OCI image (for `scp` through `ssh-entry.sh --podman` it
+must have `sftp-server` at `/usr/libexec/openssh/sftp-server`). A csub policy decides which images child jobs may use.
 
 | Image | Base | Contents | Size | Use when |
 | --- | --- | --- | --- | --- |
@@ -354,7 +361,7 @@ image.**
 | | `sandbox-run.sh --gpu` (bwrap) | `podman-run.sh --gpu` |
 | --- | --- | --- |
 | One-time setup | none | a subuid/subgid range from HPC, plus `storage.conf` and `containers.conf` from `config/` (`SETUP.md` §3) |
-| Start-up | seconds | an image pull (1.2 GB, or several GB) on each new node, and again after the hourly scratch cleanup |
+| Start-up | seconds | an image pull (about 2 GB, or 26 GB) on each new node, and again after the hourly scratch cleanup |
 | Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
 | Credential masking | yes | no, which is why `$HOME` cannot be mounted |
 | What the sandbox sees of the node | device nodes for the job's GPUs only; `/sys/devices` and `/sys/module`, read-only | a device node for every GPU on the node (LSF's device cgroup blocks the ones that are not yours) and all of `/sys`, read-only |
@@ -487,7 +494,7 @@ Five suites in `tests/`:
   need a model to answer (a Claude login, a LiteLLM key); everything else is the sandbox itself.
 - The `--csub` sections need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` set to a directory under
   your policy's allowed roots.
-- The summary line counts what was skipped (`82 passed, 0 failed, 0 skipped`), so a run without a
+- The summary line counts what was skipped (`N passed, 0 failed, 0 skipped`), so a run without a
   GPU or without csub does not look like a full one.
 - "Nothing left behind" checks compare with the state at the start, and a killed run removes its
   own test directories.
@@ -501,7 +508,8 @@ Five suites in `tests/`:
   against the job's memory.
 - **A request hangs, or `claude`/`opencode` retries with `Request timed out`**: the host isn't on your
   allowlist (the wrapper prints the denied ones). Claude Code needs `api.anthropic.com`, `claude.ai`,
-  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`.
+  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`. If a host you did allow is
+  in the denied list, its name resolves to a loopback or link-local address, which the proxy refuses.
 - **`GuardrailRaisedException`/400 from `kimi-k3`**: the safeguard, not a bug. **opencode `Forbidden`**:
   no `-m litellm/kimi-k3`. **`Failed to execute statement`/`UnknownError`**: another `--opencode`
   sandbox of yours is running.
@@ -519,7 +527,11 @@ Five suites in `tests/`:
   `sandbox-run.sh` always passes on its working directory): the sandbox has no mount outside `$HOME`
   and `/scratch` and no `--allow` host, so the broker's envelope would be empty. Add the `--rw`/`--ro`
   path or `--allow` host the child jobs may use, or `CSUB_ENVELOPE=off` for a policy-only broker.
-- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`**: a preset `CSUB_MOUNTS`
+- **`--csub: ... contains a comma or a colon`**, or **`CSUB_MOUNTS entry ... is not a plain absolute
+  path`**: the list of mounts handed to csub separates entries with commas and colons and is compared
+  as text. Use a directory without those characters, and give `CSUB_MOUNTS` plain absolute paths.
+- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`** (`podman-run.sh` says
+  "this container's mounts"): a preset `CSUB_MOUNTS`
   names a path the sandbox does not have, or asks rw where it is ro. Unset it, or add the path with
   `--rw`/`--ro`.
 - **`csub: policy_violation: ... not allowed in the parent`** (from a child's submission): the child
@@ -528,7 +540,9 @@ Five suites in `tests/`:
 - **`Permission denied (publickey)` through an `ssh-entry.sh` key**: the key line is wrong or past its
   `expiry-time`, or `~/.ssh` on the cluster is not mode 700. **`project directory ... does not
   exist`**: fix `--project` in the key line. **`project directory ... is your home directory, or inside
-  it, or above it`**: move the project outside `$HOME` and edit the key line.
+  it, or above it`**: move the project outside `$HOME` and edit the key line. **`cannot enter <project>
+  on <node>`**: the directory is not visible on the compute nodes. **`scp: Received message too
+  long`** with `--podman`: the checkout behind the key line predates 2026-11-21; update it.
 - **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
   policy or the `--allow` list, outside the sandbox.
 

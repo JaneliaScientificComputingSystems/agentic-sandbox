@@ -161,6 +161,10 @@ used `gpu_short` and exited 0.
 - **The budget is audited, not enforced.** The broker counts the jobs (4) and the second job reports them, but
   nothing stops a fifth. The agent followed the rule. A hard cap needs a ceiling in the broker or in a
   checker that runs outside the sandbox.
+- **The test set is hidden from the agent's session, not from its code.** `prepare_data.py` stores the
+  labels in the same file as the images, and final scoring hands that file to the agent's own `train.py`. A
+  `train.py` written to read the labels would score perfectly. This run's code did not, but the example
+  does not prevent it; the evaluator should pass images only.
 - **The key is exposed to the agent by design.** It must be, to reach its model. The network allowlist and a
   narrow key are the protection; there is no way to hide it from the process that uses it.
 - **Policy was broader than the sandbox.** `allowed_roots` covered more than the four mounted paths, and a

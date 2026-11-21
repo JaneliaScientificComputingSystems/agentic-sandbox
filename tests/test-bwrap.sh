@@ -204,6 +204,15 @@ s_10() {
   check "no process inside carries a host variable (bwrap is PID 1; its environment holds the job id at most)" "$OUT" "0,bwrap,0"
   OUT=$(SANDBOX_TEST_SECRET=leaked "$SANDBOX_RUN" --allow example.com -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n"')
   check "same with --allow (the relay runs inside too)" "$OUT" "0"
+  # From OUTSIDE: a command line is readable by every user on the node, so a value passed with
+  # --env must not be on bwrap's (or on any other process's of this account).
+  SANDBOX_TEST_WANTED=cmdline-canary-$$ "$SANDBOX_RUN" --env SANDBOX_TEST_WANTED -- bash -c 'echo "$SANDBOX_TEST_WANTED" > seen.txt; sleep 6' &
+  local wp=$! n=0 pid
+  sleep 3
+  for pid in $(pgrep -u "$USER"); do tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "cmdline-canary-$$" && n=$((n + 1)); done
+  wait "$wp"
+  check "an --env value reaches the command and is on no command line" "$(cat seen.txt 2>/dev/null),$n" "cmdline-canary-$$,0"
+  rm -f seen.txt
 }
 
 s_11() {
@@ -232,6 +241,8 @@ s_14() {
   OUT=$("$SANDBOX_RUN" --claude -- bash -c 'echo "{\"hooks\":{}}" > "$CLAUDE_CONFIG_DIR/settings.json" && echo "{}" > "$CLAUDE_CONFIG_DIR/.claude.json" && test "$CLAUDE_CONFIG_DIR" != "$HOME/.claude" && echo isolated' 2>/dev/null)
   AFTER=$(cat "$HOME/.claude/settings.json" 2>/dev/null | md5sum)
   check "CLAUDE_CONFIG_DIR is a per-job dir" "$OUT" "isolated"
+  "$SANDBOX_RUN" --claude -- bash -c 'mkdir "$CLAUDE_CONFIG_DIR/k" && mv "$CLAUDE_CONFIG_DIR/.claude.json" "$CLAUDE_CONFIG_DIR/k/" 2>/dev/null; chmod 000 "$CLAUDE_CONFIG_DIR/k"' >/dev/null 2>&1
+  check "a directory left without permissions in the config copy does not survive the job" "$(state_dirs)" "$BASE_STATE"
   check "host settings.json untouched" "$AFTER" "$BEFORE"
   check "per-job state dir removed on exit" "$(state_dirs)" "$BASE_STATE"
 }

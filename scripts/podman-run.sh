@@ -79,6 +79,17 @@
 # contains /scratch/$USER/.agentic-sandbox. Scope --rw/--ro to the subdirectory you need.
 set -euo pipefail
 
+# Python that this script starts on the host (the csub broker, its lookup) must never import from
+# a directory the sandboxed process can write. An empty or relative PYTHONPATH entry means "the
+# working directory", so those are dropped here, once, for everything started below.
+if [[ -n "${PYTHONPATH+x}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do [[ "$_e" == /* ]] && _pp="${_pp:+$_pp:}$_e"; done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
 # Save the real stdin before anything backgrounds `podman run` (needed below, for the
 # catatonit watchdog) -- bash silently redirects a backgrounded job's stdin from /dev/null,
 # confirmed live: piping input into this script and running `-- cat` produced no output at all
@@ -641,6 +652,13 @@ cleanup() {
   if [[ -n "${CONTAINERS_STORAGE_CONF:-}" ]]; then
     podman --events-backend=none rm -f --all --time 10 >/dev/null 2>&1 || true
   fi
+  # The copies of the agent configuration (cfg/ holds ~/.claude.json) go first, before the slower
+  # teardown below: a job that is killed part-way through cleanup must not leave them. Through
+  # `podman unshare` as well, because a root process in the container can leave entries there
+  # owned by a sub-uid that a plain rm cannot remove.
+  if [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR/cfg" ]]; then
+    podman unshare rm -rf "$JOB_DIR/cfg" 2>/dev/null || rm -rf "$JOB_DIR/cfg" 2>/dev/null || true
+  fi
 
   # The watchdog below should already have reaped any lingering catatonit for this job by the
   # time we get here; this is just a last-chance sweep before removing the storage dir.
@@ -713,10 +731,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # is started from / as well. The usual csub-broker console script is not affected (its module
   # path starts at its own bin directory) and keeps the working directory.
   CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
-  CSUB_BROKER_CWD=.
-  case "$(basename -- "${CSUB_BROKER%% *}")" in
-    python*) CSUB_BROKER_CWD=/ ;;
-  esac
+  # Only the csub-broker console script keeps the working directory (its module path starts at
+  # its own bin directory, and a relative --policy in the command must still resolve). Every
+  # other form (python -m, env python3 -m, uv run, a wrapper script) is started from /.
+  CSUB_BROKER_CWD=/
+  [[ "$(basename -- "${CSUB_BROKER%% *}")" == csub-broker ]] && CSUB_BROKER_CWD=.
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "podman-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -946,7 +965,9 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_DIR="$JOB_DIR/proxy"
   mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
-  python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
+  # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
+  # standard library only, and it runs on the host from a directory the agent may be able to write.
+  python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Bounded, fail-closed wait, as in sandbox-run.sh (a fixed sleep raced the interpreter start).

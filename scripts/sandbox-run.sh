@@ -119,6 +119,17 @@
 #     claude
 set -euo pipefail
 
+# Python that this script starts on the host (the csub broker, its lookup) must never import from
+# a directory the sandboxed process can write. An empty or relative PYTHONPATH entry means "the
+# working directory", so those are dropped here, once, for everything started below.
+if [[ -n "${PYTHONPATH+x}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do [[ "$_e" == /* ]] && _pp="${_pp:+$_pp:}$_e"; done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
 # Physical paths throughout: the script's own directory (so running it through a symlink still
 # finds allowlist_proxy.py and relay.py next to it, and the read-only re-bind below shadows the
 # real directory), and the working directory (bwrap binds and csub's envelope compare paths
@@ -326,7 +337,7 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
   OPENCODE_XDG_CONFIG="$SANDBOX_CFG_ROOT/opencode-xdg-config"
   mkdir -p "$OPENCODE_XDG_CONFIG"
-  [[ -d "$HOME/.config/opencode" ]] && cp -R "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
+  [[ -d "$HOME/.config/opencode" ]] && cp -RH "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
   mkdir -p "$OPENCODE_XDG_CONFIG/opencode"
   OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
   [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
@@ -372,12 +383,18 @@ PASSTHROUGH_ENV=(PATH HOME USER LOGNAME SHELL TERM COLORTERM LANG TZ
                  SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS)
 # Every LC_* the invoking shell has, as documented above -- not a fixed subset.
 while IFS= read -r name; do PASSTHROUGH_ENV+=("$name"); done < <(compgen -e LC_)
+# These values do NOT go on bwrap's command line: a command line is readable by every user on
+# the node (/proc/<pid>/cmdline, `ps -ef`), and --env exists to pass secrets such as an API key.
+# They are collected here and handed to bwrap on a file descriptor (--args 9, see run_bwrap). The
+# position of --args keeps the order: bwrap takes the last --setenv for a name.
+ENV_ARGS=()
 for name in "${PASSTHROUGH_ENV[@]}" "${PASS_ENV[@]:-}"; do
-  [[ -n "$name" && -n "${!name+x}" ]] && BWRAP_ARGS+=(--setenv "$name" "${!name}")
+  [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=(--setenv "$name" "${!name}")
 done
 for ((i = 0; i < ${#EXTRA_SETENV[@]}; i += 2)); do
-  BWRAP_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
+  ENV_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
 done
+BWRAP_ARGS+=(--args 9)
 # The CLI dirs bound by --claude/--opencode are only reachable by name if PATH names them. An
 # interactive shell's PATH usually does already; one from `bsub -env none` or another scrubbed
 # environment does not, and `exec: claude: not found` was the result.
@@ -597,6 +614,9 @@ cleanup() {
   # (tests and user pipelines take `2>&1 | tail -1`), and opencode denials in a successful run
   # (its registry.npmjs.org / models.opencode.ai pings) are the allowlist working, not news.
   local rc=$?
+  # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
+  # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
+  trap '' TERM INT USR2
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ $rc -ne 0 ]] && summarize_proxy_denials
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
@@ -607,7 +627,12 @@ cleanup() {
   # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
   # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on
   # the host side -- bwrap's mount only ever existed in the sandbox's namespace.
-  [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]] && rm -rf "$JOB_DIR"
+  # chmod first: the sandboxed command can write in cfg/, and a directory it left without
+  # permissions (chmod 000 around the ~/.claude.json copy) would otherwise survive the rm.
+  if [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]]; then
+    chmod -R u+rwX "$JOB_DIR" 2>/dev/null || true
+    rm -rf "$JOB_DIR" 2>/dev/null || echo "sandbox-run.sh: could not remove $JOB_DIR; remove it by hand (it holds copies of your agent configuration)" >&2
+  fi
   true
 }
 # Replaces early_cleanup (installed right after the per-job dir was made); the signal traps set
@@ -637,10 +662,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # is started from / as well. The usual csub-broker console script is not affected (its module
   # path starts at its own bin directory) and keeps the working directory.
   CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
-  CSUB_BROKER_CWD=.
-  case "$(basename -- "${CSUB_BROKER%% *}")" in
-    python*) CSUB_BROKER_CWD=/ ;;
-  esac
+  # Only the csub-broker console script keeps the working directory (its module path starts at
+  # its own bin directory, and a relative --policy in the command must still resolve). Every
+  # other form (python -m, env python3 -m, uv run, a wrapper script) is started from /.
+  CSUB_BROKER_CWD=/
+  [[ "$(basename -- "${CSUB_BROKER%% *}")" == csub-broker ]] && CSUB_BROKER_CWD=.
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "sandbox-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -877,9 +903,13 @@ write_sandbox_readme
 # the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
 run_bwrap() {
   local fd
+  # The environment for the command, NUL-separated, on descriptor 9 (see ENV_ARGS above). printf
+  # is a builtin, so the values are in no process's command line. bwrap reads the descriptor and
+  # closes it; it is not passed on to the command.
+  exec 9< <(printf '%s\0' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"})
   for fd in /proc/self/fd/*; do
     fd="${fd##*/}"
-    if [[ "$fd" -gt 2 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
+    if [[ "$fd" -gt 2 && "$fd" -ne 9 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
   done
   # --clearenv empties the environment of the COMMAND only. bwrap itself stays inside the sandbox
   # as PID 1, and the environment it was started with is readable there at /proc/1/environ: every
@@ -901,7 +931,9 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_DIR="$JOB_DIR/proxy"
   mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
-  python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
+  # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
+  # standard library only, and it runs on the host from a directory the agent may be able to write.
+  python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Wait for the socket to actually exist before bind-mounting it, and fail closed if the

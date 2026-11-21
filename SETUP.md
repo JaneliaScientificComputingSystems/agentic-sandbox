@@ -61,7 +61,7 @@ What this buys and costs: podman's per-user storage would otherwise land in
 `~/.local/share/containers` and fill your home with multi-GB images. On scratch it is node-local
 and wiped by the hourly cleanup whenever you have no job on that node, so a job on a new node, or
 one starting more than an hour after your previous job there, pulls the image again (the lite
-image is 1.24 GB; the PyTorch one several GB). If you'd rather trade that for a durable cache,
+image is about 2 GB; the PyTorch one 26 GB). If you'd rather trade that for a durable cache,
 point `graphroot`/`runroot` at a path under `$HOME`.
 
 No `podman login` or `podman pull` is needed: the images are public and `podman-run.sh` checks

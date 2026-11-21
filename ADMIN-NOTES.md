@@ -731,7 +731,8 @@ for the same account — both drive opencode against the same `~/.local/share/op
 > layer was added on top of the same cached layers: `openssh-sftp-server` in both, `python3-pip`
 > and `python3-venv` in the default image, and in the GPU image an entrypoint wrapper that runs
 > NVIDIA's entrypoint with its output on stderr. Sizes: about 2.1 GB and 26 GB. Verified from the
-> published tags on the cluster: `tests/test-podman.sh` 60 of 60 with the new default image; on the
+> published tags on the cluster: `tests/test-podman.sh` 60 of 60 with the new default image (62 after
+> the checks added later that day); on the
 > GPU image `nvidia-smi` lists the job's GPU, `torch.cuda.is_available()` is true and a matrix
 > product runs on it, `ray` 2.60.0 imports, `--keep-id` works, and `claude` 2.1.329, `opencode`
 > 1.19.6 and `codex-cli` 0.171.0 run. The previous images stay on GHCR as `test-2026-11` (default)
@@ -1190,9 +1191,29 @@ The same review produced smaller findings. Those fixed here, each read against t
   for a refusal; the Claude one-shot sections ignored the exit status; `test-array.sh` noticed a
   leak only if the answer was exactly 200.
 
-**Evidence,** on the cluster: `test-proxy.py` 64 passed, `test-csub-policy.sh` 51, `test-bwrap.sh`
-87, `test-podman.sh` 61, `test-array.sh` 11 (bwrap) and 12 (podman). Through the changed proxy,
-`pypi.org` and `litellm.int.janelia.org` answered 200 and `example.com` was refused.
+A third pass over these fixes found more, also closed:
+
+- **`--env` values on bwrap's command line.** Each went in as `--setenv NAME VALUE`, and `/proc` on
+  the nodes is mounted without `hidepid`, so every user could read them with `ps`. They now go to
+  bwrap on descriptor 9 (`--args 9`, written by the `printf` builtin), with the rest of the
+  environment. bwrap closes the descriptor; the "only 0-2 inside" check still passes.
+- **Host-side Python, remaining paths.** The proxy starts with `python3 -I`; empty and relative
+  `PYTHONPATH` entries are dropped at the top of both wrappers; and only the `csub-broker` console
+  script keeps the working directory (`env python3 -m`, `uv run` and the like were missed by the
+  first fix, which looked for a name starting with `python`).
+- **Cleanup, both wrappers.** `sandbox-run.sh` got the same guard against a second signal, and makes
+  the per-job directory removable first (the command could leave a `chmod 000` directory around the
+  `~/.claude.json` copy). `podman-run.sh` removes `cfg/` right after the containers, through
+  `podman unshare` too.
+- **Proxy.** A host written with a trailing dot, or with an empty or over-long label, raised an
+  exception that was not answered; the log bound did not cover allowed lines, and a flood of
+  allowed requests could use up the lines before a denial was recorded.
+
+**Evidence,** on the cluster, after the first batch: `test-proxy.py` 64 passed,
+`test-csub-policy.sh` 51, `test-bwrap.sh` 87, `test-podman.sh` 61, `test-array.sh` 11 (bwrap) and
+12 (podman). Through the changed proxy, `pypi.org` and `litellm.int.janelia.org` answered 200 and
+`example.com` was refused. After the third pass: `test-proxy.py` 67, `test-csub-policy.sh` 51, `test-bwrap.sh` 89,
+`test-podman.sh` 61, `test-array.sh` 11 and 12, and the same proxy check by hand.
 
 **Found sound or not applicable here:** `/scratch` is root-owned and not world-writable on the
 nodes, so another user cannot create `/scratch/<you>` first.
@@ -1208,6 +1229,9 @@ nodes, so another user cannot create `/scratch/<you>` first.
 - The proxy does not re-check a second plain-HTTP request on a kept-alive connection (the peer is
   always the checked host), has no cap on connections and no idle timeout on tunnels.
 - The images are built from unpinned installers, and `latest` is pulled on every run.
+- `--opencode` binds `~/.cache/opencode` and `~/.local/share/opencode` read-write. If opencode
+  runs code from there, an agent can change what the next unsandboxed opencode runs. Not checked
+  against opencode's layout.
 - `examples/unattended-tuning`: the labels of the "hidden" test set are in the file handed to the
   agent's own `train.py`.
 - Refusal tests that assert only exit status 1, and the smaller input checks in `csub-policy.sh`.

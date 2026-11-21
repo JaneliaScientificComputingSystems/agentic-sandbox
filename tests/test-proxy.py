@@ -99,6 +99,16 @@ async def resolved_address_checks():
         check(f"allowed name {name} that resolves to a refused address is not connected",
               got.startswith("refused: "), True)
     check("names with a dot are looked up as written (trailing dot)", asked, ["rebind.example.com.", "meta.example.com."])
+    del loop.getaddrinfo
+    for name in ("a..example.com", "x" * 70 + ".example.com"):
+        try:
+            await proxy_mod.open_checked(name, 80)
+            got = "connected"
+        except OSError as e:
+            got = "OSError"
+        except Exception as e:  # anything else would escape the handler without an HTTP reply
+            got = type(e).__name__
+        check(f"a name that cannot resolve ({name[:16]}...) fails as an ordinary connection error", got, "OSError")
 
 
 asyncio.run(resolved_address_checks())
@@ -192,6 +202,8 @@ async def e2e():
               await talk(sock, http(f"127.0.0.1:{port}")), "HTTP/1.1 200 OK")
         check("e2e CONNECT to allowed host",
               await talk(sock, connect(f"localhost:{port}")), "HTTP/1.1 200 Connection Established")
+        check("e2e CONNECT to allowed host written with a trailing dot",
+              await talk(sock, connect(f"localhost.:{port}")), "HTTP/1.1 200 Connection Established")
         check("e2e CONNECT to lookalike denied",
               await talk(sock, connect(f"evil-localhost:{port}")), "HTTP/1.1 403 Forbidden")
         check("e2e plain HTTP to lookalike denied",

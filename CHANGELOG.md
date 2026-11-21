@@ -5,77 +5,92 @@ the evidence behind each.
 
 ## 2026-11-21
 
+**What to do.** A review of every script found three ways secrets or control could leave the
+sandbox. All are closed in this version, and four things are yours to do:
+
+1. Update the checkout that your jobs and your `ssh-entry.sh` key line use (`git pull`). csub child
+   jobs run the scripts named by `sandbox_scripts_dir` in your policy, so that checkout too.
+2. Treat as exposed any API key or token that was exported in a job which ran an agent under
+   `sandbox-run.sh` (the agent could read it), and any value passed with `--env` (other users on
+   the node could read it while the job ran). Rotate them.
+3. Look in every project directory an agent could write for Python files or directories you did
+   not put there and that are named like a module (`json.py`, `csub.py`, `sqlite3.py`,
+   `datetime.py`, `tomli/` and the like), and remove them.
+4. Fetch the laptop instruction file again if you use one (`SETUP.md` §8 step 6).
+
+### Security fixes
+
+- **`sandbox-run.sh`: the job's environment was readable inside the sandbox.** `bwrap` stays
+  inside as process 1, and it was started with the wrapper's whole environment, so
+  `/proc/1/environ` showed every variable of the job, including any API key or token exported
+  there. The command's own environment was clean, as documented. `bwrap` now starts with the job id
+  and array index only. `podman-run.sh` was not affected.
+- **`sandbox-run.sh`: a value passed with `--env` was on a command line.** Each `--env` variable
+  went to `bwrap` as an argument, and command lines are readable by every user on a node
+  (`ps -ef`). The values now reach `bwrap` on a file descriptor and are on no command line.
+- **Both wrappers: a Python file in the working directory could run outside the sandbox.** With
+  `--csub`, and in `podman-run.sh` on every start, the wrapper ran Python on the host from the
+  working directory, and Python looks there for modules first. With an empty or relative entry in
+  your `PYTHONPATH`, the proxy started by `--allow` did the same. A file the agent left
+  in its project ran as you, unsandboxed, the next time a sandbox started there; through
+  `ssh-entry.sh` that is the agent's next command. Host-side Python now runs isolated from the
+  working directory, and empty or relative `PYTHONPATH` entries are dropped. A broker set with
+  `CSUB_BROKER_CMD` is started from `/` unless it is the `csub-broker` command itself, so a
+  relative `--policy` path works only with that form.
+- **`ssh-entry.sh` refuses a project directory inside `$HOME`** (and `$HOME` itself, or a directory
+  above it), on the login node, before it submits anything. The script used to check only that the
+  directory existed, so a key line could hand the agent `~/.ssh` read-write. If your key line names
+  a project under your home directory, move the project and edit the line.
 - **Proxy: an allowed name is checked for where it points.** `--allow NAME` used to connect to
   whatever the name resolved to. The proxy now resolves it once, refuses loopback, link-local
   (169.254), multicast, unspecified and reserved addresses, and connects to the address it checked.
   A name with a dot is looked up as written, so the node's search domains are not appended to it.
-  Private addresses still work, because the cluster's own services live there. To reach a service
-  on the node itself, allow `localhost` or the address literally.
-- **Proxy: the log is bounded.** Logged values are cut to 200 characters and the log stops at
-  20000 lines, so a sandboxed process cannot fill the node's scratch disk through it. A request
-  with a bad or missing `Host` header is logged as `BAD`, no longer as a denied host, and the
-  denied-host summary reads only the proxy's own lines.
-- **`podman-run.sh`: cleanup holds under races.** A process that vanished between being found and
-  being killed, a directory that was still busy, or a second signal from `bkill` could end the
-  cleanup early: the state directory stayed behind (with the copy of `~/.claude.json`) and the job
-  returned 1. In an array job each element's watchdog also matched its siblings' pause processes;
-  it now matches the array index too.
-- **`podman-run.sh`:** the host's `http_proxy`, `https_proxy` and `no_proxy` are no longer copied
-  into the container (podman does that by default); `--opencode` copies the target of a symlinked
-  `~/.config/opencode`, where it used to bind the real directory read-write; an `--image` value
-  that starts with `-` is refused.
-- **`--csub` in both wrappers:** a mount path that contains a comma or a colon is refused, and so is
-  a preset `CSUB_MOUNTS` entry with `..` in it. Either could put a directory the sandbox does not
-  have into the list handed to csub.
+  Private addresses still work, because the cluster's own services live there. A host you allowed
+  can therefore appear in the denied list at exit: its name resolves to an address of that kind.
 - **`csub-policy.sh` checks the physical path.** `--rw "$HOME/"`, `--rw /`, a path through `..` and
   a symlink into the home directory used to pass the home-directory check, which compared text.
   The policy now holds the physical path.
+- **`--csub` in both wrappers:** a mount path that contains a comma or a colon is refused, and so is
+  a preset `CSUB_MOUNTS` entry with `..` in it. Either could put a directory the sandbox does not
+  have into the list handed to csub.
 
-- **Security fix, `sandbox-run.sh`: the job's environment was readable inside the sandbox.**
-  `bwrap` stays inside as process 1, and it was started with the wrapper's whole environment, so
-  `/proc/1/environ` showed every variable of the job, including any API key or token exported
-  there. The command's own environment was clean, as documented; this was beside it. `bwrap` now
-  starts with the job id and array index only. If a key was exported in a job that ran an agent
-  under `sandbox-run.sh`, treat it as seen by that agent. `podman-run.sh` was not affected.
-- **Security fix, both wrappers: a Python file in the working directory could run outside the
-  sandbox.** With `--csub`, and in `podman-run.sh` on every start, the wrapper ran small Python
-  snippets on the host from the working directory, and Python looks there for modules first. An
-  agent that left a `csub.py`, `json.py` or `sqlite3.py` in its project had it run as you,
-  unsandboxed, the next time a sandbox started there; through `ssh-entry.sh` that is the agent's
-  next command. The snippets now run isolated from the working directory. If an agent has had
-  write access to a project used this way, look for such files in it.
+### Other changes
+
 - **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on
   stdout, so anything the wrapper or the command wrote to stderr (with `--podman`, "Trying to pull
   ..." and an image id on every command) appeared in the command's output. Commands without a
   terminal now get the two streams separately. If you parsed that mixed output, read stderr too.
-- **Images: `scp` and `sftp` work through `ssh-entry.sh --podman`.** Both images now carry
-  `sftp-server`. The default image also gained `pip` and `venv`, so a Python package can be
-  installed in it. The GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout
-  holds only its own output. `podman/Dockerfile` and `Dockerfile.pytorch` now match the published
-  images (they lacked the 2026-11-19 additions: Codex, Ray, the CUDA 13.5 base). Nodes pull the new
-  layers on the next run.
-- **Laptop instruction files:** `pip install` needs `pypi.org` and `files.pythonhosted.org` among
-  the allowed hosts, and the file says to ask for them. `AGENTS-podman.md` uses the image rule for
-  GPU jobs and says which description of the working directory to believe. Copy the new file to
-  your laptop to pick this up.
-- **`SETUP.md` §8 step 1** carries `--replace`, so it no longer stops when §6 already wrote a policy.
-
-- **`ssh-entry.sh` now refuses a project directory inside `$HOME`** (and `$HOME` itself, or a
-  directory above it), on the login node, before it submits anything. The documents always said the
-  project must be outside the home directory, but the script checked only that it existed, so a key
-  line could hand the agent `~/.ssh` or a harness's settings directory read-write. If your key line
-  names a project under your home directory, move the project and edit the line.
-- **Laptop instruction files:** the rule against `--wait` now says it holds even though the
-  sandbox's own description lists `--wait`, and the submit rule shows how to ask for a GPU. Copy the
-  new file to your laptop to pick this up.
-
-- **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`):
-  the agent now submits without `--wait` and checks with `csub status` no more often than once a
-  minute, the rule of the HPC hints page. `csub submit --wait` asks the scheduler after 1, 2, 4, 8
-  and 15 seconds and then every 30, and through `ssh-entry.sh` it holds a job slot while it waits.
-  Copy the new file to your laptop to pick this up.
-- **`SETUP.md` correction:** `EXPIRES` in the key line is the first day the key no longer works,
-  not the last day it works. sshd reads a date without a time as midnight at the start of that day.
+- **`scp` and `sftp` work through `ssh-entry.sh --podman`.** This needs both the new images and
+  this version of `ssh-entry.sh`; with an old checkout the copy still fails with "Received message
+  too long". Both images now carry `sftp-server`. The default image also gained `pip` and `venv`.
+  The GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout holds only its own
+  output. `podman/Dockerfile` and `Dockerfile.pytorch` now match the published images (they lacked
+  the 2026-11-19 additions: Codex, Ray, the CUDA 13.5 base). Nodes pull the new layers on the next
+  run. Tested through the forced command, not yet through a real sshd.
+- **Cleanup holds under races, in both wrappers.** A process that vanished between being found and
+  being killed, a directory that was still busy or that the agent left without permissions, or a
+  second signal from `bkill` could end the cleanup early: the state directory stayed behind (with
+  the copy of `~/.claude.json`) and the job returned 1. `podman-run.sh` now removes the
+  configuration copies first. In an array job each element's watchdog also matched its siblings'
+  pause processes; it now matches the array index too.
+- **`podman-run.sh`:** the host's `http_proxy`, `https_proxy` and `no_proxy` are no longer copied
+  into the container (podman does that by default); `--opencode` copies the target of a symlinked
+  `~/.config/opencode` (in `sandbox-run.sh` too); an `--image` value that starts with `-` is
+  refused.
+- **Proxy: the log is bounded.** Log lines are cut and the log stops at 20000 lines of each kind,
+  so a sandboxed process cannot fill the node's scratch disk through it. A request with a bad or
+  missing `Host` header is logged as `BAD`, no longer as a denied host.
+- **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`).
+  The agent submits without `--wait` and checks with `csub status` no more often than once a
+  minute, the rule of the HPC hints page; the rule holds even though the sandbox's own description
+  lists `--wait`. The submit rule shows how to ask for a GPU. `pip install` needs `pypi.org` and
+  `files.pythonhosted.org` among the allowed hosts, and the file says to ask for them. The host
+  rule now reads "for ssh and scp, use only janelia-agent". `AGENTS-podman.md` says which
+  description of the working directory to believe.
+- **`SETUP.md` §8:** step 1 carries `--replace`, so it no longer stops when §6 already wrote a
+  policy; `EXPIRES` in the key line is the first day the key no longer works, not the last day it
+  works (sshd reads a date without a time as midnight at the start of that day).
+- **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20
 
