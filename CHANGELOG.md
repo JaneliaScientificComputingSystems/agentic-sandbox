@@ -5,6 +5,14 @@ the evidence behind each.
 
 ## 2026-11-21
 
+- **`ssh-entry.sh` now refuses a project directory inside `$HOME`** (and `$HOME` itself, or a
+  directory above it), on the login node, before it submits anything. The documents always said the
+  project must be outside the home directory, but the script checked only that it existed, so a key
+  line could hand the agent `~/.ssh` or a harness's settings directory read-write. If your key line
+  names a project under your home directory, move the project and edit the line.
+- **Laptop instruction files:** the rule against `--wait` now says it holds even though the
+  sandbox's own description lists `--wait`. Copy the new file to your laptop to pick this up.
+
 - **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`):
   the agent now submits without `--wait` and checks with `csub status` no more often than once a
   minute, the rule of the HPC hints page. `csub submit --wait` asks the scheduler after 1, 2, 4, 8

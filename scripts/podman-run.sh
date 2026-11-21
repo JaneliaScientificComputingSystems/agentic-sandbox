@@ -55,7 +55,8 @@
 #                    your next session.
 #   --opencode      Same idea: a throwaway copy of ~/.config/opencode, mounted at opencode's
 #                    default location inside (~/.config/opencode of the in-container user), plus
-#                    RW binds on its data dirs (~/.local/share, ~/.local/state, ~/.cache)
+#                    RW binds on its data dirs (the opencode directory under each of
+#                    ~/.local/share, ~/.local/state and ~/.cache)
 #   --keep-id       Run as your real uid/gid instead of root (--userns=keep-id --user
 #                    "$(id -u):$(id -g)"), so files land on the real filesystem with your
 #                    normal ownership instead of root-mapped-through-the-user-namespace.

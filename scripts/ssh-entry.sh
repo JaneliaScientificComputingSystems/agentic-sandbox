@@ -7,7 +7,7 @@
 #
 #   command="/path/to/agentic-sandbox/scripts/ssh-entry.sh --project /groups/lab/proj",no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... agent
 #
-# Whatever the agent then sends (`ssh cluster '<command>'`) never runs on the login node. This
+# Whatever the agent then sends (`ssh janelia-agent '<command>'`) never runs on the login node. This
 # script submits it as an interactive LSF job (`bsub -I`) whose command is sandbox-run.sh
 # started in the project directory, and relays stdin, stdout, stderr and the exit status. The
 # only things that run on the login node are this script and bsub.
@@ -21,7 +21,7 @@
 #
 # Options after `--` go to the wrapper unchanged (--csub, --allow HOST, --ro DIR, --gpu, and
 # for podman --image NAME, ...). For GPU work pick a GPU queue with --queue.
-# With no command (a plain `ssh cluster`), the job is an interactive shell in the sandbox.
+# With no command (a plain `ssh janelia-agent`), the job is an interactive shell in the sandbox.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,6 +81,12 @@ fi
 # On the login node: submit, and nothing else.
 [[ -d "$PROJECT" ]] || die "project directory $PROJECT does not exist"
 PROJECT="$(cd "$PROJECT" && pwd -P)"
+# The project is the one directory the agent gets read-write. Under $HOME it could be ~/.ssh or
+# the directory of a harness's settings; the wrappers refuse $HOME itself but not what is in it.
+HOME_P="$(cd "$HOME" 2>/dev/null && pwd -P)" || HOME_P="$HOME"
+if [[ "$PROJECT" == "$HOME_P" || "$PROJECT" == "${HOME_P%/}/"* || "$HOME_P" == "${PROJECT%/}/"* ]]; then
+  die "project directory $PROJECT is your home directory, or inside it, or above it; use a directory outside \$HOME"
+fi
 if ! command -v bsub >/dev/null 2>&1; then
   # A forced command gets a non-login shell; pick up LSF if the startup files did not.
   [[ -r /etc/profile.d/profile.lsf.sh ]] && . /etc/profile.d/profile.lsf.sh

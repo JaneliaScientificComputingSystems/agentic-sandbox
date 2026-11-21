@@ -263,21 +263,20 @@ command="env PATH=$HOME/.venvs/csub/bin:$PATH $HOME/agentic-sandbox/scripts/ssh-
 ```
 
 ```
-laptop                         login node                       compute node
-─────────────────────────      ─────────────────────────        ─────────────────────────────
-agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
-                               (the script and bsub only)           in the project directory
+laptop                               login node                       compute node
+───────────────────────────────      ─────────────────────────        ─────────────────────────────
+agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
+                                     (the script and bsub only)           in the project directory
 ```
 
-- **Each `ssh cluster '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
+- **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
   `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are
   relayed, so `scp` to the project directory works too. A job takes from seconds to a minute to
   start, and nothing carries over between commands except files in the project directory.
 - **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
   in the job's environment, not on a command line.
-- **`--project DIR`** is the one directory the agent can read and write. It must exist, and it
-  should be outside `$HOME`: the scripts refuse `$HOME` itself but do not check for a directory under
-  it. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
+- **`--project DIR`** is the one directory the agent can read and write. It must exist and be
+  outside `$HOME`; `ssh-entry.sh` refuses your home directory and anything inside or above it. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
   command runs in. `--podman` runs the command through `podman-run.sh` in a container image, with
   the project bound read-write at the same path; it needs `SETUP.md` §3.
 - **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, `--gpu`,
@@ -288,8 +287,8 @@ agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──
   answers `not allowed in the parent job`.
 - **Tell the agent.** It runs outside the sandbox and cannot know the rules unless told. `config/` has
   the instruction file to put in the agent's working directory on the laptop: `CLAUDE.md` for Claude
-  Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`). They point the agent at
-  `$SANDBOX_README`, the sandbox's own description, with `ssh cluster 'cat $SANDBOX_README'`.
+  Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`, saved under either name). They point the agent at
+  `$SANDBOX_README`, the sandbox's own description, with `ssh janelia-agent 'cat $SANDBOX_README'`.
 - **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions and `bkill -g /csub/$USER 0` the jobs it
   submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date.
 

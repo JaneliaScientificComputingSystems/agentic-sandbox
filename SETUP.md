@@ -232,8 +232,8 @@ Note that csub policies cannot use `localhost/` images (they are not visible on 
 ## 8. An agent on your laptop (`ssh-entry.sh`)
 
 Skip this unless the agent runs on your laptop and should do its work on the cluster. The README's
-section "An agent on your laptop" says what this gives you. You need §1, and §6 if the agent should
-submit jobs, which is the normal case. `LAPTOP` steps run in a terminal on the laptop, `CLUSTER` steps
+section "An agent on your laptop" says what this gives you. You need §1 and §6: the key line in step 4 uses
+`--csub`, and the instruction file in step 6 tells the agent to submit its jobs through csub. `LAPTOP` steps run in a terminal on the laptop, `CLUSTER` steps
 on the cluster as yourself.
 
 1. `CLUSTER`, inside an interactive job: make the project directory, outside your home directory, and
@@ -291,9 +291,11 @@ chmod 600 ~/.ssh/authorized_keys
 command rm ~/agent_cluster.pub
 ```
 
-   To let the agent reach a host or read another directory, add `--allow HOST` or `--ro DIR` after
-   `--csub` in `OPTS`, and give the same options to `csub-policy.sh` with `--replace`. Both places are
-   needed. For podman, add `--podman` before `--queue` and write the policy with `--podman`.
+   To let the agent reach a host or read another directory, put `--allow HOST` or `--ro DIR` after
+   `--csub`, and give the same options to `csub-policy.sh` with `--replace`. Both places are needed.
+   Before the first run, set them in `OPTS`. Later, edit the existing line in
+   `~/.ssh/authorized_keys`: running the block again would append a second line for the same key.
+   For podman, add `--podman` before `--queue` and write the policy with `--podman`.
 
 5. `LAPTOP`: test by hand. Each command is a cluster job, so each takes up to a minute to start.
 
@@ -316,7 +318,10 @@ curl -fsSL $RAW/CLAUDE.md -o CLAUDE.md
 echo '{"permissions": {"allow": ["Bash(ssh janelia-agent:*)", "Bash(curl -s https://hpc.int.janelia.org/docs/ai-agent-hints.md:*)"]}}' > .claude/settings.json
 ```
 
-   For Codex (use `AGENTS-podman.md` in place of `AGENTS.md` with `--podman`):
+   With `--podman`, fetch `AGENTS-podman.md` in place of `CLAUDE.md` and keep the saved name:
+   `curl -fsSL $RAW/AGENTS-podman.md -o CLAUDE.md`. Its text suits both agents.
+
+   For Codex (with `--podman`, fetch `AGENTS-podman.md` and still save it as `AGENTS.md`):
 
 ```bash
 RAW=https://raw.githubusercontent.com/JaneliaScientificComputingSystems/agentic-sandbox/main/config

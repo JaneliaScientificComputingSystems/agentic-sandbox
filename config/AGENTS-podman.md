@@ -18,7 +18,8 @@ All computation, compilation and installation happens on the cluster, never on t
   ssh janelia-agent 'csub status JOBID' and read its output with
   ssh janelia-agent 'csub logs JOBID'. Check no more often than once a minute, and with
   several jobs name them all in one csub status. Do not use --wait or csub wait from this
-  laptop: they ask the scheduler more often than that and hold a job slot while they wait.
+  laptop, even though the sandbox's description lists --wait: they ask the scheduler more
+  often than that and hold a job slot while they wait.
   Run "ssh janelia-agent 'csub probe'" to see the queues and limits.
   Run "ssh janelia-agent 'csub submit -h'" for all options.
 - To put a file on the cluster, write it there through ssh, or copy it with:

@@ -6,7 +6,7 @@
 | `containers.conf` | `~/.config/containers/containers.conf` on the cluster | podman: its own logging off, so nothing a container prints reaches the system logs |
 | `CLAUDE.md` | the agent's working directory on your laptop | Claude Code on a laptop, working through `ssh-entry.sh` |
 | `AGENTS.md` | the agent's working directory on your laptop | Codex on a laptop, working through `ssh-entry.sh` |
-| `AGENTS-podman.md` | the same, saved as `AGENTS.md` | Codex on a laptop, with `ssh-entry.sh --podman` |
+| `AGENTS-podman.md` | the same, saved as `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code) | either agent on a laptop, with `ssh-entry.sh --podman` |
 
 The two podman files are the same for every account and are needed only for `podman-run.sh`;
 `SETUP.md` §3 says what they do and what they cost.
