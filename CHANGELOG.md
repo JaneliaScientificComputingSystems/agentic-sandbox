@@ -3,6 +3,16 @@
 Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
 the evidence behind each.
 
+## 2026-11-21
+
+- **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`):
+  the agent now submits without `--wait` and checks with `csub status` no more often than once a
+  minute, the rule of the HPC hints page. `csub submit --wait` asks the scheduler after 1, 2, 4, 8
+  and 15 seconds and then every 30, and through `ssh-entry.sh` it holds a job slot while it waits.
+  Copy the new file to your laptop to pick this up.
+- **`SETUP.md` correction:** `EXPIRES` in the key line is the first day the key no longer works,
+  not the last day it works. sshd reads a date without a time as midnight at the start of that day.
+
 ## 2026-11-20
 
 - **`podman-run.sh` fix:** the wrapper could return 1 although the command inside had succeeded

@@ -270,8 +270,9 @@ Host janelia-agent
 scp ~/.ssh/agent_cluster.pub YOUR_USER@login1.int.janelia.org:agent_cluster.pub
 ```
 
-4. `CLUSTER`, on the login node (this only edits a file): add the key line. `EXPIRES` is the last day
-   the key works, as year, month, day. Your existing keys stay untouched.
+4. `CLUSTER`, on the login node (this only edits a file): add the key line. `EXPIRES` is the first day
+   the key no longer works, as year, month, day: sshd refuses the key from midnight at the start of
+   that day, cluster time. Your existing keys stay untouched.
 
 ```bash
 PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
