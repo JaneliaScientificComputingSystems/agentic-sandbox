@@ -177,8 +177,8 @@ it can't type into your terminal.
 **Harness config is copied, not bound.** `--claude` gives the sandbox a per-job copy of
 `~/.claude.json`, `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with `CLAUDE_CONFIG_DIR`
 pointing at it; only `~/.claude/.credentials.json` is bound through, so logins and token refreshes
-persist. `--opencode` copies `~/.config/opencode` and binds the three data dirs (`~/.local/share`,
-`~/.local/state`, `~/.cache`) read-write. Why: hooks, MCP entries and plugins are commands the harness
+persist. `--opencode` copies `~/.config/opencode` and binds its three data dirs (`~/.local/share/opencode`,
+`~/.local/state/opencode`, `~/.cache/opencode`) read-write. Why: hooks, MCP entries and plugins are commands the harness
 runs *as you, outside the sandbox, in your next session*; an agent that could write them would have a
 way out that outlives the job. Edits to the copies die with the job. The CLI binaries are bound
 read-only and put on `PATH`.
@@ -215,8 +215,8 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   socket crosses the boundary, at `/run/csub.sock`.
 - Inside, `csub` and `import csub` work with the sandbox's own `python3` (the csub package is
   bound read-only on `PYTHONPATH`, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
-  `CSUB_MOUNTS` comes from `$PWD` and the `--rw`/`--ro` paths not under `$HOME` or `/scratch` (nested
-  ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
+  `CSUB_MOUNTS` comes from `$PWD` (under `sandbox-run.sh`, always) and the `--rw`/`--ro` paths not under
+  `$HOME` or `/scratch` (nested ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
   does not.
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
@@ -275,8 +275,9 @@ agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──
   start, and nothing carries over between commands except files in the project directory.
 - **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
   in the job's environment, not on a command line.
-- **`--project DIR`** is the one directory the agent can read and write; it must exist and be outside
-  `$HOME`. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
+- **`--project DIR`** is the one directory the agent can read and write. It must exist, and it
+  should be outside `$HOME`: the scripts refuse `$HOME` itself but do not check for a directory under
+  it. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
   command runs in. `--podman` runs the command through `podman-run.sh` in a container image, with
   the project bound read-write at the same path; it needs `SETUP.md` §3.
 - **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, `--gpu`,
@@ -463,7 +464,7 @@ csub-policy.sh --bwrap|--podman --rw DIR [--ro DIR] [--allow HOST] [--gpus N] [-
 
 ## Testing
 
-Four suites in `tests/`:
+Five suites in `tests/`:
 
 | Suite | Tests | Run it |
 | --- | --- | --- |
@@ -510,7 +511,8 @@ Four suites in `tests/`:
 - **`csub: policy_violation: mount ... home directory`**: `CSUB_MOUNTS` includes something under
   `$HOME`; work from a directory under an allowed root. `csub --json probe` (`--json` before the
   subcommand) shows the policy.
-- **`--csub: nothing to bound child jobs to`** (at start): the sandbox has no mount outside `$HOME`
+- **`--csub: nothing to bound child jobs to`** (at start, in practice only from `podman-run.sh`, since
+  `sandbox-run.sh` always passes on its working directory): the sandbox has no mount outside `$HOME`
   and `/scratch` and no `--allow` host, so the broker's envelope would be empty. Add the `--rw`/`--ro`
   path or `--allow` host the child jobs may use, or `CSUB_ENVELOPE=off` for a policy-only broker.
 - **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`**: a preset `CSUB_MOUNTS`

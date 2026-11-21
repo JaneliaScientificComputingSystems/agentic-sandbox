@@ -245,6 +245,10 @@ mkdir -p "$PROJECT"
 "$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT
 ```
 
+   If you already wrote a policy in §6, this stops with `... exists; add --replace to overwrite it`.
+   The script writes the whole policy each time, so give it everything again: the options you used
+   in §6, plus `--rw $PROJECT`, plus `--replace`.
+
 2. `LAPTOP`: make a key for the agent only. It has no passphrase, because the agent must use it
    unattended; the key line in step 4 is what limits it.
 

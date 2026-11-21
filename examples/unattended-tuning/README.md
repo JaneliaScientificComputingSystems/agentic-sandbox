@@ -98,14 +98,14 @@ running anything below.
 
 **Step 1. Data** (`scripts/prepare_data.py`). On a machine with internet and numpy and pillow in a venv, run it:
 it downloads BBBC038 (83 MB), keeps the 334 grayscale 256x256 fluorescence images and writes `train.npz`
-(200), `val.npz` (64) and `test.npz` (70). Put `train.npz` and `val.npz` in `$R/data/` and `test.npz` in a
+(200), `val.npz` (64) and `test.npz` (70). Once step 2 has created `$R/data/`, put `train.npz` and `val.npz` there and `test.npz` in a
 directory the csub policy refuses, such as `~/holdout/`. Without csub's envelope, anything under `allowed_roots` could be reached by a
 widened mount claim; a hidden set must live outside it either way.
 
 **Step 2. Layout** (`scripts/setup.sh`). Creates `$R/{project,eval,data,venv,logs,final}`. `project/` gets the
 baseline `train.py` (`train_baseline.py`) and `TASK.md`, rendered from `TASK.md.in` with your `$R`; `eval/` gets
 `run_eval.py`, which runs `train.py` as a subprocess with a 540 s timeout and prints a `RESULT` line. The same
-script installs the trap in step 5, so run it after step 1 has produced the data.
+script installs the trap in step 5. It needs no data, so it can run before or after step 1.
 
 **Step 3. csub policy.** After step 2 has created the directories, write it with
 `"$SANDBOX"/csub-policy.sh --podman --rw $R --ro $R/eval --ro $R/data --ro $R/venv` (add `--replace` if you
