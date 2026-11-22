@@ -1,7 +1,7 @@
 # Changes that affect how you use the wrappers
 
-Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
-the evidence behind each (superseded passages are in `ADMIN-NOTES-history.md`).
+Newest first. Behaviour changes only; see `git log` for everything else, including the test results
+behind each change.
 
 ## 2026-11-21
 

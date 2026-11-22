@@ -10,7 +10,7 @@
 #
 # User-agnostic: uses $USER/$HOME/$(whoami) throughout, no hardcoded account names.
 # --keep-id tests require a /etc/subuid//etc/subgid range wider than the invoking account's
-# real GID -- see ADMIN-NOTES-history.md's "--userns=keep-id, revisited" section if those fail. The
+# real GID -- if those fail, the account's subuid/subgid range is too small (SETUP.md §3). The
 # --csub section runs only when csub-broker is on PATH and CSUB_TEST_ROOT is set. Whatever is
 # skipped is counted in the summary line.
 set -uo pipefail
@@ -219,7 +219,7 @@ s_11() {
   echo "--- 11b. no --keep-id, WITH --rw <dir under \$HOME>: in-container identity stays root, but bind-mount"
   echo "    writes ALREADY land with real ownership -- rootless podman's default mapping already"
   echo "    writes bind-mounted files as your real host identity; --keep-id changes in-container"
-  echo "    identity (whoami/\$HOME), not this. See ADMIN-NOTES.md's keep-id section."
+  echo "    identity (whoami/\$HOME), not this. See SETUP.md §3 on the subuid/subgid range."
   WORKDIR="$HOME/test-podman-nohome-$$"; EXTRA_CLEANUP+=("$WORKDIR")
   mkdir -p "$WORKDIR" 2>/dev/null
   "$PODMAN_RUN" --gpu --rw "$WORKDIR" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1

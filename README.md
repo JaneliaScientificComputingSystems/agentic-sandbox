@@ -14,10 +14,9 @@ that agent-generated code never runs with a user's full permissions. Everything 
 live on the cluster as an ordinary user account.
 
 **Which document:** [`SETUP.md`](SETUP.md) first (one-time, per account) · this README to use the
-wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`ADMIN-NOTES.md`](ADMIN-NOTES.md)
-for the evidence and reasoning behind each decision
-([`ADMIN-NOTES-history.md`](ADMIN-NOTES-history.md) for the superseded passages) · [`config/`](config/)
-for the files setup copies.
+wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`config/`](config/) for the files
+setup copies. The reasoning behind each decision is in the comments of the scripts, next to the code
+it explains.
 
 **Which setup:**
 
@@ -239,7 +238,9 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   bound read-only on `PYTHONPATH`, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
   `CSUB_MOUNTS` comes from `$PWD` (under `sandbox-run.sh`, always) and the `--rw`/`--ro` paths not under
   `$HOME` or `/scratch` (nested ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
-  does not.
+  does not. With a `--ro` directory inside a `--rw` one, the outer directory is passed to csub as
+  read-only (csub cannot express the nesting), so `csub submit` from inside it is refused: submit
+  from a read-write directory that has no read-only part.
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"`
@@ -399,7 +400,7 @@ what the node has installed, which varies, or on a venv you build (see "Dependen
   LD_LIBRARY_PATH` for anything that loads `libcudart` or `libcublas` dynamically. Prefer a 13.x
   toolkit: on the L4 nodes checked, cuda/12.4 and 12.9 (`cuda/12-latest`) lack `cuda_runtime.h`.
 - For PyTorch, bind a venv or conda env with `--ro`.
-- How the GPUs are found and why `/sys` is needed: `ADMIN-NOTES.md`, "bwrap `--gpu`".
+- How the GPUs are found and why `/sys` is needed: the comments at `--gpu` in `scripts/sandbox-run.sh`.
 
 **Under podman:**
 
@@ -546,6 +547,9 @@ Five suites in `tests/`:
 - **`... the command created files that tools run or load outside the sandbox`** (at exit): the
   command made a `.mcp.json`, `.vscode`, git hooks or similar where there was none. Look at them
   before you use git, an editor or an agent in that directory.
+- **`crun: cannot stat ...libnvidia-nscq.so.<version>`** with `podman-run.sh --gpu`: the node's CDI
+  spec (`/etc/cdi/nvidia.yaml`) predates a driver upgrade. An administrator regenerates it with
+  `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
 - **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a
@@ -578,8 +582,7 @@ Five suites in `tests/`:
   policy or the `--allow` list, outside the sandbox.
 
 ## Known limitations
-- bwrap has no image (so no packaged CUDA toolkit); podman can't mask credentials. The proxy is
-  HTTP-style only (no SOCKS5), but allows any port on a listed host.
+- bwrap has no image (so no packaged CUDA toolkit). The proxy is HTTP-style only (no SOCKS5).
 - One opencode sandbox per account at a time; `--keep-id` needs a widened subuid/subgid range.
 - Per-job state needs a writable `/scratch/$USER`; `sandbox-run.sh` falls back to `$TMPDIR` only off
   the cluster and says so, `podman-run.sh` requires it.

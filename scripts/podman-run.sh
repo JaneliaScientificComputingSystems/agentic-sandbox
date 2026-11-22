@@ -221,8 +221,9 @@ fi
 # exists as a mount point, exactly as it did when the real dir was bound. So opencode's config
 # AND data dirs use the HOME-dependent destination: default (no --keep-id) the container runs
 # as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
-# -e HOME below), same convention as bwrap. See ADMIN-NOTES-history.md's "Identity and $HOME under
-# podman" for why forcing identity without remapping failed.
+# -e HOME below), same convention as bwrap. Forcing an identity with -e/--user
+# alone, without the user-namespace remapping of --keep-id, was tried and failed: the files under
+# the mounts then belong to an id the process does not have.
 # Per-job state directory: ONE place for everything this wrapper creates for a run --
 # podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/
 # (allowlist proxy socket + log). Mode 700, removed whole by cleanup(), nothing in /tmp.

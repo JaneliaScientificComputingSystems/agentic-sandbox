@@ -91,7 +91,9 @@
 # copies above), proxy/ (the allowlist proxy's Unix socket + log), and the empty file used to
 # mask credential files. Nothing is ever written to /tmp. /scratch/$USER is node-local, which
 # is where a Unix socket belongs, and is swept by an hourly cleanup cron, which turns a crashed
-# job's leftovers into a non-problem. Two consequences:
+# job's leftovers into a non-problem. /scratch itself is owned by root and not world-writable
+# on the nodes, so no other user can create /scratch/$USER before you do; this layout relies on
+# that. Two consequences:
 #   - --scratch binds /scratch/$USER/work, not /scratch/$USER: binding the whole tree would
 #     expose every concurrent job's state dir (same uid, so permissions don't help) -- a
 #     sibling's proxy socket, which has a DIFFERENT allowlist, and its config copies. As
@@ -370,6 +372,9 @@ BWRAP_ARGS=(
   # in order, so a tmpfs mounted after the $PWD bind would cover a $PWD that lives under /tmp,
   # and the agent would start in an empty directory.
   --tmpfs /tmp
+  # --unshare-pid is also what cleans up: when bwrap's process 1 exits, the kernel kills
+  # everything left in the namespace. Without it the in-sandbox relay (relay.py) outlived the
+  # command and stayed on the node after the job.
   --proc /proc --dev /dev --unshare-net --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
@@ -704,6 +709,9 @@ summarize_proxy_denials() {
   true
 }
 CSUB_PID=""
+# The proxy and the broker run outside the sandbox and must be stopped here. A job that ends
+# normally does not have its stragglers swept by LSF the way a `bkill`ed one does, so anything
+# left running would stay on the node.
 cleanup() {
   # $? on entry is the script's exit status (the `exit $?` after bwrap, or 130/141/143 from the
   # signal traps). The denied-host summary is a troubleshooting hint, so it is printed only
