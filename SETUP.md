@@ -168,7 +168,7 @@ sets what has to differ:
   root, so everything under it is in reach. Never `$HOME` (csub refuses it) and never `/scratch` (the
   policy rejects it); the script refuses both.
 - `--ro DIR` (repeatable): directories jobs may mount read-only at most, such as a dataset, a scorer
-  or a venv. The broker forces any mount under them read-only even if the client asks for `:rw`.
+  or a venv, outside your home directory. The broker forces any mount under them read-only even if the client asks for `:rw`.
 - `--allow HOST` (repeatable): network hosts jobs may reach. None unless given.
 - `--gpus N`, `--slots N`, `--walltime MIN`, `--cost USD`, `--pending N`: the limits for one job
   and the number of pending jobs per session. Without these options the limits stay as in csub's
@@ -300,11 +300,14 @@ command rm ~/agent_cluster.pub
    For podman, add `--podman` before `--queue` and write the policy with `--podman`.
 
    With more than one project, each key line can have its own csub policy, for different limits
-   per project. This is optional: without it every key uses the one policy from step 1. Write the
-   second policy to its own file with `--out`, outside the project, and name it in the key line
-   before the ` -- `:
+   per project. This is optional: without it every key uses the one policy from step 1. A second
+   project needs its own key and alias (steps 2 and 3 again, under other names) and its own key
+   line. Write its policy to a file of its own with `--out`, outside the project, and name that
+   file in `OPTS` before the ` -- `. Then run the rest of the block above with the new `PUBKEY`.
 
 ```bash
+PROJECT2=/groups/YOUR_LAB/YOUR_DIR/project2
+mkdir -p "$PROJECT2"
 "$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT2 --out ~/.config/csub/project2.toml
 OPTS="--project $PROJECT2 --queue interactive --walltime 60 --csub-policy $HOME/.config/csub/project2.toml -- --csub"
 ```
@@ -367,5 +370,9 @@ echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/
 
 To watch: log in as yourself. `bjobs -a` lists the agent's jobs, the ssh sessions among them named
 `agent-ssh`, and `PROJECT/.csub/jobs` has one directory per submitted job. To stop it: `bkill -J
-agent-ssh 0` and `bkill -g /csub/$USER 0`. To cut it off: delete its line from
+agent-ssh 0` for the ssh sessions, and for the jobs it submitted the line below. To cut it off: delete its line from
 `~/.ssh/authorized_keys`.
+
+```bash
+bjobs -noheader -o 'jobid job_group' | awk -v g="/csub/$USER/" 'index($2,g)==1 {print $1}' | xargs -r bkill
+```

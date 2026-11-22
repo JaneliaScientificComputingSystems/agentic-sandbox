@@ -136,7 +136,7 @@
 # cfg/ directory inside its per-job state dir (below) seeded with COPIES, deleted on exit;
 # edits made inside die with the job. The one file that is shared is the credentials file, so
 # an existing login is reused and token refreshes persist. Not carried in: ~/.claude/plugins,
-# skills, projects/ history -- pass --ro/--rw explicitly if a task needs them.
+# skills, projects/ history (--claude-history brings this directory's history).
 #
 # Per-job state: everything this wrapper creates for one run lives in ONE directory,
 # /scratch/$USER/.agentic-sandbox/<LSB_JOBID>[-<LSB_JOBINDEX>]-<pid>/ (mode 700): cfg/ (the
