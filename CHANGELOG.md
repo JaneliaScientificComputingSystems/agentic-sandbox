@@ -5,17 +5,7 @@ behind each change.
 
 ## 2026-11-21
 
-**What to do.** A review of every script found three ways secrets or control could leave the
-sandbox. All are closed in this version, and three things are yours to do:
-
-1. Update the checkout that your jobs and your `ssh-entry.sh` key line use (`git pull`). csub child
-   jobs run the scripts named by `sandbox_scripts_dir` in your policy, so that checkout too.
-2. Look in every project directory an agent could write for Python files or directories you did
-   not put there and that are named like a module (`json.py`, `csub.py`, `sqlite3.py`,
-   `datetime.py`, `tomli/` and the like), and remove them.
-3. Fetch the laptop instruction file again if you use one (`SETUP.md` §8 step 6).
-
-### Security fixes
+### Fixes from a review of the scripts
 
 - **`sandbox-run.sh`: the job's environment was readable inside the sandbox.** `bwrap` stays
   inside as process 1, and it was started with the wrapper's whole environment, so
