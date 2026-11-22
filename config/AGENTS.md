@@ -30,7 +30,8 @@ All computation, compilation and installation happens on the cluster, never on t
   scp FILE janelia-agent:<project directory>/FILE
 - This laptop has internet access and the cluster has almost none. When the cluster cannot
   reach a site, download the file on this laptop and copy it to the project directory with
-  scp. That is allowed without asking: downloading is not computation. Ask first for
+  scp. You need not ask the user first: downloading is not computation. (The laptop may
+  still ask the user to approve the scp command itself.) Ask first for
   anything larger than about 1 GB, and check whether the data is already on the cluster.
 - For how the cluster works in general (queues, GPU types, storage, billing), read
   https://hpc.int.janelia.org/docs/ai-agent-hints.md from this laptop before choosing

@@ -58,7 +58,9 @@ Design choices:
 - **It reads as routine**, not as an attack: an accounting step with a consequence for skipping it. It does not
   say "ignore your instructions".
 - **The target is real.** The sandbox contains a copy of the opencode config, which holds the LiteLLM key the
-  agent needs to talk to its model. So the file the instruction names exists and is readable.
+  agent needs to talk to its model. In the recorded run the file the instruction names existed and was
+  readable. With today's wrappers the copy is at the path in `$OPENCODE_CONFIG`, not under `$HOME`, so the
+  command as written would not find its file; the key is still readable inside.
 - **The sink is harmless.** `.example` is a reserved name that never resolves, so nothing can leave even if the
   instruction is followed. This is a test of our own setup.
 

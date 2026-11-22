@@ -12,31 +12,36 @@
 # started in the project directory, and relays stdin, stdout, stderr and the exit status. The
 # only things that run on the login node are this script and bsub.
 #
-#   ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--walltime MIN] [-- wrapper options]
+#   ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN] [-- wrapper options]
 #
 # The sandbox is bwrap (sandbox-run.sh) unless --podman is given, which runs the command in a
 # container image through podman-run.sh instead, with the project directory bound read-write
 # at the same path. Use --podman only when the work needs an image; it needs the one-time
 # podman setup in SETUP.md and a /etc/subuid range for the account.
 #
-# Options after `--` go to the wrapper unchanged (--csub, --allow HOST, --ro DIR, --gpu, and
-# for podman --image NAME, ...). For GPU work pick a GPU queue with --queue.
+# Options after `--` go to the wrapper unchanged (--csub, --allow HOST, --ro DIR, and for podman
+# --image NAME, ...).
+# --gpus N asks for N GPUs for every command (bsub -gpu "num=N") and gives the wrapper --gpu; it
+# needs a GPU queue with --queue and enough --slots for that queue. Every command then holds
+# those GPUs while it runs, so for most work leave it out and let the agent submit GPU jobs
+# with csub.
 # With no command (a plain `ssh janelia-agent`), the job is an interactive shell in the sandbox.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { echo "ssh-entry.sh: $*" >&2; exit 1; }
 
-PROJECT="" QUEUE="" SLOTS=1 WALLTIME=240 INNER=0 PODMAN=0
+PROJECT="" QUEUE="" SLOTS=1 WALLTIME=240 INNER=0 PODMAN=0 GPUS=0
 SANDBOX_OPTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project|--queue|--slots|--walltime)
+    --project|--queue|--slots|--walltime|--gpus)
       [[ $# -ge 2 ]] || die "$1 needs an argument"
       case "$1" in
         --project) PROJECT="$2" ;;
         --queue) QUEUE="$2" ;;
         --slots) SLOTS="$2" ;;
+        --gpus) GPUS="$2" ;;
         --walltime) WALLTIME="$2" ;;
       esac
       shift 2 ;;
@@ -48,7 +53,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$PROJECT" ]] || die "--project DIR is required"
-[[ "$SLOTS" =~ ^[0-9]+$ && "$WALLTIME" =~ ^[0-9]+$ ]] || die "--slots and --walltime take whole numbers"
+[[ "$SLOTS" =~ ^[0-9]+$ && "$WALLTIME" =~ ^[0-9]+$ && "$GPUS" =~ ^[0-9]+$ ]] || die "--slots, --gpus and --walltime take whole numbers"
+if [[ $GPUS -gt 0 && " ${SANDBOX_OPTS[*]:-} " != *" --gpu "* ]]; then SANDBOX_OPTS+=(--gpu); fi
 [[ -z "$QUEUE" || "$QUEUE" =~ ^[A-Za-z0-9_]+$ ]] || die "--queue $QUEUE: not a queue name"
 
 if [[ $INNER -eq 1 ]]; then
@@ -97,6 +103,7 @@ export AGENT_SSH_COMMAND="${SSH_ORIGINAL_COMMAND:-}"
 export BSUB_QUIET=1   # no "Job <n> is submitted" / "<<Waiting for dispatch>>" lines in the agent's output
 BSUB=(bsub -n "$SLOTS" -W "$WALLTIME" -J agent-ssh)
 [[ -n "$QUEUE" ]] && BSUB+=(-q "$QUEUE")
+[[ $GPUS -gt 0 ]] && BSUB+=(-gpu "num=$GPUS")
 # A pty only for an interactive login with a terminal; commands get plain pipes.
 if [[ -z "$AGENT_SSH_COMMAND" && -t 0 ]]; then
   BSUB+=(-Is)

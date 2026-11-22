@@ -377,8 +377,12 @@ flowchart TB
   outside `$HOME`; `ssh-entry.sh` refuses your home directory and anything inside or above it. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
   command runs in. `--podman` runs the command through `podman-run.sh` in a container image, with
   the project bound read-write at the same path; it needs `SETUP.md` §3.
-- **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, `--gpu`,
-  and for podman `--image NAME`. They are the sandbox every command gets.
+- **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, and for
+  podman `--image NAME`. They are the sandbox every command gets.
+- **`--gpus N`** (before the ` -- `) gives every command N GPUs: it asks LSF for them and passes
+  `--gpu` to the wrapper. It needs a GPU queue in `--queue` and the `--slots` that queue expects.
+  Each command then holds those GPUs while it runs, so for most work leave it out and let the
+  agent submit GPU jobs with `csub`.
 - **A host or directory has to be allowed twice** when jobs go through `--csub`: here in the key line,
   and in the csub policy (`csub-policy.sh --allow HOST --ro DIR`). A job the agent submits must pass
   the policy and stay inside the sandbox it was submitted from; with only one of the two, csub
@@ -561,7 +565,7 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --image NAME    (podman-run.sh) any OCI image; default agentic-sandbox-lite
   -h, --help      Show help
 
-ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--walltime MIN] [-- wrapper options]
+ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN] [-- wrapper options]
                   # forced command for an agent's ssh key: each ssh command becomes a sandboxed LSF job
 
 csub-policy.sh --bwrap|--podman --rw DIR [--ro DIR] [--allow HOST] [--gpus N] [--slots N]
@@ -649,6 +653,9 @@ that come from somewhere else.
   runs traps between foreground commands). `bkill` and LSF walltime kills signal the whole process
   group, so bwrap or podman gets it too and cleanup runs promptly; a bare `kill <wrapper-pid>` does
   not. Kill the process group (`kill -- -<pgid>`) when doing it by hand.
+- Under `sandbox-run.sh`, Ctrl-C at the prompt of a line-mode program (`python3`, `R`) ends the
+  sandbox, because `bwrap` receives it too. Full-screen agents such as Claude Code and opencode are
+  not affected.
 - `sandbox-run.sh` refuses to run from `$HOME` or a directory above it (the working directory is
   bound read-write). Run it from a project directory.
 - Not tested: a fresh `claude auth login` combined with the one-shot or loop modes.
