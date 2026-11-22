@@ -9,11 +9,12 @@
 #
 # It starts one sandbox per node with blaunch, as a multi-node launcher does, and checks that the
 # two reach each other and nothing else. --ib is not covered: it needs InfiniBand nodes and a
-# program that uses them (see ADMIN-NOTES.md, "Multi-node jobs").
+# program that uses them.
 #
 # The same checks run against podman-run.sh with SANDBOX_WRAPPER=podman-run.sh in the environment
 # of the bsub command (allow -W 30: every container start checks the image).
 set -uo pipefail
+export SANDBOX_RECORD=off   # no per-job record in ~/.agentic-sandbox/records for a test run
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 WRAPPER="${SANDBOX_WRAPPER:-sandbox-run.sh}"
@@ -46,7 +47,7 @@ refuses() {  # refuses "what" "expected text" wrapper-args...
   out="$("$W" "$@" 2>&1)"; rc=$?
   if [[ $rc -ne 0 && "$out" == *"$text"* ]]; then ok "refuses $what"; else bad "refuses $what (exit $rc: ${out:0:120})"; fi
 }
-left() { ls "$STATE" 2>/dev/null | grep -c "^$LSB_JOBID-" || true; }
+left() { compgen -G "$STATE/$LSB_JOBID-*" | wc -l; }
 
 ADDRS=()
 for h in "${HOSTS[@]}"; do ADDRS+=("$(getent ahostsv4 "$h" | awk 'NR==1{print $1}')"); done

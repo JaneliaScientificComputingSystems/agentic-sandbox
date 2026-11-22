@@ -8,6 +8,15 @@ on:
 permissions:
   contents: read
 jobs:
+  # Static checks of every shell script, at shellcheck's warning level. It does not catch a
+  # failing command inside a trap under `set -e`, which is what most wrapper bugs have been, but
+  # it does catch unchecked `cd`, masked return values and unquoted lists in new code.
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --version
+      - run: git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
   test-proxy:
     runs-on: ubuntu-24.04   # ubuntu-latest moved to 26.04, which has no Python 3.9; the cluster runs 3.9
     strategy:

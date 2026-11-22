@@ -1,8 +1,9 @@
 # One-time setup
 
-Everything here is per account and done once. None of it runs on a login node: start an
-interactive job first (`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only) and do
-the setup there. The README assumes
+Everything here is per account and done once. Do it inside an interactive job
+(`bsub -q interactive -Is /bin/bash`; the `short` queue takes batch jobs only), not on a login node.
+The exceptions are all in §8, where a login node only passes things on: the key is copied to it,
+one line is added to `~/.ssh/authorized_keys`, and the agent's ssh commands arrive there. The README assumes
 all of this is in place.
 
 ## 1. Get the wrappers
@@ -11,7 +12,7 @@ all of this is in place.
 cd
 git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git
 SANDBOX="$HOME/agentic-sandbox/scripts"       # the README's examples use this variable
-# a new job shell starts without it: put the line above in your shell startup file
+echo 'export SANDBOX="$HOME/agentic-sandbox/scripts"' >> ~/.bashrc    # so that new job shells have it too
 ```
 
 The rest of this document assumes the checkout is `~/agentic-sandbox`. Anywhere else works; set
@@ -60,7 +61,7 @@ What this buys and costs: podman's per-user storage would otherwise land in
 `~/.local/share/containers` and fill your home with multi-GB images. On scratch it is node-local
 and wiped by the hourly cleanup whenever you have no job on that node, so a job on a new node, or
 one starting more than an hour after your previous job there, pulls the image again (the lite
-image is 1.24 GB; the PyTorch one several GB). If you'd rather trade that for a durable cache,
+image is about 2 GB; the PyTorch one 26 GB). If you'd rather trade that for a durable cache,
 point `graphroot`/`runroot` at a path under `$HOME`.
 
 No `podman login` or `podman pull` is needed: the images are public and `podman-run.sh` checks
@@ -221,7 +222,7 @@ Both are pre-built on GHCR and pulled automatically. Build your own only if you 
 they lack:
 
 ```bash
-cd agentic-sandbox/podman
+cd ~/agentic-sandbox/podman
 podman build -t agentic-sandbox-lite:latest .                                   # CUDA runtime + CLIs
 podman build -t agentic-sandbox-gpu:latest -f Dockerfile.pytorch .              # NVIDIA PyTorch + CLIs
 # then: podman-run.sh --image localhost/agentic-sandbox-lite:latest ...
@@ -232,9 +233,11 @@ Note that csub policies cannot use `localhost/` images (they are not visible on 
 ## 8. An agent on your laptop (`ssh-entry.sh`)
 
 Skip this unless the agent runs on your laptop and should do its work on the cluster. The README's
-section "An agent on your laptop" says what this gives you. You need §1, and §6 if the agent should
-submit jobs, which is the normal case. `LAPTOP` steps run in a terminal on the laptop, `CLUSTER` steps
-on the cluster as yourself.
+section "An agent on your laptop" says what this gives you. You need §1 and §6: the key line in step 4 uses
+`--csub`, and the instruction file in step 6 tells the agent to submit its jobs through csub. To run the
+commands in a container image you also need §3: write the policy in step 1 with `--podman` in place
+of `--bwrap`, and add `--podman` to `OPTS` in step 4. `LAPTOP` steps run in a terminal on the laptop,
+`CLUSTER` steps on the cluster as yourself.
 
 1. `CLUSTER`, inside an interactive job: make the project directory, outside your home directory, and
    write the csub policy for it.
@@ -242,8 +245,11 @@ on the cluster as yourself.
 ```bash
 PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
 mkdir -p "$PROJECT"
-"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT
+"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT --replace   # plus every option you gave in §6
 ```
+
+   This replaces the policy from §6. The script writes the whole file each time, so repeat the
+   options you used there (`--rw`, `--ro`, `--allow`, limits) on this command line.
 
 2. `LAPTOP`: make a key for the agent only. It has no passphrase, because the agent must use it
    unattended; the key line in step 4 is what limits it.
@@ -253,8 +259,8 @@ ssh-keygen -t ed25519 -N '' -C agent-cluster -f ~/.ssh/agent_cluster
 ```
 
 3. `LAPTOP`: add an alias to `~/.ssh/config`, with your cluster user name, and copy the public half of
-   the key over with your own login. The last three lines keep the agent from ever using your
-   personal key.
+   the key over with your own login. Of the last three lines, the first two keep the agent
+   from ever using your personal key, and `BatchMode` makes ssh fail where it would otherwise prompt.
 
 ```
 Host janelia-agent
@@ -270,8 +276,9 @@ Host janelia-agent
 scp ~/.ssh/agent_cluster.pub YOUR_USER@login1.int.janelia.org:agent_cluster.pub
 ```
 
-4. `CLUSTER`, on the login node (this only edits a file): add the key line. `EXPIRES` is the last day
-   the key works, as year, month, day. Your existing keys stay untouched.
+4. `CLUSTER`, on the login node (this only edits a file): add the key line. `EXPIRES` is the first day
+   the key no longer works, as year, month, day: sshd refuses the key from midnight at the start of
+   that day, cluster time. Your existing keys stay untouched.
 
 ```bash
 PROJECT=/groups/YOUR_LAB/YOUR_DIR/project
@@ -286,14 +293,16 @@ chmod 600 ~/.ssh/authorized_keys
 command rm ~/agent_cluster.pub
 ```
 
-   To let the agent reach a host or read another directory, add `--allow HOST` or `--ro DIR` after
-   `--csub` in `OPTS`, and give the same options to `csub-policy.sh` with `--replace`. Both places are
-   needed. For podman, add `--podman` before `--queue` and write the policy with `--podman`.
+   To let the agent reach a host or read another directory, put `--allow HOST` or `--ro DIR` after
+   `--csub` (for `pip install`, `--allow pypi.org --allow files.pythonhosted.org`), and give the same options to `csub-policy.sh` with `--replace`. Both places are needed.
+   Before the first run, set them in `OPTS`. Later, edit the existing line in
+   `~/.ssh/authorized_keys`: running the block again would append a second line for the same key.
+   For podman, add `--podman` before `--queue` and write the policy with `--podman`.
 
 5. `LAPTOP`: test by hand. Each command is a cluster job, so each takes up to a minute to start.
 
 ```bash
-ssh janelia-agent 'hostname; pwd'              # a compute node, then your project directory
+ssh janelia-agent 'hostname; pwd'              # a compute node (with --podman, a container id), then your project directory
 ssh janelia-agent 'ls ~/.ssh'                  # No such file or directory
 ssh janelia-agent 'bsub -V'                    # command not found
 ssh janelia-agent 'head -22 $SANDBOX_README'   # what the sandbox tells the agent
@@ -311,7 +320,10 @@ curl -fsSL $RAW/CLAUDE.md -o CLAUDE.md
 echo '{"permissions": {"allow": ["Bash(ssh janelia-agent:*)", "Bash(curl -s https://hpc.int.janelia.org/docs/ai-agent-hints.md:*)"]}}' > .claude/settings.json
 ```
 
-   For Codex (use `AGENTS-podman.md` in place of `AGENTS.md` with `--podman`):
+   With `--podman`, fetch `AGENTS-podman.md` in place of `CLAUDE.md` and keep the saved name:
+   `curl -fsSL $RAW/AGENTS-podman.md -o CLAUDE.md`. Its text suits both agents.
+
+   For Codex (with `--podman`, fetch `AGENTS-podman.md` and still save it as `AGENTS.md`):
 
 ```bash
 RAW=https://raw.githubusercontent.com/JaneliaScientificComputingSystems/agentic-sandbox/main/config
@@ -325,6 +337,13 @@ echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/
    (`https://hpc.int.janelia.org/docs/ai-agent-hints.md`, reachable from the Janelia network or VPN);
    the second permission in the Claude Code settings lets it fetch that page without asking. Then
    start the agent in that directory, with `claude` or `codex`.
+
+   Claude Code: the first start in that directory must be the interactive one (`claude`, not
+   `claude -p "..."`), and you must accept its question whether you trust the folder. Until you
+   have, Claude Code ignores the two permissions above and says so ("Ignoring 2
+   permissions.allow entries from .claude/settings.json: this workspace has not been trusted"),
+   and a `claude -p` run cannot use `ssh janelia-agent`. Once is enough; after that `claude -p`
+   works there too.
 
    The instruction file applies only when the agent is started in that directory. There, the agent
    still runs the code it writes, but on the cluster: each test or script goes through `ssh

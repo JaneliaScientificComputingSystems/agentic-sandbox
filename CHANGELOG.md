@@ -1,17 +1,129 @@
 # Changes that affect how you use the wrappers
 
-Newest first. Behaviour changes only; see `git log` for everything else and `ADMIN-NOTES.md` for
-the evidence behind each.
+Newest first. Behaviour changes only; see `git log` for everything else, including the test results
+behind each change.
+
+## 2026-11-21
+
+### Fixes from a review of the scripts
+
+- **`sandbox-run.sh`: the job's environment was readable inside the sandbox.** `bwrap` stays
+  inside as process 1, and it was started with the wrapper's whole environment, so
+  `/proc/1/environ` showed every variable of the job, including any API key or token exported
+  there. The command's own environment was clean, as documented. `bwrap` now starts with the job id
+  and array index only. `podman-run.sh` was not affected.
+- **`sandbox-run.sh`: a value passed with `--env` was on a command line.** Each `--env` variable
+  went to `bwrap` as an argument, and command lines are readable by every user on a node
+  (`ps -ef`). The values now reach `bwrap` on a file descriptor and are on no command line.
+- **Both wrappers: a Python file in the working directory could run outside the sandbox.** With
+  `--csub`, and in `podman-run.sh` on every start, the wrapper ran Python on the host from the
+  working directory, and Python looks there for modules first. With an empty or relative entry in
+  your `PYTHONPATH`, the proxy started by `--allow` did the same. A file the agent left
+  in its project ran as you, unsandboxed, the next time a sandbox started there; through
+  `ssh-entry.sh` that is the agent's next command. Host-side Python now runs isolated from the
+  working directory, and empty or relative `PYTHONPATH` entries are dropped. A broker set with
+  `CSUB_BROKER_CMD` is started from `/` unless it is the `csub-broker` command itself, so a
+  relative `--policy` path works only with that form.
+- **`ssh-entry.sh` refuses a project directory inside `$HOME`** (and `$HOME` itself, or a directory
+  above it), on the login node, before it submits anything. The script used to check only that the
+  directory existed, so a key line could hand the agent `~/.ssh` read-write.
+- **Proxy: an allowed name is checked for where it points.** `--allow NAME` used to connect to
+  whatever the name resolved to. The proxy now resolves it once, refuses loopback, link-local
+  (169.254), multicast, unspecified and reserved addresses, and connects to the address it checked.
+  A name with a dot is looked up as written, so the node's search domains are not appended to it.
+  Private addresses still work, because the cluster's own services live there. A host you allowed
+  can therefore appear in the denied list at exit: its name resolves to an address of that kind.
+- **`csub-policy.sh` checks the physical path.** `--rw "$HOME/"`, `--rw /`, a path through `..` and
+  a symlink into the home directory used to pass the home-directory check, which compared text.
+  The policy now holds the physical path.
+- **`--csub` in both wrappers:** a mount path that contains a comma or a colon is refused, and so is
+  a preset `CSUB_MOUNTS` entry with `..` in it. Either could put a directory the sandbox does not
+  have into the list handed to csub.
+
+- **Files that run later are read-only, in both wrappers.** `.git/hooks`, `.git/config`,
+  `.mcp.json`, `.claude/` settings and commands, `.vscode`, `.pre-commit-config.yaml` and similar
+  files are now bound read-only where they exist at the top of a read-write directory, and `.git`
+  cannot be moved aside. An agent could otherwise plant a git hook or an MCP server that ran as
+  you the next time you used the project outside the sandbox. **This changes behaviour:**
+  `git config` inside a repository fails (commits and branches work, and your git identity is
+  passed in), and `--no-protect` turns the protection off. If the command creates
+  such a file where there was none, the wrapper names it at exit. A path named with `--ro` or `--rw`
+  keeps the mode given to it, and a name that is a symlink is left alone and named in a note.
+
+- **A checkout inside a read-write directory cannot be swapped.** The wrappers already re-bound
+  their own `scripts/` directory read-only when it lay inside a read-write mount. The directories
+  above it could still be renamed, and a new checkout put in their place. They are now pinned,
+  under both wrappers, and `podman-run.sh` applies the same to `--scratch`.
+- **`podman-run.sh` refuses credential directories.** `--ro` or `--rw` on `~/.ssh`, `~/.aws`,
+  `~/.claude`, the Hugging Face cache and the other credential locations, on a directory inside
+  one, or on one that contains one (`~/.config`, `~/.cache`), is refused, as `sandbox-run.sh` refuses or masks them. So is the
+  shared image store.
+- **Paths are checked again right before they are mounted,** in both wrappers, so a directory
+  replaced by a link while the sandbox is being set up is not mounted.
+
+### Other changes
+
+- **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on
+  stdout, so anything the wrapper or the command wrote to stderr (with `--podman`, "Trying to pull
+  ..." and an image id on every command) appeared in the command's output. Commands without a
+  terminal now get the two streams separately.
+- **`scp` and `sftp` work through `ssh-entry.sh --podman`.** This needs both the new images and
+  this version of `ssh-entry.sh`; with an old checkout the copy still fails with "Received message
+  too long". Both images now carry `sftp-server`. The default image also gained `pip` and `venv`.
+  The GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout holds only its own
+  output. `podman/Dockerfile` and `Dockerfile.pytorch` now match the published images (they lacked
+  Codex, Ray and the CUDA 13.5 base, added to the images on 2026-11-19). Nodes pull the new layers
+  on the next run. Tested through the forced command, not yet through a real sshd.
+- **Cleanup holds under races, in both wrappers.** A process that vanished between being found and
+  being killed, a directory that was still busy or that the agent left without permissions, or a
+  second signal from `bkill` could end the cleanup early: the state directory stayed behind (with
+  the copy of `~/.claude.json`) and the job returned 1. `podman-run.sh` now removes the
+  configuration copies first. In an array job each element's watchdog also matched its siblings'
+  pause processes; it now matches the array index too.
+- **`podman-run.sh`:** the host's `http_proxy`, `https_proxy` and `no_proxy` are no longer copied
+  into the container (podman does that by default); `--opencode` copies the target of a symlinked
+  `~/.config/opencode` (in `sandbox-run.sh` too); an `--image` value that starts with `-` is
+  refused.
+- **Proxy: the log is bounded.** Log lines are cut and the log stops at 20000 lines of each kind,
+  so a sandboxed process cannot fill the node's scratch disk through it. A request with a bad or
+  missing `Host` header is logged as `BAD`, no longer as a denied host.
+- **Laptop instruction files** (`config/CLAUDE.md`, `config/AGENTS.md`, `config/AGENTS-podman.md`).
+  The agent submits without `--wait` and checks with `csub status` no more often than once a
+  minute, the rule of the HPC hints page; the rule holds even though the sandbox's own description
+  lists `--wait`. The submit rule shows how to ask for a GPU. `pip install` needs `pypi.org` and
+  `files.pythonhosted.org` among the allowed hosts, and the file says to ask for them. The host
+  rule now reads "for ssh and scp, use only janelia-agent". `AGENTS-podman.md` says which
+  description of the working directory to believe.
+- **`SETUP.md` §8:** step 1 carries `--replace`, so it no longer stops when §6 already wrote a
+  policy; `EXPIRES` in the key line is the first day the key no longer works, not the last day it
+  works (sshd reads a date without a time as midnight at the start of that day).
+- **`podman-run.sh`** runs `podman system migrate` only when the shared store does not answer. It
+  ran at every start, and it stops the containers of that store.
+- **`examples/unattended-tuning`:** the evaluator passes the agent's `train.py` the images to
+  predict without the labels.
+- **`--dry-run`**, in both wrappers: every check runs, nothing is started, and the `bwrap` or `podman`
+  command, the proxy, the broker and the command's environment are printed. Values passed with
+  `--env` are not shown.
+- **A record of each run** that used `--allow` or `--csub` is written to
+  `~/.agentic-sandbox/records/<date>/`, outside the sandbox: the command, its exit status, every
+  host the proxy allowed or refused with the time, and the csub jobs recorded meanwhile. The proxy's
+  log lines now carry the time. `SANDBOX_RECORD=off` turns the record off.
+- **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20
 
+- **`podman-run.sh` fix:** the wrapper could return 1 although the command inside had succeeded
+  (about one run in twenty in an array of 20). It now returns the command's own exit status.
+- **`podman-run.sh` fix:** with several podman jobs of one user on a node, a job could return 1
+  without running its command, or return 1 after its command had succeeded (2 of 60 starts, ten
+  at a time). A sibling job removed a pid file between this script's test for it and its read.
+- **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
+  own sandbox, for either wrapper. Arrays needed no other change.
 - **`--job-nodes` / `--peers`: the port block is 2000 ports, not 5000**, in both wrappers:
   13000-14999 on our nodes, and five such sandboxes fit on a node where two did. Ports the
-  system picks come from the top 1500 of the block (it was 1000). A program with fixed ports
-  must now take them from the lowest 500 of its block, which `$SANDBOX_README` names; anything
-  that hard-coded 10000-13999 must change (the Ray launcher in `gpu-cluster-recipes` did).
-- **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
-  own sandbox, for either wrapper.
+  system picks come from the top 1500 of the block (it was 1000). The lowest 500 of the block,
+  which `$SANDBOX_README` names, are left for a program's fixed ports; the earlier fixed range
+  10000-13999 no longer applies (the Ray launcher in `gpu-cluster-recipes` was changed to match).
 - **`podman-run.sh --host-net` fix:** the node's own `/etc/hosts` is used inside. With podman's
   file the node's name resolved to `host.containers.internal`, which `torchrun` passed to the
   other nodes as the master's address, and a two-node Ethernet job hung until it timed out.
@@ -27,9 +139,9 @@ the evidence behind each.
 - All three are for a job's workers, not for the agent: each refuses `--claude` and `--opencode`,
   and the two network flags refuse `--allow` and `--csub`. Nothing changes for existing uses.
 - **`podman-run.sh`** takes the same flags (`--job-nodes`, `--peers`, `--listen`,
-  `--host-net`, `--ib`) with the same meaning. `--job-nodes` is refused with `--keep-id`. With
-  `--ib` the image must contain `libibverbs` and the mlx5 provider. New file:
-  `scripts/jobnet-hook.sh`, which must stay next to `podman-run.sh`.
+  `--host-net`, `--ib`) with the same meaning. `--job-nodes` is refused with `--keep-id`. `--ib`
+  relies on `libibverbs` and the mlx5 provider in the image. New file:
+  `scripts/jobnet-hook.sh`, which `podman-run.sh` looks for in its own directory.
 - **`tests/test-multinode.sh`** tests them as a two-node LSF job, for either wrapper.
 - **`podman-run.sh` fix:** a command that ended within about a second could make the wrapper
   return 1 instead of the command's own exit status.
@@ -61,12 +173,12 @@ the evidence behind each.
   turns every `ssh cluster '<command>'` into an interactive LSF job that runs the command through
   `sandbox-run.sh` (or `podman-run.sh` with `--podman`) in one project directory. Only the script and
   `bsub` run on the login node. Documented on 2026-11-16: README, "An agent on your laptop".
-- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need the csub `bwrap-gpu` change; see README). The LSF-allocated GPUs (from
+- **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need PR #15 of the csub repo, merged 2026-11-15; see README). The LSF-allocated GPUs (from
   `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
   `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is set to their
   numbering inside (`0..n-1`, in the order given; a subset such as the job's second GPU alone is `0`
-  there). An error in a job with no GPU allocated. No CUDA toolkit comes with it: bind a venv/conda
-  env or use podman for an image. (#10, hokinus)
+  there). An error in a job with no GPU allocated. No CUDA toolkit comes with it; a bound venv or
+  conda env, or a podman image, supplies one. (#10, hokinus)
 - **`sandbox-run.sh --claude-history` and `--claude-history-rw`** (with `--claude`): the past Claude
   sessions of the directory you start from become visible, so `claude --resume` and `--continue`
   work. Read-only by default (new turns are not kept); `-rw` keeps them. Only that directory's
@@ -85,7 +197,7 @@ the evidence behind each.
   interactive agent, and the conversation itself -- was copied into the node's journal and the
   central syslog. Output still reaches your terminal and the job's output file as before;
   `podman logs` shows nothing for these containers (the wrapper never used it). There is no flag
-  to turn it back on. Update your copy of the wrapper to get this.
+  to turn it back on.
 - **`podman-run.sh --shm-size SIZE`**, and `/dev/shm` is **8g by default with `--gpu`** (it was
   podman's 64 MB, which PyTorch DataLoader workers fill at once: "unable to allocate shared
   memory(shm)"). Without `--gpu` and without the flag nothing changes. csub child jobs that run
@@ -125,8 +237,8 @@ the evidence behind each.
 ## 2026-11-02
 
 - **`sandbox-run.sh` refuses to run from `$HOME`** (or a directory above it): `$PWD` is bound
-  read-write and that would expose the whole home directory. Use `--rw "$HOME"` from a project
-  directory if you really mean it.
+  read-write and that would expose the whole home directory. `--rw "$HOME"` from a project
+  directory is still accepted.
 - **More credential paths masked** under a visible `$HOME`/`$PWD`/bound root: `.gnupg`, `.config/gh`,
   `.config/git/credentials`, `.pgpass`, `.vault-token`, `.cache/huggingface/token`, shell history
   files, and the other harness's credentials (`~/.claude/.credentials.json` without `--claude`,
@@ -179,13 +291,13 @@ the evidence behind each.
 
 - **`--scratch` now binds `/scratch/$USER/work`, not all of `/scratch/$USER`.** Everything a
   wrapper creates for a run lives in `/scratch/$USER/.agentic-sandbox/<job>/` and nothing is
-  written to `/tmp`; binding the whole tree would expose other jobs' state. Use
-  `--rw /scratch/$USER/<subdir>` for anything else; never bind `/scratch/$USER` itself.
+  written to `/tmp`; binding the whole tree would expose other jobs' state.
+  `--rw /scratch/$USER/<subdir>` covers anything else.
 - **`--claude` and `--opencode` no longer bind your real config read-write** (Maris Basha, #5).
   Each run gets a throwaway copy of `~/.claude.json`, `~/.claude/settings.json`,
   `~/.claude/CLAUDE.md` and `~/.config/opencode`; only `~/.claude/.credentials.json` is bound
   through, so logins and token refreshes persist but hooks/MCP edits made inside die with the
-  job. On a fresh account, log in once outside the sandbox first (or use an API key).
+  job. A first login done inside the sandbox on a fresh account is therefore not kept.
 - **`sandbox-run.sh` starts from an empty environment.** Only `PATH`, `HOME`, `USER`, `LOGNAME`,
   `SHELL`, `TERM`, `COLORTERM`, `LANG`/`LC_*`, `TZ` and the CA-bundle variables come through;
   anything else needs `--env NAME` (e.g. `--env ANTHROPIC_API_KEY`). `/tmp` inside is a private
@@ -198,8 +310,8 @@ the evidence behind each.
   jobs and repeated calls in one job no longer collide); per-job `XDG_RUNTIME_DIR`; the shared
   store is never reset, only skipped when unhealthy; `--keep-id` works on the pytorch image too
   (`agentic-sandbox-gpu:latest` rebuilt 2026-10-08).
-- Run `tests/test-bwrap.sh` and `tests/test-podman.sh` one at a time: both drive opencode against
-  the same sqlite database on NFS.
+- `tests/test-bwrap.sh` and `tests/test-podman.sh` cannot run at the same time: both drive opencode
+  against the same sqlite database on NFS.
 
 ## 2026-09-23
 
@@ -209,8 +321,8 @@ the evidence behind each.
 
 ## 2026-09-10
 
-- **`$HOME` is no longer bound by default** in `sandbox-run.sh` (it used to be, read-only). Add
-  `--ro`/`--rw` for the specific path a task needs; never for `$HOME` as a whole.
+- **`$HOME` is no longer bound by default** in `sandbox-run.sh` (it used to be, read-only).
+  `--ro`/`--rw` bind the specific paths a task needs.
 - `agentic-sandbox-lite` became the default podman image; the PyTorch image is the alternate
   (`agentic-sandbox-gpu`).
 - `--keep-id` works end to end on accounts with a widened subuid/subgid range.

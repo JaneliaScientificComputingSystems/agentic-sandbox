@@ -70,6 +70,13 @@
 #                          (OPENCODE_CONFIG/OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is
 #                          left alone, so git/gh config still resolve) plus RW binds on its data dirs
 #                          (~/.local/share/opencode, ~/.local/state/opencode, ~/.cache/opencode)
+#   --dry-run             Do every check, start nothing, and print the bwrap command, the
+#                          host-side helpers and the environment a real run would use.
+#   --no-protect          Leave the files that tools run later writable (.git/hooks,
+#                          .git/config, .mcp.json, .claude/, .vscode and the like). By default
+#                          they are read-only where they exist in a read-write directory, and
+#                          ones the command creates are reported at exit. See "Files that run
+#                          later" below.
 #   -h, --help             Show this help
 #
 # The toolchain (/usr /bin /lib64 /lib /sbin /etc) and $PWD (read-write, wherever
@@ -137,7 +144,9 @@
 # copies above), proxy/ (the allowlist proxy's Unix socket + log), and the empty file used to
 # mask credential files. Nothing is ever written to /tmp. /scratch/$USER is node-local, which
 # is where a Unix socket belongs, and is swept by an hourly cleanup cron, which turns a crashed
-# job's leftovers into a non-problem. Two consequences:
+# job's leftovers into a non-problem. /scratch itself is owned by root and not world-writable
+# on the nodes, so no other user can create /scratch/$USER before you do; this layout relies on
+# that. Two consequences:
 #   - --scratch binds /scratch/$USER/work, not /scratch/$USER: binding the whole tree would
 #     expose every concurrent job's state dir (same uid, so permissions don't help) -- a
 #     sibling's proxy socket, which has a DIFFERENT allowlist, and its config copies. As
@@ -170,6 +179,17 @@
 #     claude
 set -euo pipefail
 
+# Python that this script starts on the host (the csub broker, its lookup) must never import from
+# a directory the sandboxed process can write. An empty or relative PYTHONPATH entry means "the
+# working directory", so those are dropped here, once, for everything started below.
+if [[ -n "${PYTHONPATH+x}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do [[ "$_e" == /* ]] && _pp="${_pp:+$_pp:}$_e"; done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
 # Physical paths throughout: the script's own directory (so running it through a symlink still
 # finds allowlist_proxy.py and relay.py next to it, and the read-only re-bind below shadows the
 # real directory), and the working directory (bwrap binds and csub's envelope compare paths
@@ -183,6 +203,8 @@ RW_TRY_BINDS=()
 ALLOW_HOSTS=()
 PASS_ENV=()
 WANT_CSUB=0
+PROTECT=1
+DRY_RUN=0
 WANT_GPU=0
 WANT_IB=0
 WANT_JOBNET=0     # --job-nodes / --peers
@@ -216,6 +238,8 @@ while [[ $# -gt 0 ]]; do
       if [[ "$1" == --ro ]]; then RO_BINDS+=("$p"); else RW_BINDS+=("$p"); fi
       shift 2 ;;
     --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
+    --no-protect) PROTECT=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --env)
       need_arg "$@"
       # A NAME, looked up in this shell's environment -- not NAME=value.
@@ -253,7 +277,7 @@ while [[ $# -gt 0 ]]; do
     --opencode)
       WANT_OPENCODE=1
       # Same reasoning as --claude above: opencode's own installer puts the actual binary
-      # under ~/.opencode/bin/opencode, separate from its four XDG state dirs above.
+      # under ~/.opencode/bin/opencode, separate from its XDG dirs (config, data, state, cache).
       # Read-only, same rationale.
       RO_TRY_BINDS+=("$HOME/.opencode")
       PATH_PREPEND+="$HOME/.opencode/bin:"
@@ -289,6 +313,8 @@ fi
 # Both run before anything is created, so a refusal here leaves nothing behind.
 jobnet_die() { echo "sandbox-run.sh: --job-nodes: $*" >&2; exit 1; }
 JOBNET_INNER=0
+JOBNET_DRY=0      # --dry-run with --job-nodes: the outer stage's values, and pasta is not started
+JOBNET_PASTA=()   # the pasta command of the outer stage (for --dry-run)
 if [[ $WANT_HOSTNET -eq 1 ]]; then
   # One flag must not be enough to run an agent itself, or its job broker, with an open network.
   _why=""
@@ -306,6 +332,7 @@ if [[ $WANT_IB -eq 1 ]]; then
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }
+  [[ -d /dev/infiniband ]] || { echo "sandbox-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1; }
 fi
 if [[ $WANT_JOBNET -eq 0 && ${#LISTEN_PORTS[@]} -gt 0 ]]; then
   echo "sandbox-run.sh: --listen needs --job-nodes (or --peers)" >&2; exit 1
@@ -360,8 +387,11 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       # One sandbox at a time on this node chooses its block and lets pasta bind it: two that
       # look at the same instant would each get part of the same block. Held until the inner
       # stage has started (or pasta has given up), never across the sandboxed command.
-      exec {_lockfd}> "$_markdir/net.lock"
-      flock "$_lockfd"
+      # (Not in a dry run, which binds no port.)
+      if [[ $DRY_RUN -eq 0 ]]; then
+        exec {_lockfd}> "$_markdir/net.lock"
+        flock "$_lockfd"
+      fi
       # Ports other nodes may connect to: a block of 2000 below the node's own range for outgoing
       # connections, so that nothing on the node hands one out by chance. Ports already listening
       # on the node are left out (pasta would report each one it cannot bind). A block that is
@@ -383,16 +413,33 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
         [[ -n "$port" ]] || continue
         [[ "$port" -ge "$_lo" && "$port" -le "$_hi" ]] || _fwd+=(-t "$_myip/$port")
       done
-      export SANDBOX_NET_STAGE=inner SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip" \
-             SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts" SANDBOX_NET_HOSTNAME="$(hostname)" \
-             SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$" SANDBOX_NET_MARK="$_markdir/net-$$.starting"
-      : > "$SANDBOX_NET_MARK"
       # A killed parent takes its child with it, at both levels: this shell -> pasta -> inner stage.
       _pre=(); command -v setpriv >/dev/null && _pre=(setpriv --pdeathsig KILL)
+      JOBNET_PASTA=(${_pre[@]+"${_pre[@]}"} pasta --config-net -4 -q -i "$_hif" -I "$_hif" "${_fwd[@]}"
+                    -u none -T none -U none --no-map-gw --
+                    ${_pre[@]+"${_pre[@]}"} "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"})
+      if [[ $DRY_RUN -eq 1 ]]; then
+        # A dry run starts nothing: no pasta, no second run of this script. What the inner stage
+        # would be given is set here (not exported), the routes are left alone, and the script
+        # carries on to build and print the bwrap command of the inner stage. dry_run_print names
+        # the pasta command.
+        SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip" SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts"
+        SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$"
+        JOBNET_DRY=1
+        break
+      fi
+      SANDBOX_NET_STAGE=inner SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip"
+      SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts" SANDBOX_NET_HOSTNAME="$(hostname)"
+      SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$" SANDBOX_NET_MARK="$_markdir/net-$$.starting"
+      export SANDBOX_NET_STAGE SANDBOX_NET_PEERS SANDBOX_NET_MYIP SANDBOX_NET_IF SANDBOX_NET_HOSTS SANDBOX_NET_HOSTNAME \
+             SANDBOX_NET_UID SANDBOX_NET_GID SANDBOX_NET_PORTS SANDBOX_NET_PID SANDBOX_NET_MARK
+      : > "$SANDBOX_NET_MARK"
+      # pasta is stopped on every way out of this stage. (It normally ends with the inner stage,
+      # and _pp is emptied once it has been waited for.)
+      _pp=""
+      trap '[[ -n "$_pp" ]] && kill "$_pp" 2>/dev/null || true' EXIT
       # In the background, so that the traps below run at once; `<&0` keeps the caller's stdin.
-      ${_pre[@]+"${_pre[@]}"} pasta --config-net -4 -q -i "$_hif" -I "$SANDBOX_NET_IF" "${_fwd[@]}" \
-           -u none -T none -U none --no-map-gw -- \
-           ${_pre[@]+"${_pre[@]}"} "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} <&0 {_lockfd}>&- &
+      "${JOBNET_PASTA[@]}" <&0 {_lockfd}>&- &
       _pp=$!
       for ((_w = 0; _w < 300; _w++)); do
         [[ -e "$SANDBOX_NET_MARK" ]] && kill -0 "$_pp" 2>/dev/null || break
@@ -415,6 +462,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       # The inner stage removes the marker when it starts. Still there: pasta gave up before that,
       # which is what happens when another sandbox on this node took the same block of ports in
       # the same instant. Look again and retry; any other failure repeats and is reported as is.
+      _pp=""   # waited for: nothing left for the EXIT trap to stop
       [[ -e "$SANDBOX_NET_MARK" ]] || exit "$_rc"
       rm -f "$SANDBOX_NET_MARK"
       [[ $_try -lt 3 ]] || exit "$_rc"
@@ -424,26 +472,28 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   # ---- inner stage. SANDBOX_NET_STAGE is only an environment variable, so prove where we are
   # before touching a routing table: root of a user namespace that maps to the calling user.
   # (As plain root on the node, the flush below would hit the node's own routes.)
-  read -r _in _out _cnt < /proc/self/uid_map
-  [[ "$(id -u)" == 0 && "$_in" == 0 && "$_cnt" == 1 && "$_out" != 0 && "$_out" == "${SANDBOX_NET_UID:-}" ]] \
-    || jobnet_die "internal: the inner stage is not running in pasta's namespace"
-  [[ "${SANDBOX_NET_GID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_PID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_IF:-}" =~ ^[A-Za-z0-9._-]{1,15}$ \
-     && "${SANDBOX_NET_PORTS:-}" =~ ^[0-9]+\ [0-9]+$ && "${SANDBOX_NET_PEERS-x}" =~ ^[0-9.\ ]*$ ]] \
-    || jobnet_die "internal: bad settings from the outer stage"
-  "$IP_BIN" -4 route flush dev "$SANDBOX_NET_IF" || jobnet_die "could not clear the routes"
-  _n=0
-  for a in $SANDBOX_NET_PEERS; do
-    "$IP_BIN" -4 route add "$a/32" dev "$SANDBOX_NET_IF" || jobnet_die "could not add the route to $a"
-    _n=$((_n + 1))
-  done
-  # Exactly one route per other node, and nothing else: fail closed on anything unexpected.
-  [[ "$("$IP_BIN" -4 route show | grep -c .)" == "$_n" && -z "$("$IP_BIN" -4 route show default)" ]] \
-    || jobnet_die "the routing table is not what was set: $("$IP_BIN" -4 route show | tr '\n' ';')"
-  # Listeners that let the system pick a port get one from the top 1500 of the forwarded range.
-  echo "$(( ${SANDBOX_NET_PORTS#* } - 1499 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
-    || jobnet_die "could not set the port range"
-  # pasta names its namespace pasta-<host>; software that looks itself up needs the real name.
-  hostname "$SANDBOX_NET_HOSTNAME" 2>/dev/null || true
+  if [[ $JOBNET_DRY -eq 0 ]]; then
+    read -r _in _out _cnt < /proc/self/uid_map
+    [[ "$(id -u)" == 0 && "$_in" == 0 && "$_cnt" == 1 && "$_out" != 0 && "$_out" == "${SANDBOX_NET_UID:-}" ]] \
+      || jobnet_die "internal: the inner stage is not running in pasta's namespace"
+    [[ "${SANDBOX_NET_GID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_PID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_IF:-}" =~ ^[A-Za-z0-9._-]{1,15}$ \
+       && "${SANDBOX_NET_PORTS:-}" =~ ^[0-9]+\ [0-9]+$ && "${SANDBOX_NET_PEERS-x}" =~ ^[0-9.\ ]*$ ]] \
+      || jobnet_die "internal: bad settings from the outer stage"
+    "$IP_BIN" -4 route flush dev "$SANDBOX_NET_IF" || jobnet_die "could not clear the routes"
+    _n=0
+    for a in $SANDBOX_NET_PEERS; do
+      "$IP_BIN" -4 route add "$a/32" dev "$SANDBOX_NET_IF" || jobnet_die "could not add the route to $a"
+      _n=$((_n + 1))
+    done
+    # Exactly one route per other node, and nothing else: fail closed on anything unexpected.
+    [[ "$("$IP_BIN" -4 route show | grep -c .)" == "$_n" && -z "$("$IP_BIN" -4 route show default)" ]] \
+      || jobnet_die "the routing table is not what was set: $("$IP_BIN" -4 route show | tr '\n' ';')"
+    # Listeners that let the system pick a port get one from the top 1500 of the forwarded range.
+    echo "$(( ${SANDBOX_NET_PORTS#* } - 1499 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
+      || jobnet_die "could not set the port range"
+    # pasta names its namespace pasta-<host>; software that looks itself up needs the real name.
+    hostname "$SANDBOX_NET_HOSTNAME" 2>/dev/null || true
+  fi
   JOBNET_INNER=1
   JOBNET_PID="$SANDBOX_NET_PID"
   [[ "${SANDBOX_NET_MARK:-}" == */net-"$SANDBOX_NET_PID".starting ]] && rm -f "$SANDBOX_NET_MARK"
@@ -514,6 +564,7 @@ JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDE
 # or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
 mkdir "$JOB_DIR" || { echo "sandbox-run.sh: per-job state dir $JOB_DIR already exists; remove it if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
+RECORD_START="$(date +%Y-%m-%dT%H:%M:%S%z)"; : > "$JOB_DIR/.start"   # for the per-job record
 # Removed on every exit from here on: the cfg/ copies below include ~/.claude.json (account
 # details), so no exit between here and the full cleanup() further down may leave them behind.
 # cleanup() replaces this trap once there is a proxy or broker to stop as well.
@@ -563,7 +614,7 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
   OPENCODE_XDG_CONFIG="$SANDBOX_CFG_ROOT/opencode-xdg-config"
   mkdir -p "$OPENCODE_XDG_CONFIG"
-  [[ -d "$HOME/.config/opencode" ]] && cp -R "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
+  [[ -d "$HOME/.config/opencode" ]] && cp -RH "$HOME/.config/opencode" "$OPENCODE_XDG_CONFIG/opencode"
   mkdir -p "$OPENCODE_XDG_CONFIG/opencode"
   OPENCODE_CONFIG_FILE="$OPENCODE_XDG_CONFIG/opencode/opencode.json"
   [[ -f "$OPENCODE_XDG_CONFIG/opencode/opencode.jsonc" && ! -f "$OPENCODE_CONFIG_FILE" ]] \
@@ -573,7 +624,9 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   # bwrap has a source path on a fresh account.
   for d in .local/share/opencode .local/state/opencode .cache/opencode; do
     mkdir -p "$HOME/$d"
-    RW_BINDS+=("$HOME/$d")
+    # The physical path: the binds are compared and re-checked by name, and $HOME may be reached
+    # through a symlink.
+    RW_BINDS+=("$(realpath -e -- "$HOME/$d")")
   done
   # opencode's own variables, not XDG_CONFIG_HOME: that would also hide git's, gh's and every
   # other tool's ~/.config from the sandboxed process. OPENCODE_CONFIG is the config file,
@@ -589,17 +642,19 @@ BWRAP_ARGS=(
   # in order, so a tmpfs mounted after the $PWD bind would cover a $PWD that lives under /tmp,
   # and the agent would start in an empty directory.
   --tmpfs /tmp
+  # --unshare-pid is also what cleans up: when bwrap's process 1 exits, the kernel kills
+  # everything left in the namespace. Without it the in-sandbox relay (relay.py) outlived the
+  # command and stayed on the node after the job.
+  # The network: --unshare-net is added just below, except for a multi-node worker.
   --proc /proc --dev /dev --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
 if [[ $JOBNET_INNER -eq 1 ]]; then
   # The network namespace is the one pasta serves, already narrowed above. The nested user
   # namespace is what makes that final: inside it, uid 0 of the outer namespace is the user
-  # again, with no capability over the network namespace. /etc/hosts: the job's nodes (no DNS).
-  JOBNET_HOSTS="$JOB_DIR/hosts"
-  { echo "127.0.0.1 localhost"; printf '%s' "$SANDBOX_NET_HOSTS"; } > "$JOBNET_HOSTS"
-  BWRAP_ARGS+=(--unshare-user --uid "$SANDBOX_NET_UID" --gid "$SANDBOX_NET_GID"
-               --ro-bind "$JOBNET_HOSTS" /etc/hosts)
+  # again, with no capability over the network namespace. (/etc/hosts for the job's nodes is
+  # bound with the other multi-node binds, in the sorted list below.)
+  BWRAP_ARGS+=(--unshare-user --uid "$SANDBOX_NET_UID" --gid "$SANDBOX_NET_GID")
 elif [[ $WANT_HOSTNET -eq 0 ]]; then
   BWRAP_ARGS+=(--unshare-net)
 fi
@@ -607,27 +662,6 @@ fi
 if [[ ${#GPU_BINDS[@]} -gt 0 ]]; then
   BWRAP_ARGS+=("${GPU_BINDS[@]}")
   EXTRA_SETENV+=(CUDA_VISIBLE_DEVICES "$GPU_CVD" CUDA_DEVICE_ORDER PCI_BUS_ID)
-fi
-# Multi-node workers: the sysfs entries NCCL and libibverbs read, all read-only.
-#   /sys/class/net: NCCL sizes its socket transport from the interface's speed. Without it a
-#   bandwidth test over Ethernet ran about 27% slower inside the sandbox than outside.
-#   /sys/bus/pci, /sys/class/pci_bus: NCCL decides that a NIC is a PCI device by following
-#   <device>/subsystem into /sys/bus/pci. Without them InfiniBand comes up, NCCL logs "network
-#   path ... is not a PCI device", and the job dies with "Could not find NET with id 0" (verified
-#   live, NCCL 2.27.3 on H200 nodes).
-if [[ $WANT_IB -eq 1 || $WANT_HOSTNET -eq 1 || $JOBNET_INNER -eq 1 ]]; then
-  [[ $WANT_GPU -eq 1 ]] || BWRAP_ARGS+=(--ro-bind /sys/devices /sys/devices)
-  for d in /sys/class/net /sys/bus/pci /sys/class/pci_bus; do
-    [[ -e "$d" ]] && BWRAP_ARGS+=(--ro-bind "$d" "$d")
-  done
-fi
-# --ib: the verbs devices and their class entries.
-if [[ $WANT_IB -eq 1 ]]; then
-  [[ -d /dev/infiniband ]] || { echo "sandbox-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1; }
-  BWRAP_ARGS+=(--dev-bind /dev/infiniband /dev/infiniband)
-  for d in /sys/class/infiniband /sys/class/infiniband_verbs; do
-    [[ -e "$d" ]] && BWRAP_ARGS+=(--ro-bind "$d" "$d")
-  done
 fi
 # Own terminal session unless a human is actually at a terminal (Mode C): with a controlling
 # tty shared with the parent shell, a sandboxed process can queue keystrokes into it with the
@@ -641,12 +675,30 @@ PASSTHROUGH_ENV=(PATH HOME USER LOGNAME SHELL TERM COLORTERM LANG TZ
                  SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS)
 # Every LC_* the invoking shell has, as documented above -- not a fixed subset.
 while IFS= read -r name; do PASSTHROUGH_ENV+=("$name"); done < <(compgen -e LC_)
+# These values do NOT go on bwrap's command line: a command line is readable by every user on
+# the node (/proc/<pid>/cmdline, `ps -ef`), and --env exists to pass secrets such as an API key.
+# They are collected here and handed to bwrap on a file descriptor (--args 9, see run_bwrap). The
+# position of --args keeps the order: bwrap takes the last --setenv for a name.
+# With .git/config read-only, `git config user.name ...` fails inside, and $HOME is not there to
+# supply an identity. Pass yours in the variables git reads, so that commits still work. Read
+# from / so that no repository's configuration is consulted on the host.
+if [[ $PROTECT -eq 1 ]] && command -v git >/dev/null 2>&1; then
+  _gn="$(cd / && git config --global --get user.name 2>/dev/null || true)"
+  _ge="$(cd / && git config --global --get user.email 2>/dev/null || true)"
+  # A name or address already in your environment wins over the global configuration.
+  _gn="${GIT_AUTHOR_NAME:-$_gn}"; _ge="${GIT_AUTHOR_EMAIL:-$_ge}"
+  [[ -n "$_gn" ]] && EXTRA_SETENV+=(GIT_AUTHOR_NAME "$_gn" GIT_COMMITTER_NAME "${GIT_COMMITTER_NAME:-$_gn}")
+  [[ -n "$_ge" ]] && EXTRA_SETENV+=(GIT_AUTHOR_EMAIL "$_ge" GIT_COMMITTER_EMAIL "${GIT_COMMITTER_EMAIL:-$_ge}")
+  unset _gn _ge
+fi
+ENV_ARGS=()
 for name in "${PASSTHROUGH_ENV[@]}" "${PASS_ENV[@]:-}"; do
-  [[ -n "$name" && -n "${!name+x}" ]] && BWRAP_ARGS+=(--setenv "$name" "${!name}")
+  [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=(--setenv "$name" "${!name}")
 done
 for ((i = 0; i < ${#EXTRA_SETENV[@]}; i += 2)); do
-  BWRAP_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
+  ENV_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
 done
+BWRAP_ARGS+=(--args 9)
 # The CLI dirs bound by --claude/--opencode are only reachable by name if PATH names them. An
 # interactive shell's PATH usually does already; one from `bsub -env none` or another scrubbed
 # environment does not, and `exec: claude: not found` was the result.
@@ -665,17 +717,199 @@ fi
 # order the flags came in. Same path twice: $PWD, then --ro, then --rw, so the last of those wins.
 _bind_lines=""
 _seq=0
-add_bind() {  # $1 = bwrap flag, $2 = path
+add_bind() {  # $1 = bwrap flag, $2 = path, $3 = source if it is not the path itself
   local d="${2//[^\/]/}"
   _seq=$((_seq + 1))
-  _bind_lines+="${#d}"$'\t'"$_seq"$'\t'"$1"$'\t'"$2"$'\n'
+  _bind_lines+="${#d}"$'\t'"$_seq"$'\t'"$1"$'\t'"$2"$'\t'"${3:-$2}"$'\n'
 }
 add_bind --bind "$PWD"
 for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind "$p"; done
 for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind-try "$p"; done
 for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind "$p"; done
 for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind-try "$p"; done
-while IFS=$'\t' read -r _ _ _flag _path; do
+# ---- What is added to the binds above before they are sorted ---------------------------------
+# Everything below goes through add_bind, into the same depth-sorted list as $PWD and the --ro
+# and --rw paths. That matters: a bind covers whatever was mounted beneath it before, so a bind
+# emitted AFTER the sorted list could uncover a deeper --ro of yours. In the sorted list the
+# deeper path always comes later and keeps its own mode.
+
+# The mode a path has from your own binds: that of the deepest of $PWD, --ro and --rw that
+# contains it (same path: $PWD, then --ro, then --rw, as in the sort). Prints rw, ro or nothing.
+eff_mode() {
+  local p="$1" best=-1 mode="" r d
+  if [[ "$p" == "$PWD" || "$p" == "${PWD%/}/"* ]]; then d="${PWD//[^\/]/}"; best=${#d}; mode=rw; fi
+  for r in "${RO_BINDS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=ro; fi
+  done
+  for r in "${RW_BINDS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=rw; fi
+  done
+  echo "$mode"
+}
+user_named() {  # $1 = path; true if you named exactly this path with --ro or --rw
+  local r
+  for r in "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do [[ -n "$r" && "$1" == "$r" ]] && return 0; done
+  return 1
+}
+# True if no component of the path is a symlink. A path that goes through a link is never bound
+# by name: the name could lead out of the directory it appears to be in.
+plain_path() { [[ "$(realpath -e -- "$1" 2>/dev/null)" == "$1" ]]; }
+
+# PYTHONPATH once more, now that the binds are known: an absolute entry inside a directory that is
+# writable in the sandbox is as good as the working directory to host-side Python (the csub
+# broker), so those entries are dropped too.
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do
+    [[ "$(eff_mode "$(realpath -m -- "$_e" 2>/dev/null || echo "$_e")")" == rw ]] || _pp="${_pp:+$_pp:}$_e"
+  done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
+# Multi-node workers: the sysfs entries NCCL and libibverbs read, all read-only. Through add_bind
+# like everything else here, so that a --ro or --rw of yours above one of them (/sys, /etc) cannot
+# cover it, and a deeper one of yours keeps its own mode.
+#   /sys/class/net: NCCL sizes its socket transport from the interface's speed. Without it a
+#   bandwidth test over Ethernet ran about 27% slower inside the sandbox than outside.
+#   /sys/bus/pci, /sys/class/pci_bus: NCCL decides that a NIC is a PCI device by following
+#   <device>/subsystem into /sys/bus/pci. Without them InfiniBand comes up, NCCL logs "network
+#   path ... is not a PCI device", and the job dies with "Could not find NET with id 0" (verified
+#   live, NCCL 2.27.3 on H200 nodes).
+if [[ $WANT_IB -eq 1 || $WANT_HOSTNET -eq 1 || $JOBNET_INNER -eq 1 ]]; then
+  [[ $WANT_GPU -eq 1 ]] || add_bind --ro-bind /sys/devices     # --gpu has bound it already
+  for d in /sys/class/net /sys/bus/pci /sys/class/pci_bus; do
+    [[ -e "$d" ]] && add_bind --ro-bind "$d"
+  done
+fi
+# --ib: the verbs devices and their class entries.
+if [[ $WANT_IB -eq 1 ]]; then
+  add_bind --dev-bind /dev/infiniband
+  for d in /sys/class/infiniband /sys/class/infiniband_verbs; do
+    [[ -e "$d" ]] && add_bind --ro-bind "$d"
+  done
+fi
+# --job-nodes: /etc/hosts names the job's nodes (there is no DNS inside).
+if [[ $JOBNET_INNER -eq 1 ]]; then
+  JOBNET_HOSTS="$JOB_DIR/hosts"
+  { echo "127.0.0.1 localhost"; printf '%s' "$SANDBOX_NET_HOSTS"; } > "$JOBNET_HOSTS"
+  add_bind --ro-bind /etc/hosts "$JOBNET_HOSTS"
+fi
+
+# This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
+# the sandbox). If the directory they live in is writable inside -- which is the case whenever
+# the script is run from its own checkout, e.g. `cd agentic-sandbox/scripts &&
+# ./sandbox-run.sh` -- a prompt-injected agent could edit them and have the edit run
+# unsandboxed on the NEXT invocation. So the script directory is bound read-only, and every
+# writable directory above it is bound onto itself: a read-only bind makes the script
+# directory a mount point, which cannot be renamed, but the directories ABOVE it still could
+# be, and a new checkout put in their place. Mount points cannot.
+if [[ "$(eff_mode "$SCRIPT_DIR")" == rw ]]; then
+  echo "sandbox-run.sh: note: $SCRIPT_DIR is inside a read-write bind; re-binding it read-only. Prefer running from a separate work directory." >&2
+  _a="$(dirname "$SCRIPT_DIR")"
+  while [[ -n "$_a" && "$_a" != / ]]; do
+    if [[ "$(eff_mode "$_a")" == rw && "$_a" != "$PWD" ]] && ! user_named "$_a"; then add_bind --bind "$_a"; fi
+    _a="$(dirname "$_a")"
+  done
+  add_bind --ro-bind "$SCRIPT_DIR"
+fi
+
+# ---- Files that run later ------------------------------------------------------------------
+# Some files in a project are not the work product but instructions to tools: git runs
+# .git/hooks and what .git/config names (core.hooksPath, core.fsmonitor, aliases, an ssh command),
+# Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
+# .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
+# you, outside the sandbox, the next time you use git or open the project. So where they exist
+# in a directory that is writable inside, they are bound read-only, unless --no-protect is given.
+#   - Their parents (.git, .claude) are bound onto themselves first. That makes them mount points,
+#     which the kernel refuses to rename or remove: without it the process could move .git aside
+#     and build a new one with its own hooks.
+#   - Only what exists at start can be bound. Names that are absent are remembered, and the ones
+#     that appear during the run are reported at exit (see report_new_config). That includes
+#     .git/commondir and .git/config.worktree, which redirect git to another configuration.
+#   - A name that is a symlink, or lies behind one, is not bound (see plain_path) and is named
+#     in a note at start.
+#   - A path you named yourself with --ro or --rw keeps the mode you gave it.
+#   - Only directly under each read-write directory, like the credential masks.
+PROTECT_PINS=(.git .claude)
+PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
+              .vscode .devcontainer .husky .codex .opencode)
+PROTECT_FILES=(.git/config .git/commondir .git/config.worktree .mcp.json .claude/settings.json
+               .claude/settings.local.json .pre-commit-config.yaml opencode.json)
+PROTECTED=()   # what was bound read-only, for the in-sandbox README
+WATCHED=()     # absent at start; reported if present at exit
+LINKED=()      # not bound because a symlink is involved
+declare -A PROTECT_SEEN=()
+protect_one() {  # $1 = dir|file, $2 = path
+  local p="$2"
+  [[ -z "${PROTECT_SEEN[$p]:-}" ]] || return 0
+  PROTECT_SEEN[$p]=1
+  user_named "$p" && return 0
+  [[ "$(eff_mode "$p")" == rw ]] || return 0
+  if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then LINKED+=("$p"); return 0; fi
+  if [[ ! -e "$p" ]]; then WATCHED+=("$p"); return 0; fi
+  if { [[ "$1" == dir && -d "$p" ]] || [[ "$1" == file && -f "$p" ]]; }; then
+    add_bind --ro-bind "$p"; PROTECTED+=("$p")
+  fi
+  return 0
+}
+protect_root() {  # $1 = a directory that is writable inside
+  local root="${1%/}" x p hp part skip=" "
+  [[ -d "$root" ]] || return 0
+  for x in "${PROTECT_PINS[@]}"; do
+    p="$root/$x"
+    if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then
+      LINKED+=("$p"); skip+="$x "
+    elif [[ -d "$p" ]]; then
+      if [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then add_bind --bind "$p"; fi
+    elif [[ -f "$p" ]]; then
+      protect_one file "$p"; skip+="$x "       # .git as a file: a worktree or submodule pointer
+    else
+      # Not there yet (.git before a clone or `git init`): watched as one name, so that a new
+      # repository is reported once and not once per file inside it.
+      [[ "$(eff_mode "$p")" == rw ]] && WATCHED+=("$p")
+      skip+="$x "
+    fi
+  done
+  for x in "${PROTECT_DIRS[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one dir "$root/$x"; done
+  for x in "${PROTECT_FILES[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one file "$root/$x"; done
+  # A hooks directory named in .git/config. git itself reads the file (from /, so that no
+  # repository on the host is consulted); the value is the sandboxed process's to write, so it is
+  # used only as a plain relative path inside this directory, and each directory on the way to
+  # it is pinned like .git.
+  if [[ "$skip" != *" .git "* && -f "$root/.git/config" ]] && command -v git >/dev/null 2>&1; then
+    hp="$(cd / && git config --file "$root/.git/config" --includes --get core.hooksPath 2>/dev/null || true)"
+    hp="${hp%/}"
+    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "$hp" != . && "/$hp/" != */../* && "/$hp/" != */./* && "$hp" != *$'\n'* ]]; then
+      p="$root"
+      while [[ "$hp" == */* ]]; do
+        part="${hp%%/*}"; hp="${hp#*/}"; p="$p/$part"
+        if [[ -d "$p" && ! -L "$p" ]] && plain_path "$p" && [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then add_bind --bind "$p"; fi
+      done
+      protect_one dir "$p/$hp"
+    fi
+  fi
+  return 0
+}
+report_new_config() {  # at exit: which of the watched names did the command create?
+  local x new=()
+  for x in ${WATCHED[@]+"${WATCHED[@]}"}; do [[ -e "$x" || -L "$x" ]] && new+=("$x"); done
+  [[ ${#new[@]} -gt 0 ]] || return 0
+  echo "sandbox-run.sh: the command created files that tools run or load outside the sandbox. Review them before you use git, an editor or an agent in that directory:" >&2
+  printf '  %s\n' "${new[@]}" >&2
+  return 0
+}
+if [[ $PROTECT -eq 1 ]]; then
+  for root in "$PWD" "${RW_BINDS[@]:-}"; do [[ -n "$root" ]] && protect_root "$root"; done
+  if [[ ${#LINKED[@]} -gt 0 ]]; then
+    echo "sandbox-run.sh: note: not protected, because a symlink is involved: ${LINKED[*]}" >&2
+  fi
+fi
+
+while IFS=$'\t' read -r _ _ _flag _path _src; do
   [[ -n "$_path" ]] || continue
   if [[ "$_flag" == --ro-bind-try && -L "$_path" ]]; then
     # bwrap: "Can't mount on symlink destination" -- recreate the link inside instead, and bind
@@ -683,24 +917,11 @@ while IFS=$'\t' read -r _ _ _flag _path; do
     _t="$(realpath -e -- "$_path" 2>/dev/null)" || continue
     BWRAP_ARGS+=(--ro-bind-try "$_t" "$_t" --symlink "$_t" "$_path")
   else
-    BWRAP_ARGS+=("$_flag" "$_path" "$_path")
+    BWRAP_ARGS+=("$_flag" "${_src:-$_path}" "$_path")
   fi
 done < <(printf '%s' "$_bind_lines" | sort -t$'\t' -k1,1n -k2,2n)
 
-# This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
-# the sandbox). If the directory they live in falls inside a read-write bind -- which is the
-# case whenever the script is run from its own checkout, e.g. `cd agentic-sandbox/scripts &&
-# ./sandbox-run.sh` -- a prompt-injected agent could edit them and have the edit run
-# unsandboxed on the NEXT invocation. Shadow the script directory read-only after all the
-# read-write binds (later mounts win in bwrap), and say so once.
-for root in "$PWD" "${RW_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
-  [[ -n "$root" ]] || continue
-  if [[ "$SCRIPT_DIR" == "$root" || "$SCRIPT_DIR" == "$root/"* ]]; then
-    echo "sandbox-run.sh: note: $SCRIPT_DIR is inside a read-write bind ($root); re-binding it read-only. Prefer running from a separate work directory." >&2
-    BWRAP_ARGS+=(--ro-bind "$SCRIPT_DIR" "$SCRIPT_DIR")
-    break
-  fi
-done
+
 
 # Mask well-known credential locations -- applied LAST, after every --ro/--rw
 # above (including --claude/--opencode/--scratch and anything the caller
@@ -827,6 +1048,7 @@ for root in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}" "${RO_TRY_BINDS[@]:-}" 
   fi
 done
 [[ ${#CFG_BINDS[@]} -gt 0 ]] && BWRAP_ARGS+=("${CFG_BINDS[@]}")
+
 [[ ${#LATE_BINDS[@]} -gt 0 ]] && BWRAP_ARGS+=("${LATE_BINDS[@]}")
 
 PROXY_PID=""
@@ -853,12 +1075,67 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -cE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $NF}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
+
+# ---- The per-job record -----------------------------------------------------------------------
+# What the sandboxed command reached, kept where it cannot touch it: every host the proxy allowed
+# or refused, with the time, and the csub jobs recorded while the sandbox ran. One small file per
+# run under ~/.agentic-sandbox/records/<date>/, written at exit, and only when there is something
+# to record (a run without --allow and --csub has nothing). $HOME is not bound into the sandbox,
+# so a later run cannot rewrite an earlier record. SANDBOX_RECORD=off turns it off.
+record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started (best effort)
+  local policy="$HOME/.config/csub/broker.toml" state w prev=""
+  for w in ${CSUB_BROKER:-}; do [[ "$prev" == --policy ]] && policy="$w"; prev="$w"; done
+  state="$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$policy" 2>/dev/null | head -1)"
+  state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
+  [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
+  find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200
+}
+write_record() {  # $1 = exit status of the command
+  [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
+  local plog="" jobs="" dir file
+  [[ -n "${PROXY_DIR:-}" && -s "$PROXY_DIR/proxy.log" ]] && grep -qE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$PROXY_DIR/proxy.log" 2>/dev/null && plog="$PROXY_DIR/proxy.log"
+  [[ ${WANT_CSUB:-0} -eq 1 ]] && jobs="$(record_csub_jobs)"
+  [[ -n "$plog" || -n "$jobs" ]] || return 0
+  dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 700 "$HOME/.agentic-sandbox" "$HOME/.agentic-sandbox/records" 2>/dev/null || true
+  file="$dir/${JOB_DIR##*/}.log"
+  {
+    echo "agentic-sandbox record (sandbox-run.sh)"
+    echo "started:   ${RECORD_START:-unknown}"
+    echo "ended:     $(date +%Y-%m-%dT%H:%M:%S%z)"
+    echo "job:       ${LSB_JOBID:-none}${LSB_JOBINDEX:+ index $LSB_JOBINDEX} on $(hostname -s) as $USER"
+    echo "directory: $PWD"
+    echo "command:   $(printf '%q ' "${CMD[@]}" | cut -c1-600)"
+    echo "exit:      $1"
+    echo "allowed hosts: ${ALLOW_HOSTS[*]:-none}"
+    echo
+    echo "## Network (every request the proxy saw)"
+    if [[ -n "$plog" ]]; then
+      grep -E '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog" | sed 's/^\[allowlist_proxy\] //; s/ (peer=[^)]*)$//' | head -5000
+      [[ "$(grep -cE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog")" -le 5000 ]] || echo "(more than 5000 lines; the rest is not kept)"
+    else
+      echo "none"
+    fi
+    if [[ ${WANT_CSUB:-0} -eq 1 ]]; then
+      echo
+      echo "## csub jobs recorded while this sandbox ran"
+      echo "(taken from csub's own state directory; refused requests are not recorded there, and"
+      echo " other sandboxes of yours running at the same time appear here too)"
+      if [[ -n "$jobs" ]]; then echo "$jobs"; else echo "none"; fi
+    fi
+  } > "$file" 2>/dev/null || true
+  return 0
+}
+# The proxy and the broker run outside the sandbox and must be stopped here. A job that ends
+# normally does not have its stragglers swept by LSF the way a `bkill`ed one does, so anything
+# left running would stay on the node.
 cleanup() {
   # $? on entry is the script's exit status (the `exit $?` after bwrap, or 130/141/143 from the
   # signal traps). The denied-host summary is a troubleshooting hint, so it is printed only
@@ -866,8 +1143,13 @@ cleanup() {
   # (tests and user pipelines take `2>&1 | tail -1`), and opencode denials in a successful run
   # (its registry.npmjs.org / models.opencode.ai pings) are the allowlist working, not news.
   local rc=$?
+  # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
+  # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
+  trap '' TERM INT USR2
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ $rc -ne 0 ]] && summarize_proxy_denials
+  declare -F report_new_config >/dev/null && report_new_config
+  write_record "$rc"
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -876,7 +1158,12 @@ cleanup() {
   # The whole per-job state dir: cfg/ copies (incl. ~/.claude.json account details), proxy
   # socket + log, the empty mask file. The bind-mounted credentials file is NOT inside it on
   # the host side -- bwrap's mount only ever existed in the sandbox's namespace.
-  [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]] && rm -rf "$JOB_DIR"
+  # chmod first: the sandboxed command can write in cfg/, and a directory it left without
+  # permissions (chmod 000 around the ~/.claude.json copy) would otherwise survive the rm.
+  if [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR" ]]; then
+    chmod -R u+rwX "$JOB_DIR" 2>/dev/null || true
+    rm -rf "$JOB_DIR" 2>/dev/null || echo "sandbox-run.sh: could not remove $JOB_DIR; remove it by hand (it holds copies of your agent configuration)" >&2
+  fi
   true
 }
 # Replaces early_cleanup (installed right after the per-job dir was made); the signal traps set
@@ -898,7 +1185,19 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # in the sandbox, ahead of the python's own.
   CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
   [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
-  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Host-side Python must never import from the working directory: that is the directory the
+  # agent can write, and a csub.py or json.py planted there would run OUTSIDE the sandbox, as
+  # you, on the next start. `python -c` and `python -` put the current directory first on the
+  # module path, so the csub lookup runs from / (not -I: a csub installed with `pip --user` or
+  # found through PYTHONPATH must still be found), and a broker given in the `python -m ...` form
+  # is started from / as well. The usual csub-broker console script is not affected (its module
+  # path starts at its own bin directory) and keeps the working directory.
+  CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Only the csub-broker console script keeps the working directory (its module path starts at
+  # its own bin directory, and a relative --policy in the command must still resolve). Every
+  # other form (python -m, env python3 -m, uv run, a wrapper script) is started from /.
+  CSUB_BROKER_CWD=/
+  [[ "$(basename -- "${CSUB_BROKER%% *}")" == csub-broker ]] && CSUB_BROKER_CWD=.
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "sandbox-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -917,7 +1216,15 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # (the last one named wins for one path).
   declare -A _mmode=()
   _paths=()
-  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  _add_mount() {
+    # The list is handed on as path:mode,path:mode. A comma or colon inside a path would be read
+    # as a separator and put a directory this sandbox does not have into the envelope.
+    if [[ "$1" == *,* || "$1" == *:* ]]; then
+      echo "sandbox-run.sh: --csub: '$1' contains a comma or a colon, which the mount list passed to csub cannot carry; use a path without them" >&2
+      exit 1
+    fi
+    [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"
+  }
   _add_mount "$PWD" rw
   for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
   for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
@@ -955,6 +1262,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     for e in "${_pre[@]}"; do
       [[ -n "$e" ]] || continue
       ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      # Compared as text below, so "/proj/../other" must not pass for something under /proj.
+      if [[ "$ep" != /* || "/$ep/" == */../* || "/$ep/" == */./* ]]; then
+        echo "sandbox-run.sh: --csub: CSUB_MOUNTS entry '$e' is not a plain absolute path" >&2
+        exit 1
+      fi
       ok=0
       for d in "${_der[@]}"; do
         dp="${d%:*}"; dm="${d##*:}"
@@ -978,7 +1290,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # envelope that allows nothing"). CSUB_ENVELOPE=off accepts a policy-only broker explicitly.
   CSUB_ENV_ARGS=()
   if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
-    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+    if ! (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER --help) 2>&1 | grep -q -- --envelope-mount; then
       echo "sandbox-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
     fi
@@ -992,12 +1304,14 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
-  CSUB_PID=$!
-  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
-  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  if [[ $DRY_RUN -eq 0 ]]; then
+    (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
+    CSUB_PID=$!
+    wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+    # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+    echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  fi
   # PATH: bwrap takes the LAST --setenv, so this one must carry the --claude/--opencode CLI
   # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(
@@ -1078,7 +1392,7 @@ write_sandbox_readme() {
       echo "  then \`csub status\`, \`csub logs <id>\`, \`csub kill <id>\`. A child's output lands in <cwd>/.csub/jobs/<id>/stdout and stderr."
       echo "- Jobs are refused with a policy_violation error when they ask for something the policy does not allow. Read the message and adjust; do not probe or guess."
       if [[ -n "${CSUB_PROBE_JSON:-}" && -s "$CSUB_PROBE_JSON" ]]; then
-        python3 - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
+        python3 -I - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
@@ -1118,6 +1432,10 @@ PY
     echo
     [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
     [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; name the model explicitly: \`--model ${SANDBOX_OPENCODE_MODEL:-litellm/kimi-k3}\` (or \`-m\`)."
+    if [[ ${#PROTECTED[@]} -gt 0 ]]; then
+      echo "- These are read-only here, because tools run or load them later outside the sandbox: ${PROTECTED[*]}. Do not try to change, move or replace them. \`git config\` in such a repository fails; commits work, your git identity is already set in GIT_AUTHOR_* and GIT_COMMITTER_*. If the task needs one of them changed, say so in your answer and the user will do it."
+    fi
+    [[ $PROTECT -eq 1 ]] && echo "- If you create .mcp.json, .vscode, .claude/ settings, git hooks or similar files, the user is told at exit."
     echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
     echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
   } > "$SANDBOX_README_FILE"
@@ -1133,13 +1451,64 @@ write_sandbox_readme
 # LSF job script usually has a few open beyond 0-2 (a redirected log, a lock file, bash's own
 # fd for a sourced script). Close them in a subshell right before exec'ing bwrap: 0-2 stay, and
 # the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
+dry_run_print() {  # "$@" = everything after `bwrap`
+  local i n
+  echo "sandbox-run.sh: dry run. Nothing was started. A real run would do this:"
+  if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+    echo; echo "On the host, the allowlist proxy:"
+    printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo
+  fi
+  if [[ $WANT_CSUB -eq 1 ]]; then
+    echo; echo "On the host, the csub broker:"
+    echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
+  fi
+  if [[ $JOBNET_DRY -eq 1 ]]; then
+    echo; echo "On the host, the network relay (pasta), which runs this script again in a network namespace of its own:"
+    printf ' '; printf ' %q' "${JOBNET_PASTA[@]}"; echo
+    echo "In that namespace, before the sandbox starts: every route is removed and one host route is added per other node of the job (${SANDBOX_NET_PEERS:-none})."
+    echo "Ports open to the job's other nodes: ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and ${LISTEN_PORTS[*]}}."
+  fi
+  [[ $WANT_HOSTNET -eq 1 ]] && { echo; echo "The network: the node's own (--host-net); no helper is started."; }
+  echo; echo "The sandbox:"
+  printf '  bwrap'; printf ' %q' "$@"; echo
+  echo; echo "Environment of the command (handed to bwrap as --args 9; values passed with --env are not shown):"
+  for ((i = 0; i + 2 < ${#ENV_ARGS[@]}; i += 3)); do
+    n="${ENV_ARGS[i + 1]}"
+    if [[ " ${PASS_ENV[*]:-} " == *" $n "* ]]; then echo "  $n=<set, not shown>"; else echo "  $n=${ENV_ARGS[i + 2]}"; fi
+  done
+  echo; echo "Per-job state would be in $JOB_DIR (removed at exit)."
+}
 run_bwrap() {
-  local fd
+  local fd p
+  # Each path was made physical and checked when the arguments were read. Seconds have passed
+  # since (the proxy and the broker were started); look once more, so that a directory swapped
+  # for a symlink in between is not mounted under the name that was checked.
+  for p in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$(realpath -e -- "$p" 2>/dev/null)" != "$p" ]]; then
+      echo "sandbox-run.sh: $p changed while the sandbox was being set up (it is no longer the directory that was checked); not starting" >&2
+      exit 1
+    fi
+  done
+  # The environment for the command, NUL-separated, on descriptor 9 (see ENV_ARGS above). printf
+  # is a builtin, so the values are in no process's command line. bwrap reads the descriptor and
+  # closes it; it is not passed on to the command.
+  exec 9< <(printf '%s\0' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"})
   for fd in /proc/self/fd/*; do
     fd="${fd##*/}"
-    if [[ "$fd" -gt 2 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
+    if [[ "$fd" -gt 2 && "$fd" -ne 9 ]]; then eval "exec $fd>&-" 2>/dev/null || true; fi
   done
-  exec bwrap "$@"
+  # --clearenv empties the environment of the COMMAND only. bwrap itself stays inside the sandbox
+  # as PID 1, and the environment it was started with is readable there at /proc/1/environ: every
+  # variable of the job, API keys and tokens included. So bwrap is started with an environment of
+  # its own that holds only the job's id and array index (not secrets; they let someone on the
+  # node trace a bwrap process back to its job). What the command gets is unchanged: that comes
+  # from the --setenv arguments, which were read from this script's environment above.
+  local bwrap_bin keep=()
+  bwrap_bin="$(command -v bwrap)" || { echo "sandbox-run.sh: bwrap not found on PATH" >&2; exit 127; }
+  [[ -n "${LSB_JOBID:-}" ]] && keep+=("LSB_JOBID=$LSB_JOBID")
+  [[ -n "${LSB_JOBINDEX:-}" ]] && keep+=("LSB_JOBINDEX=$LSB_JOBINDEX")
+  exec env -i ${keep[@]+"${keep[@]}"} "$bwrap_bin" "$@"
 }
 
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
@@ -1149,13 +1518,17 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_DIR="$JOB_DIR/proxy"
   mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
-  python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
+  # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
+  # standard library only, and it runs on the host from a directory the agent may be able to write.
+  if [[ $DRY_RUN -eq 0 ]]; then
+  python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Wait for the socket to actually exist before bind-mounting it, and fail closed if the
   # proxy died (bad allowlist, python missing). A fixed `sleep 1` raced a slow interpreter
   # start on a busy node, and bwrap then failed with "Can't find source path".
   wait_for_proxy_socket "$PROXY_SOCK" "$PROXY_PID" || exit 1
+  fi
   BWRAP_ARGS+=(
     --ro-bind "$SCRIPT_DIR/relay.py" /opt/sandbox-relay.py
     --ro-bind "$PROXY_SOCK" /run/sandbox-proxy.sock
@@ -1173,11 +1546,13 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # replace this script's own process image, which would skip the `trap cleanup EXIT` and leak
   # the host-side allowlist_proxy.py process. The subshell is a normal foreground child, so the
   # trap fires once it returns, and its exit code is propagated explicitly.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}"; exit 0; fi
   (run_bwrap "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}")
   exit $?
 else
   # Same shape: the EXIT trap must run to delete the per-job config copies and the empty mask
   # file. Exit code is propagated.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "${BWRAP_ARGS[@]}" -- "${CMD[@]}"; exit 0; fi
   (run_bwrap "${BWRAP_ARGS[@]}" -- "${CMD[@]}")
   exit $?
 fi

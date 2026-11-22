@@ -10,10 +10,10 @@
 #
 # Options:
 #   --image NAME    Image to run (default: agentic-sandbox-lite, the lightweight pre-built
-#                    image on GHCR -- `podman pull` it first, or build your own locally with
-#                    `podman build -t agentic-sandbox-lite:latest .` in this directory and
+#                    image on GHCR -- pulled and kept current by this script, or build your own
+#                    with `podman build -t agentic-sandbox-lite:latest .` in ../podman and
 #                    pass `--image localhost/agentic-sandbox-lite:latest`. For a heavier
-#                    image with PyTorch/cuDNN preinstalled, build ./Dockerfile.pytorch
+#                    image with PyTorch/cuDNN preinstalled, build Dockerfile.pytorch there
 #                    instead, or pass `--image ghcr.io/janeliascientificcomputingsystems/
 #                    agentic-sandbox-gpu:latest`)
 #   --ro PATH       Read-only bind (repeatable): -v PATH:PATH:ro
@@ -55,7 +55,8 @@
 #                    your next session.
 #   --opencode      Same idea: a throwaway copy of ~/.config/opencode, mounted at opencode's
 #                    default location inside (~/.config/opencode of the in-container user), plus
-#                    RW binds on its data dirs (~/.local/share, ~/.local/state, ~/.cache)
+#                    RW binds on its data dirs (the opencode directory under each of
+#                    ~/.local/share, ~/.local/state and ~/.cache)
 #   --keep-id       Run as your real uid/gid instead of root (--userns=keep-id --user
 #                    "$(id -u):$(id -g)"), so files land on the real filesystem with your
 #                    normal ownership instead of root-mapped-through-the-user-namespace.
@@ -88,6 +89,12 @@
 #                    (libibverbs and the mlx5 provider: rdma-core / ibverbs-providers). Verbs
 #                    traffic does not pass through the container's network, so this opens the
 #                    InfiniBand fabric to the container whatever else is closed.
+#   --dry-run       Do every check, start nothing (no image pull, no container), and print the
+#                    podman command and the host-side helpers a real run would use.
+#   --no-protect    Leave the files that tools run later writable (.git/hooks, .git/config,
+#                    .mcp.json, .claude/, .vscode and the like). By default they are mounted
+#                    read-only where they exist under a --rw path, and ones the command
+#                    creates are reported at exit.
 #   -h, --help      Show help
 #
 # Multi-node jobs: the same three flags as sandbox-run.sh, with the same meaning (see its header
@@ -100,14 +107,25 @@
 # The command runs without CAP_NET_ADMIN, so it cannot put a route back. --keep-id is refused
 # with --job-nodes: there the network is set up only after the hook has run.
 #
-# Unlike sandbox-run.sh, $HOME is NOT bound by default here -- use --rw/--ro if you need your
-# real home directory's files. UNLIKE sandbox-run.sh, there is no credential-path masking
+# As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro on the subdirectory
+# of it that you need. UNLIKE sandbox-run.sh, there is no credential-path masking
 # here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
 # covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
 # PODMAN_ARGS below for the full story). So --rw/--ro on a path that IS or CONTAINS
 # $HOME is refused (.ssh/.aws/.git-credentials/etc. would be fully exposed), as is one that
 # contains /scratch/$USER/.agentic-sandbox. Scope --rw/--ro to the subdirectory you need.
 set -euo pipefail
+
+# Python that this script starts on the host (the csub broker, its lookup) must never import from
+# a directory the sandboxed process can write. An empty or relative PYTHONPATH entry means "the
+# working directory", so those are dropped here, once, for everything started below.
+if [[ -n "${PYTHONPATH+x}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do [[ "$_e" == /* ]] && _pp="${_pp:+$_pp:}$_e"; done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
 
 # Save the real stdin before anything backgrounds `podman run` (needed below, for the
 # catatonit watchdog) -- bash silently redirects a backgrounded job's stdin from /dev/null,
@@ -123,10 +141,14 @@ IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
 RO_PATHS=()
 RW_PATHS=()
+SCRATCH_ROOT=""   # set by --scratch: a read-write mount that is not in RW_PATHS
 ALLOW_HOSTS=()
 GPU=0
 SHM_SIZE=""
 WANT_CSUB=0
+PROTECT=1
+DRY_RUN=0
+PROTECT_VOLUMES=()
 KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
@@ -148,7 +170,8 @@ need_arg() { [[ $# -ge 2 ]] || { echo "podman-run.sh: $1 needs an argument" >&2;
 #   - $HOME, or anything above it: .ssh, .aws, tokens, shell rc files, all exposed;
 #   - /scratch/$USER or anything above it, or anything inside .agentic-sandbox: every concurrent
 #     job's state dir (config copies, a proxy socket with a different allowlist).
-# A subdirectory of $HOME is fine. Checked on the canonical path.
+# A subdirectory of $HOME is fine unless it holds credentials (see refuse_wide_mount). Checked on
+# the canonical path.
 HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
 SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
 STATE_PARENT_P="$(realpath -m -- "$SANDBOX_STATE_PARENT" 2>/dev/null || echo "$SANDBOX_STATE_PARENT")"
@@ -159,6 +182,21 @@ refuse_wide_mount() {
     echo "podman-run.sh: $1 $2: refusing to mount your home directory (or a directory above it). There is no credential masking under podman; mount the specific subdirectory you need." >&2
     exit 1
   fi
+  # Credential locations under $HOME, and any directory that contains one (~/.config holds
+  # gcloud and gh). sandbox-run.sh masks or refuses these; here nothing can hide them.
+  local c
+  for c in .ssh .aws .azure .kube .config/gcloud .docker .gnupg .config/gh .config/git .claude \
+           .cache/huggingface .config/opencode .local/share/opencode .config/containers; do
+    if [[ "$2" == "$HOME_P/$c" || "$2" == "$HOME_P/$c/"* || "$HOME_P/$c" == "$pre"* ]]; then
+      echo "podman-run.sh: $1 $2: refusing to mount a directory that is, is inside, or contains ~/$c, which holds credentials. There is no credential masking under podman; mount a directory without them." >&2
+      exit 1
+    fi
+  done
+  # The shared image store: every later job of yours on the node reads images from it.
+  if [[ "$2" == "/scratch/$USER/podman-storage" || "$2" == "/scratch/$USER/podman-storage/"* ]]; then
+    echo "podman-run.sh: $1 $2: refusing to mount the shared image store" >&2
+    exit 1
+  fi
   if [[ "$2" == "$STATE_PARENT_P" || "$STATE_PARENT_P" == "$pre"* || "$2" == "$STATE_PARENT_P/"* ]]; then
     echo "podman-run.sh: $1 $2: refusing to mount a directory that contains (or is inside) $SANDBOX_STATE_PARENT, where every concurrent job's state lives. Use --scratch, or a subdirectory of /scratch/$USER." >&2
     exit 1
@@ -167,7 +205,9 @@ refuse_wide_mount() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --image) need_arg "$@"; IMAGE="$2"; shift 2 ;;
+    --image) need_arg "$@"
+      [[ "$2" != -* ]] || { echo "podman-run.sh: --image $2: not an image name" >&2; exit 1; }
+      IMAGE="$2"; shift 2 ;;
     --ro|--rw)
       need_arg "$@"
       # Canonical, existing path: a relative or symlinked argument would otherwise be mounted
@@ -195,7 +235,9 @@ while [[ $# -gt 0 ]]; do
       need_arg "$@"
       [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || { echo "podman-run.sh: --listen takes a port from 1024 to 65535 (got '$2')" >&2; exit 1; }
       LISTEN_PORTS+=("$2"); shift 2 ;;
-    --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
+    --scratch) mkdir -p "/scratch/$USER/work"; SCRATCH_ROOT="$(realpath -e -- "/scratch/$USER/work")"; VOLUMES+=("-v" "$SCRATCH_ROOT:$SCRATCH_ROOT:rw"); shift ;;
+    --no-protect) PROTECT=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -214,22 +256,70 @@ for p in "${RO_PATHS[@]:-}"; do
     [[ -n "$p" && "$p" == "$q" ]] && { echo "podman-run.sh: $p is given as both --ro and --rw; pick one" >&2; exit 1; }
   done
 done
-# This wrapper, allowlist_proxy.py and relay.py run on the HOST. If their directory is inside a
-# read-write mount, an agent could edit them and have the edit run unsandboxed on the next
+# The mode a path has from your own mounts: that of the deepest of --ro, --rw and --scratch that
+# contains it. Prints rw, ro or nothing.
+eff_mode() {
+  local p="$1" best=-1 mode="" r d
+  for r in "${RO_PATHS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=ro; fi
+  done
+  for r in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=rw; fi
+  done
+  echo "$mode"
+}
+user_named() {  # $1 = path; true if you named exactly this path with --ro, --rw or --scratch
+  local r
+  for r in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do [[ -n "$r" && "$1" == "$r" ]] && return 0; done
+  return 1
+}
+# True if no component of the path is a symlink. A path that goes through a link is never mounted
+# by name: the name could lead out of the directory it appears to be in.
+plain_path() { [[ "$(realpath -e -- "$1" 2>/dev/null)" == "$1" ]]; }
+# Podman refuses the same destination twice, so every extra mount goes through here once.
+declare -A EXTRA_DEST=()
+extra_mount() {  # $1 = rw|ro, $2 = path, $3 = name of the array to append to
+  local -n _arr="$3"
+  [[ -z "${EXTRA_DEST[$2]:-}" ]] || return 0
+  EXTRA_DEST[$2]=1
+  _arr+=("-v" "$2:$2:$1")
+}
+
+# PYTHONPATH once more, now that the mounts are known: an absolute entry inside a directory that
+# is writable in the container is as good as the working directory to host-side Python (the csub
+# broker), so those entries are dropped too.
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do
+    [[ "$(eff_mode "$(realpath -m -- "$_e" 2>/dev/null || echo "$_e")")" == rw ]] || _pp="${_pp:+$_pp:}$_e"
+  done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
+# This wrapper, allowlist_proxy.py and relay.py run on the HOST. If their directory is writable
+# in the container, an agent could edit them and have the edit run unsandboxed on the next
 # invocation, so it is mounted read-only on top (podman orders mounts by destination depth, so
-# the deeper mount wins, as the credentials file over its config dir does). When the directory
-# IS the read-write mount there is nothing deeper to add, so that is refused.
-for q in "${RW_PATHS[@]:-}"; do
-  [[ -n "$q" ]] || continue
-  if [[ "$SCRIPT_DIR" == "$q" ]]; then
-    echo "podman-run.sh: --rw $q is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
+# the deeper mount wins). The read-only mount makes the script directory a mount point, which
+# cannot be renamed; the writable directories ABOVE it still could be, and a new checkout put
+# in their place, so each of them is mounted onto itself. When the directory IS a read-write
+# mount there is nothing deeper to add, so that is refused.
+if [[ "$(eff_mode "$SCRIPT_DIR")" == rw ]]; then
+  if user_named "$SCRIPT_DIR"; then
+    echo "podman-run.sh: --rw $SCRIPT_DIR is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
     exit 1
-  elif [[ "$SCRIPT_DIR" == "${q%/}/"* ]]; then
-    echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount ($q); mounting it read-only. Prefer running from a separate work directory." >&2
-    VOLUMES+=("-v" "$SCRIPT_DIR:$SCRIPT_DIR:ro")
-    break
   fi
-done
+  echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount; mounting it read-only. Prefer running from a separate work directory." >&2
+  _a="$(dirname "$SCRIPT_DIR")"
+  while [[ -n "$_a" && "$_a" != / ]]; do
+    if [[ "$(eff_mode "$_a")" == rw ]] && ! user_named "$_a"; then extra_mount rw "$_a" VOLUMES; fi
+    _a="$(dirname "$_a")"
+  done
+  extra_mount ro "$SCRIPT_DIR" VOLUMES
+fi
 if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   # Checked before anything is created: this is the most common early exit.
   echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
@@ -320,8 +410,9 @@ fi
 # exists as a mount point, exactly as it did when the real dir was bound. So opencode's config
 # AND data dirs use the HOME-dependent destination: default (no --keep-id) the container runs
 # as root and looks under /root/...; --keep-id runs as your real uid with $HOME=$HOME (set via
-# -e HOME below), same convention as bwrap. See ADMIN-NOTES.md's "identity/HOME saga" for why
-# forcing identity without remapping failed.
+# -e HOME below), same convention as bwrap. Forcing an identity with -e/--user
+# alone, without the user-namespace remapping of --keep-id, was tried and failed: the files under
+# the mounts then belong to an id the process does not have.
 # Per-job state directory: ONE place for everything this wrapper creates for a run --
 # podman/ (graphroot, runroot, xdg-runtime, storage.conf), cfg/ (the config copies), proxy/
 # (allowlist proxy socket + log). Mode 700, removed whole by cleanup(), nothing in /tmp.
@@ -340,13 +431,14 @@ JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDE
 # or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
 mkdir "$JOB_DIR" || { echo "podman-run.sh: per-job state dir $JOB_DIR already exists; remove it (podman unshare rm -rf) if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
+RECORD_START="$(date +%Y-%m-%dT%H:%M:%S%z)"; : > "$JOB_DIR/.start"   # for the per-job record
 JOB_STORAGE_DIR="$JOB_DIR/podman"
 # Removed on every exit from here on. The cfg/ copies below include ~/.claude.json (account
 # details), so an exit between here and the full cleanup() further down (a failed image pull,
 # say) must not leave them on /scratch. Plain rm is enough on those paths: nothing has run
 # against the per-job store yet, so there is no container, pause process or subuid-owned
 # layer to tear down. cleanup() replaces this trap once there can be.
-early_cleanup() { rm -rf "$JOB_DIR"; true; }
+early_cleanup() { rm -rf "$JOB_DIR" 2>/dev/null || true; }
 trap early_cleanup EXIT
 # bash does NOT run EXIT traps when killed by an untrapped fatal signal, and that is exactly
 # how LSF ends over-walltime jobs (SIGUSR2/SIGTERM before SIGKILL) and how `bkill` works --
@@ -391,7 +483,10 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   new_cfg_root
   OPENCODE_CFG="$SANDBOX_CFG_ROOT/opencode-config"
   if [[ -d "$HOME/.config/opencode" ]]; then
-    cp -R "$HOME/.config/opencode" "$OPENCODE_CFG"
+    # -H: if ~/.config/opencode is itself a symlink (a dotfile manager), copy what it points to.
+    # A plain -R copies the link, and the "copy" bound into the container is then the real
+    # directory, read-write: exactly what the copy exists to prevent.
+    cp -RH "$HOME/.config/opencode" "$OPENCODE_CFG"
   else
     mkdir -p "$OPENCODE_CFG"
   fi
@@ -434,7 +529,7 @@ chmod 700 "$JOB_STORAGE_DIR/xdg-runtime"
 
 # The prologue calls below (migrate / info / pull) run against the SHARED store with
 # XDG_RUNTIME_DIR UNSET, so podman derives its libpod tmp dir from its stable default
-# (${TMPDIR:-/tmp}/podman-run-<uid>/libpod/tmp), NOT from this job's xdg-runtime dir. This
+# (<runtime dir>/libpod/tmp, see shared_runtime_dir below), NOT from this job's xdg-runtime dir. This
 # matters far more than it looks: podman records the tmp dir in the store's own database
 # (DBConfig.TmpDir) the first time it initializes that store, and every later invocation
 # that doesn't pass --tmpdir explicitly silently ADOPTS the recorded value. Confirmed live on
@@ -459,7 +554,8 @@ unset XDG_RUNTIME_DIR
 # here, before the prologue, to heal a node an earlier job left in that state, and in the
 # sweep itself right after the kill. A live pid (a sibling's pause) is never touched.
 shared_runtime_dir() {
-  local d="/run/user/$(id -u)"
+  local d
+  d="/run/user/$(id -u)"
   if [[ -d "$d" && -O "$d" ]]; then echo "$d"; else echo "${TMPDIR:-/tmp}/storage-run-$(id -u)"; fi
 }
 SHARED_RUNTIME_DIR="$(shared_runtime_dir)"
@@ -467,7 +563,10 @@ SHARED_PAUSE_PIDFILE="$SHARED_RUNTIME_DIR/libpod/tmp/pause.pid"
 remove_stale_shared_pause_pidfile() {
   local p
   [[ -f "$SHARED_PAUSE_PIDFILE" ]] || return 0
-  p="$(cat "$SHARED_PAUSE_PIDFILE" 2>/dev/null)"
+  # `|| return 0`: a sibling job on this node can remove the file between the test above and
+  # this read. Under `set -e` the failed read would end the script with status 1: at start,
+  # before the command ever ran, or in the exit trap, replacing the command's own status.
+  p="$(cat "$SHARED_PAUSE_PIDFILE" 2>/dev/null)" || return 0
   if [[ -n "$p" ]] && ! kill -0 "$p" 2>/dev/null; then
     rm -f "$SHARED_PAUSE_PIDFILE"
     echo "podman-run.sh: removed stale shared pause pid file ($SHARED_PAUSE_PIDFILE -> dead pid $p)" >&2
@@ -477,11 +576,13 @@ remove_stale_shared_pause_pidfile() {
 remove_stale_shared_pause_pidfile
 
 # Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
-# used the shared graphroot (Janelia's Harbor fork documents this). Cheap and harmless when
-# there's nothing to migrate. CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
+# used the shared graphroot (Janelia's Harbor fork documents this). It stops the containers of that
+# store, so it runs only when the store does not answer (see below). CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
 # these prologue calls must see the SHARED store from ~/.config/containers/storage.conf, both
 # to health-check it and to read its graphroot for the cache reference below.
-podman system migrate 2>/dev/null || true
+# Only when the store does not answer: `podman system migrate` stops the containers of that store,
+# so running it at every start could stop one that you run on the node yourself.
+podman info >/dev/null 2>&1 || podman system migrate 2>/dev/null || true
 # Do NOT `podman system reset -f` the shared store on a failed `podman info` here: this
 # script deliberately runs multiple podman jobs concurrently on one node, so that store may
 # be in active use by a sibling job's additionalimagestores right now. Resetting it out from
@@ -490,13 +591,11 @@ podman system migrate 2>/dev/null || true
 # defensive: the shared graphroot lives under /scratch, which is swept on a periodic cleanup
 # cron that can delete blobs out from under a live store's metadata DB, so `podman info`
 # genuinely can go unhealthy mid-run through no fault of any job here.
-SHARED_STORE_HEALTHY=1
 SHARED_GRAPHROOT=""
 if podman info >/dev/null 2>&1; then
-  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
+  SHARED_GRAPHROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)" || SHARED_GRAPHROOT=""
 else
   echo "podman-run.sh: shared podman store looks unhealthy on $(hostname) -- skipping its image cache for this invocation rather than resetting a store a sibling job may be using" >&2
-  SHARED_STORE_HEALTHY=0
 fi
 
 # Repair a shared-store DB already stamped with some job's per-job tmp dir by an earlier
@@ -517,7 +616,9 @@ fi
 repair_shared_store_tmpdir() {
   local db="$1/db.sql" want="$SHARED_RUNTIME_DIR/libpod/tmp"
   [[ -f "$db" ]] || return 0
-  python3 - "$db" "$want" "/scratch/$USER/podman-jobs/" "$SANDBOX_STATE_PARENT/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
+  # -I: this runs on the host from the working directory, which the agent may be able to write
+  # (ssh-entry.sh --podman starts there); without it a planted sqlite3.py would run outside.
+  python3 -I - "$db" "$want" "/scratch/$USER/podman-jobs/" "$SANDBOX_STATE_PARENT/" <<'REPAIR' 2>&1 | sed 's/^/podman-run.sh: /' >&2
 import sqlite3, sys
 db, want = sys.argv[1:3]
 bad_prefixes = tuple(sys.argv[3:])
@@ -541,7 +642,7 @@ REPAIR
 # (before CONTAINERS_STORAGE_CONF is exported) so the pull warms the node-local cache that
 # every sibling job reads through additionalimagestores. Skipped for a purely local image
 # (localhost/...), which has no registry to check against.
-if [[ "$IMAGE" != localhost/* ]]; then
+if [[ "$IMAGE" != localhost/* && $DRY_RUN -eq 0 ]]; then
   # stdout to stderr: `podman pull` prints the image ID on stdout, which would otherwise be the
   # first line of the sandboxed command's output.
   podman --events-backend=none pull "$IMAGE" >&2 || true
@@ -556,7 +657,7 @@ fi
 # healthy), so this doesn't cost a re-pull for another job landing on the SAME node --
 # confirmed live: two concurrent invocations both saw the already-pulled image instantly and
 # ran to completion with no collision. (If storage.conf's graphroot is under /scratch, per the
-# README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
+# SETUP.md §3, that cache is node-local scratch, not cluster-wide -- a job that
 # lands on a different node still pays a fresh pull regardless of this mechanism.)
 cat > "$JOB_STORAGE_DIR/storage.conf" <<STORAGECONF
 [storage]
@@ -621,8 +722,13 @@ kill_orphaned_catatonit_for_this_job() {
   for pid in $(pgrep -u "$USER" -x catatonit 2>/dev/null); do
     [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "1" ]] || continue
     if grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null \
-       || grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null; then
-      kill -9 "$pid" 2>/dev/null
+       || { grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null \
+            && grep -azq "^LSB_JOBINDEX=${LSB_JOBINDEX:-0}\$" "/proc/$pid/environ" 2>/dev/null; }; then
+      # The elements of an array job share LSB_JOBID, so the index is matched too: without it
+      # every element's watchdog killed its siblings' pause processes. `|| true`: the process
+      # may be gone between pgrep and here, and a failed kill must not end the caller (the
+      # watchdog subshell, or the EXIT trap in the middle of cleanup).
+      kill -9 "$pid" 2>/dev/null || true
     fi
   done
   # The shared pause we may just have killed leaves a pid file podman 5.8 can't get past --
@@ -639,22 +745,38 @@ kill_orphaned_catatonit_for_this_job() {
 # here, not left to the user's containers.conf, so it cannot be forgotten. --events-backend=none
 # (a global option, so it sits before the subcommand on each call that would emit events: pull,
 # run, rm) does the same for podman's container create/start/died events.
-PODMAN_ARGS=(--rm --log-driver=none)
+# --http-proxy=false: podman otherwise copies the host's http_proxy/https_proxy/no_proxy into the
+# container, credentials in the URL included, and nothing else of the host environment goes in.
+# (With --host-net as well: a worker talks to the job's nodes directly, and the node's proxy
+# settings are not its business.)
+PODMAN_ARGS=(--rm --log-driver=none --http-proxy=false)
+# The mounts of a multi-node worker go into VOLUMES like every other mount, once per destination
+# (podman refuses the same destination twice, and orders mounts by destination depth itself).
+net_mount() {  # $1 = source, $2 = destination; read-only
+  if user_named "$2"; then
+    echo "podman-run.sh: $2 is mounted by this wrapper for a multi-node worker; leave it out of --ro/--rw" >&2
+    exit 1
+  fi
+  [[ -z "${EXTRA_DEST[$2]:-}" ]] || return 0
+  EXTRA_DEST[$2]=1
+  VOLUMES+=("-v" "$1:$2:ro")
+}
 if [[ $WANT_HOSTNET -eq 1 ]]; then
   # The node's network namespace. podman then binds the node's /sys read-only, which is where
   # NCCL reads the network card's details (without them it runs about a quarter slower).
   # The node's own /etc/hosts, too: podman otherwise adds "host.containers.internal" for the
   # node's address, the node's name then reverse-resolves to that, and torchrun hands that name
   # to the other nodes as the master's, where it means themselves.
-  PODMAN_ARGS+=(--network=host --no-hosts -v /etc/hosts:/etc/hosts:ro)
+  PODMAN_ARGS+=(--network=host --no-hosts)
+  net_mount /etc/hosts /etc/hosts
 elif [[ $WANT_JOBNET -eq 1 ]]; then
   # pasta, with the options written to a per-job containers.conf just before the launch (the
   # forwarding option contains commas, which --network=pasta:opt,opt would split). The hook
   # narrows the routes; /etc/hosts names the job's nodes, since no DNS server is reachable.
   mkdir "$JOB_DIR/hooks"
   { echo "127.0.0.1 localhost"; printf '%s' "$JOBNET_HOSTS_TEXT"; } > "$JOB_DIR/hosts"
-  PODMAN_ARGS+=(--network=pasta --hooks-dir "$JOB_DIR/hooks" --hostname "$(hostname)" --no-hosts
-                -v "$JOB_DIR/hosts:/etc/hosts:ro")
+  PODMAN_ARGS+=(--network=pasta --hooks-dir "$JOB_DIR/hooks" --hostname "$(hostname)" --no-hosts)
+  net_mount "$JOB_DIR/hosts" /etc/hosts
 else
   PODMAN_ARGS+=(--network=none)
 fi
@@ -664,7 +786,7 @@ if [[ $WANT_IB -eq 1 ]]; then
   # that one directory comes from the node. (--host-net already has the node's whole /sys.)
   PODMAN_ARGS+=(--device /dev/infiniband)
   if [[ $WANT_HOSTNET -eq 0 && -d /sys/class/infiniband_verbs ]]; then
-    PODMAN_ARGS+=(-v /sys/class/infiniband_verbs:/sys/class/infiniband_verbs:ro)
+    net_mount /sys/class/infiniband_verbs /sys/class/infiniband_verbs
   fi
 fi
 # Without -i, podman leaves stdin closed -- an interactive shell/TUI inside hits EOF and
@@ -694,6 +816,150 @@ if [[ $KEEP_ID -eq 1 ]]; then
   PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
 fi
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
+
+# Each --ro/--rw path was made physical and checked when the arguments were read. Minutes can pass
+# before the container starts (the image pull); recheck_paths looks once more, so that a
+# directory swapped for a symlink in between is not mounted under the name that was checked.
+dry_run_print() {  # $1 = a note about how the command is wrapped, or empty
+  echo "podman-run.sh: dry run. Nothing was started and no image was pulled. A real run would do this:"
+  if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+    echo; echo "On the host, the allowlist proxy:"
+    printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo
+  fi
+  if [[ $WANT_CSUB -eq 1 ]]; then
+    echo; echo "On the host, the csub broker:"
+    echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
+  fi
+  if [[ $WANT_JOBNET -eq 1 ]]; then
+    echo; echo "On the host, started by podman for this container: the network relay (pasta), with these options:"
+    echo "  $JOBNET_PASTA_OPTS"
+    echo "and, before the command starts, the hook that replaces the routes inside with one host route per other node of the job (${JOBNET_PEERS:-none}):"
+    echo "  $SCRIPT_DIR/jobnet-hook.sh $JOB_DIR $JOBNET_IF $JOBNET_PEERS"
+    echo "Ports open to the job's other nodes: $JOBNET_LO-$JOBNET_HI${LISTEN_PORTS[*]:+ and ${LISTEN_PORTS[*]}}."
+  fi
+  [[ $WANT_HOSTNET -eq 1 ]] && { echo; echo "The network: the node's own (--host-net); no helper is started."; }
+  echo; echo "The container:"
+  printf '  podman --events-backend=none run'; printf ' %q' "${PODMAN_ARGS[@]}" "$IMAGE"
+  [[ -n "$1" ]] && printf ' %s' "$1"
+  printf ' %q' "${CMD[@]}"; echo
+  echo; echo "Per-job state would be in $JOB_DIR (removed at exit)."
+}
+recheck_paths() {
+  local p
+  for p in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$(realpath -e -- "$p" 2>/dev/null)" != "$p" ]]; then
+      echo "podman-run.sh: $p changed while the sandbox was being set up (it is no longer the directory that was checked); not starting" >&2
+      exit 1
+    fi
+  done
+  return 0
+}
+
+# ---- Files that run later ------------------------------------------------------------------
+# Some files in a project are not the work product but instructions to tools: git runs
+# .git/hooks and what .git/config names (core.hooksPath, core.fsmonitor, aliases, an ssh command),
+# Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
+# .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
+# you, outside the sandbox, the next time you use git or open the project. So where they exist
+# in a directory that is writable in the container, they are mounted read-only, unless
+# --no-protect is given.
+#   - Their parents (.git, .claude) are mounted onto themselves first. That makes them mount
+#     points, which the kernel refuses to rename or remove: without it the process could move
+#     .git aside and build a new one with its own hooks.
+#   - Only what exists at start can be mounted. Names that are absent are remembered, and the
+#     ones that appear during the run are reported at exit (see report_new_config). That includes
+#     .git/commondir and .git/config.worktree, which redirect git to another configuration.
+#   - A name that is a symlink, or lies behind one, is not mounted (see plain_path) and is named
+#     in a note at start.
+#   - A path you named yourself with --ro or --rw keeps the mode you gave it.
+#   - Only directly under each read-write directory.
+PROTECT_PINS=(.git .claude)
+PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
+              .vscode .devcontainer .husky .codex .opencode)
+PROTECT_FILES=(.git/config .git/commondir .git/config.worktree .mcp.json .claude/settings.json
+               .claude/settings.local.json .pre-commit-config.yaml opencode.json)
+PROTECTED=()   # what was mounted read-only, for the in-sandbox README
+WATCHED=()     # absent at start; reported if present at exit
+LINKED=()      # not mounted because a symlink is involved
+declare -A PROTECT_SEEN=()
+protect_one() {  # $1 = dir|file, $2 = path
+  local p="$2"
+  [[ -z "${PROTECT_SEEN[$p]:-}" ]] || return 0
+  PROTECT_SEEN[$p]=1
+  user_named "$p" && return 0
+  [[ "$(eff_mode "$p")" == rw ]] || return 0
+  if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then LINKED+=("$p"); return 0; fi
+  if [[ ! -e "$p" ]]; then WATCHED+=("$p"); return 0; fi
+  if { [[ "$1" == dir && -d "$p" ]] || [[ "$1" == file && -f "$p" ]]; }; then
+    extra_mount ro "$p" PROTECT_VOLUMES; PROTECTED+=("$p")
+  fi
+  return 0
+}
+protect_root() {  # $1 = a directory that is writable in the container
+  local root="${1%/}" x p hp part skip=" "
+  [[ -d "$root" ]] || return 0
+  for x in "${PROTECT_PINS[@]}"; do
+    p="$root/$x"
+    if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then
+      LINKED+=("$p"); skip+="$x "
+    elif [[ -d "$p" ]]; then
+      if [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then extra_mount rw "$p" PROTECT_VOLUMES; fi
+    elif [[ -f "$p" ]]; then
+      protect_one file "$p"; skip+="$x "       # .git as a file: a worktree or submodule pointer
+    else
+      # Not there yet (.git before a clone or `git init`): watched as one name, so that a new
+      # repository is reported once and not once per file inside it.
+      [[ "$(eff_mode "$p")" == rw ]] && WATCHED+=("$p")
+      skip+="$x "
+    fi
+  done
+  for x in "${PROTECT_DIRS[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one dir "$root/$x"; done
+  for x in "${PROTECT_FILES[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one file "$root/$x"; done
+  # A hooks directory named in .git/config. git itself reads the file (from /, so that no
+  # repository on the host is consulted); the value is the sandboxed process's to write, so it is
+  # used only as a plain relative path inside this directory, and each directory on the way to
+  # it is pinned like .git.
+  if [[ "$skip" != *" .git "* && -f "$root/.git/config" ]] && command -v git >/dev/null 2>&1; then
+    hp="$(cd / && git config --file "$root/.git/config" --includes --get core.hooksPath 2>/dev/null || true)"
+    hp="${hp%/}"
+    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "$hp" != . && "/$hp/" != */../* && "/$hp/" != */./* && "$hp" != *$'\n'* ]]; then
+      p="$root"
+      while [[ "$hp" == */* ]]; do
+        part="${hp%%/*}"; hp="${hp#*/}"; p="$p/$part"
+        if [[ -d "$p" && ! -L "$p" ]] && plain_path "$p" && [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then extra_mount rw "$p" PROTECT_VOLUMES; fi
+      done
+      protect_one dir "$p/$hp"
+    fi
+  fi
+  return 0
+}
+report_new_config() {  # at exit: which of the watched names did the command create?
+  local x new=()
+  for x in ${WATCHED[@]+"${WATCHED[@]}"}; do [[ -e "$x" || -L "$x" ]] && new+=("$x"); done
+  [[ ${#new[@]} -gt 0 ]] || return 0
+  echo "podman-run.sh: the command created files that tools run or load outside the sandbox. Review them before you use git, an editor or an agent in that directory:" >&2
+  printf '  %s\n' "${new[@]}" >&2
+  return 0
+}
+if [[ $PROTECT -eq 1 ]]; then
+  for root in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do [[ -n "$root" ]] && protect_root "$root"; done
+  [[ ${#PROTECT_VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${PROTECT_VOLUMES[@]}")
+  if [[ ${#LINKED[@]} -gt 0 ]]; then
+    echo "podman-run.sh: note: not protected, because a symlink is involved: ${LINKED[*]}" >&2
+  fi
+  # With .git/config read-only, `git config user.name ...` fails inside. Pass your identity in
+  # the variables git reads, so that commits still work (read from /, so that no repository's
+  # configuration is consulted on the host). A name already in your environment wins.
+  if command -v git >/dev/null 2>&1; then
+    _gn="$(cd / && git config --global --get user.name 2>/dev/null || true)"
+    _ge="$(cd / && git config --global --get user.email 2>/dev/null || true)"
+    _gn="${GIT_AUTHOR_NAME:-$_gn}"; _ge="${GIT_AUTHOR_EMAIL:-$_ge}"
+    [[ -n "$_gn" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_NAME=$_gn" -e "GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-$_gn}")
+    [[ -n "$_ge" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_EMAIL=$_ge" -e "GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-$_ge}")
+    unset _gn _ge
+  fi
+fi
 [[ ${#ENV_ARGS[@]} -gt 0 ]] && PODMAN_ARGS+=("${ENV_ARGS[@]}")
 
 # NOTE: an earlier version of this script attempted to mask credential paths under $HOME
@@ -736,14 +1002,73 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c 'DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -cE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE 'DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $3}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $NF}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
+
+# ---- The per-job record -----------------------------------------------------------------------
+# What the sandboxed command reached, kept where it cannot touch it: every host the proxy allowed
+# or refused, with the time, and the csub jobs recorded while the sandbox ran. One small file per
+# run under ~/.agentic-sandbox/records/<date>/, written at exit, and only when there is something
+# to record (a run without --allow and --csub has nothing). $HOME is not bound into the sandbox,
+# so a later run cannot rewrite an earlier record. SANDBOX_RECORD=off turns it off.
+record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started (best effort)
+  local policy="$HOME/.config/csub/broker.toml" state w prev=""
+  for w in ${CSUB_BROKER:-}; do [[ "$prev" == --policy ]] && policy="$w"; prev="$w"; done
+  state="$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$policy" 2>/dev/null | head -1)"
+  state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
+  [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
+  find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200
+}
+write_record() {  # $1 = exit status of the command
+  [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
+  local plog="" jobs="" dir file
+  [[ -n "${PROXY_DIR:-}" && -s "$PROXY_DIR/proxy.log" ]] && grep -qE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$PROXY_DIR/proxy.log" 2>/dev/null && plog="$PROXY_DIR/proxy.log"
+  [[ ${WANT_CSUB:-0} -eq 1 ]] && jobs="$(record_csub_jobs)"
+  [[ -n "$plog" || -n "$jobs" ]] || return 0
+  dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 700 "$HOME/.agentic-sandbox" "$HOME/.agentic-sandbox/records" 2>/dev/null || true
+  file="$dir/${JOB_DIR##*/}.log"
+  {
+    echo "agentic-sandbox record (podman-run.sh)"
+    echo "started:   ${RECORD_START:-unknown}"
+    echo "ended:     $(date +%Y-%m-%dT%H:%M:%S%z)"
+    echo "job:       ${LSB_JOBID:-none}${LSB_JOBINDEX:+ index $LSB_JOBINDEX} on $(hostname -s) as $USER"
+    echo "directory: $PWD"
+    echo "command:   $(printf '%q ' "${CMD[@]}" | cut -c1-600)"
+    echo "exit:      $1"
+    echo "allowed hosts: ${ALLOW_HOSTS[*]:-none}"
+    echo
+    echo "## Network (every request the proxy saw)"
+    if [[ -n "$plog" ]]; then
+      grep -E '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog" | sed 's/^\[allowlist_proxy\] //; s/ (peer=[^)]*)$//' | head -5000
+      [[ "$(grep -cE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog")" -le 5000 ]] || echo "(more than 5000 lines; the rest is not kept)"
+    else
+      echo "none"
+    fi
+    if [[ ${WANT_CSUB:-0} -eq 1 ]]; then
+      echo
+      echo "## csub jobs recorded while this sandbox ran"
+      echo "(taken from csub's own state directory; refused requests are not recorded there, and"
+      echo " other sandboxes of yours running at the same time appear here too)"
+      if [[ -n "$jobs" ]]; then echo "$jobs"; else echo "none"; fi
+    fi
+  } > "$file" 2>/dev/null || true
+  return 0
+}
 cleanup() {
   local rc=$?   # the script's exit status on entry; see the denied-host summary below
+  # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
+  # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
+  trap '' TERM INT USR2
+  # --job-nodes: the lock on the node's port blocks, if the exit came while it was still held
+  # (it is normally released as soon as the container's network is up). Other sandboxes starting
+  # on this node wait for it, and the rest of this function can take a while.
+  [[ ${JOBNET_LOCKED:-0} -eq 1 ]] && exec 9>&-
   # IMPORTANT: this function's own LAST command's exit status becomes the script's real exit
   # code, silently overriding whatever `exit N` triggered it -- bash only honors the original
   # N if the EXIT trap itself doesn't leave a nonzero status behind. Confirmed live: an
@@ -755,6 +1080,8 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   # Only when the sandboxed command did not succeed (same reasoning as in sandbox-run.sh).
   [[ $rc -ne 0 ]] && summarize_proxy_denials
+  declare -F report_new_config >/dev/null && report_new_config
+  write_record "$rc"
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -767,6 +1094,13 @@ cleanup() {
   # the user's SHARED store and remove every container they own on the node).
   if [[ -n "${CONTAINERS_STORAGE_CONF:-}" ]]; then
     podman --events-backend=none rm -f --all --time 10 >/dev/null 2>&1 || true
+  fi
+  # The copies of the agent configuration (cfg/ holds ~/.claude.json) go first, before the slower
+  # teardown below: a job that is killed part-way through cleanup must not leave them. Through
+  # `podman unshare` as well, because a root process in the container can leave entries there
+  # owned by a sub-uid that a plain rm cannot remove.
+  if [[ -n "${JOB_DIR:-}" && -d "$JOB_DIR/cfg" ]]; then
+    podman unshare rm -rf "$JOB_DIR/cfg" 2>/dev/null || rm -rf "$JOB_DIR/cfg" 2>/dev/null || true
   fi
 
   # The watchdog below should already have reaped any lingering catatonit for this job by the
@@ -807,7 +1141,7 @@ cleanup() {
   # xdg-runtime/libpod/tmp (alive, alive.lck, exits/, persist/, rootless-netns/ -- all owned by
   # the invoking user, all trivially removable a minute later), leaving that subtree behind.
   for _ in $(seq 1 5); do
-    rm -rf "$JOB_DIR" 2>/dev/null
+    rm -rf "$JOB_DIR" 2>/dev/null || true   # a busy subtree must not end the trap: retry below
     [[ -e "$JOB_DIR" ]] || break
     sleep 1
     kill_orphaned_catatonit_for_this_job
@@ -832,7 +1166,19 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   fi
   CSUB_PY="$(dirname "$(command -v "${CSUB_BROKER%% *}")")/python3"
   [[ -x "$CSUB_PY" ]] || CSUB_PY=python3
-  CSUB_SITE="$("$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Host-side Python must never import from the working directory: that is the directory the
+  # agent can write, and a csub.py or json.py planted there would run OUTSIDE the sandbox, as
+  # you, on the next start. `python -c` and `python -` put the current directory first on the
+  # module path, so the csub lookup runs from / (not -I: a csub installed with `pip --user` or
+  # found through PYTHONPATH must still be found), and a broker given in the `python -m ...` form
+  # is started from / as well. The usual csub-broker console script is not affected (its module
+  # path starts at its own bin directory) and keeps the working directory.
+  CSUB_SITE="$(cd / && "$CSUB_PY" -c 'import csub, os; print(os.path.dirname(os.path.dirname(csub.__file__)))' 2>/dev/null || true)"
+  # Only the csub-broker console script keeps the working directory (its module path starts at
+  # its own bin directory, and a relative --policy in the command must still resolve). Every
+  # other form (python -m, env python3 -m, uv run, a wrapper script) is started from /.
+  CSUB_BROKER_CWD=/
+  [[ "$(basename -- "${CSUB_BROKER%% *}")" == csub-broker ]] && CSUB_BROKER_CWD=.
   if [[ -z "$CSUB_SITE" || ! -d "$CSUB_SITE/csub" ]]; then
     echo "podman-run.sh: --csub: cannot locate the csub package next to $CSUB_BROKER" >&2
     exit 1
@@ -847,7 +1193,15 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # host's). csub rejects overlapping mounts, so a path nested under another listed path is dropped.
   declare -A _mmode=()
   _paths=()
-  _add_mount() { [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"; }
+  _add_mount() {
+    # The list is handed on as path:mode,path:mode. A comma or colon inside a path would be read
+    # as a separator and put a directory this sandbox does not have into the envelope.
+    if [[ "$1" == *,* || "$1" == *:* ]]; then
+      echo "podman-run.sh: --csub: '$1' contains a comma or a colon, which the mount list passed to csub cannot carry; use a path without them" >&2
+      exit 1
+    fi
+    [[ -n "${_mmode[$1]+x}" ]] || _paths+=("$1"); _mmode[$1]="$2"
+  }
   for p in "${RO_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" ro; done
   for p in "${RW_PATHS[@]:-}"; do [[ -n "$p" && "$p" != "$HOME_P" && "$p" != "$HOME_P/"* && "$p" != /scratch/* ]] && _add_mount "$p" rw; done
   # A read-only mount inside a read-write one cannot be expressed to csub (the nested entry is
@@ -880,6 +1234,11 @@ if [[ $WANT_CSUB -eq 1 ]]; then
     for e in "${_pre[@]}"; do
       [[ -n "$e" ]] || continue
       ep="${e%:*}"; em="${e##*:}"; [[ "$em" == "$ep" ]] && em=rw
+      # Compared as text below, so "/proj/../other" must not pass for something under /proj.
+      if [[ "$ep" != /* || "/$ep/" == */../* || "/$ep/" == */./* ]]; then
+        echo "podman-run.sh: --csub: CSUB_MOUNTS entry '$e' is not a plain absolute path" >&2
+        exit 1
+      fi
       ok=0
       for d in "${_der[@]:-}"; do
         [[ -n "$d" ]] || continue
@@ -903,7 +1262,7 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   # was previously a warning that an unattended run never reads.
   CSUB_ENV_ARGS=()
   if [[ "${CSUB_ENVELOPE:-on}" != off ]]; then
-    if ! $CSUB_BROKER --help 2>&1 | grep -q -- --envelope-mount; then
+    if ! (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER --help) 2>&1 | grep -q -- --envelope-mount; then
       echo "podman-run.sh: --csub: this csub-broker has no --envelope-mount (needs csub with #13), so requests would be bounded by the policy only. Upgrade csub, or set CSUB_ENVELOPE=off to accept that." >&2
       exit 1
     fi
@@ -917,12 +1276,14 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "podman-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK" > "$CSUB_DIR/broker.log" 2>&1 &
-  CSUB_PID=$!
-  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
-  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  if [[ $DRY_RUN -eq 0 ]]; then
+    (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
+    CSUB_PID=$!
+    wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+    # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+    echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  fi
   # Only the csub package (and tomli, which it needs on a python without tomllib, i.e. the
   # image's 3.10) go into the container, under a directory of their own -- not the whole host
   # venv site-packages: that put a python-3.9 venv's pip, setuptools and friends ahead of the
@@ -1004,7 +1365,7 @@ write_sandbox_readme() {
       echo "  then \`csub status\`, \`csub logs <id>\`, \`csub kill <id>\`. A child's output lands in <cwd>/.csub/jobs/<id>/stdout and stderr."
       echo "- Jobs are refused with a policy_violation error when they ask for something the policy does not allow. Read the message and adjust; do not probe or guess."
       if [[ -n "${CSUB_PROBE_JSON:-}" && -s "$CSUB_PROBE_JSON" ]]; then
-        python3 - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
+        python3 -I - "$CSUB_PROBE_JSON" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     p = json.load(open(sys.argv[1]))
@@ -1044,6 +1405,10 @@ PY
     echo
     [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
     [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; name the model explicitly: \`--model ${SANDBOX_OPENCODE_MODEL:-litellm/kimi-k3}\` (or \`-m\`)."
+    if [[ ${#PROTECTED[@]} -gt 0 ]]; then
+      echo "- These are read-only here, because tools run or load them later outside the sandbox: ${PROTECTED[*]}. Do not try to change, move or replace them. \`git config\` in such a repository fails; commits work, your git identity is already set in GIT_AUTHOR_* and GIT_COMMITTER_*. If the task needs one of them changed, say so in your answer and the user will do it."
+    fi
+    [[ $PROTECT -eq 1 ]] && echo "- If you create .mcp.json, .vscode, .claude/ settings, git hooks or similar files, the user is told at exit."
     echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
     echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
   } > "$SANDBOX_README_FILE"
@@ -1061,10 +1426,14 @@ PY
 # container would stay held until the container ended, and a second sandbox on the node would
 # wait that long.
 JOBNET_LOCKED=0
+JOBNET_PASTA_OPTS=""
 if [[ $WANT_JOBNET -eq 1 ]]; then
-  exec 9> "$SANDBOX_STATE_PARENT/net.lock"
-  flock 9
-  JOBNET_LOCKED=1
+  # (Not in a dry run, which starts nothing and binds no port.)
+  if [[ $DRY_RUN -eq 0 ]]; then
+    exec 9> "$SANDBOX_STATE_PARENT/net.lock"
+    flock 9
+    JOBNET_LOCKED=1
+  fi
   # Ports other nodes may connect to: a block of 2000 below the node's own range for outgoing
   # connections, so that nothing on the node hands one out by chance. Ports already listening
   # on the node are left out. A block that is mostly taken belongs to another sandbox on this
@@ -1087,6 +1456,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     [[ "$port" -ge "$JOBNET_LO" && "$port" -le "$JOBNET_HI" ]] || _opts+=", \"-t\", \"$JOBNET_MYIP/$port\""
   done
   _opts+=", \"-u\", \"none\", \"-T\", \"none\", \"-U\", \"none\", \"--no-map-gw\""
+  JOBNET_PASTA_OPTS="$_opts"
   printf '[network]\ndefault_rootless_network_cmd = "pasta"\npasta_options = [%s]\n' "$_opts" > "$JOB_DIR/containers.conf"
   _hargs="\"jobnet-hook.sh\", \"$JOB_DIR\", \"$JOBNET_IF\""
   for a in $JOBNET_PEERS; do _hargs+=", \"$a\""; done
@@ -1108,16 +1478,22 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_DIR="$JOB_DIR/proxy"
   mkdir -p "$PROXY_DIR"
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
-  python3 "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
+  # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
+  # standard library only, and it runs on the host from a directory the agent may be able to write.
+  if [[ $DRY_RUN -eq 0 ]]; then
+  python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Bounded, fail-closed wait, as in sandbox-run.sh (a fixed sleep raced the interpreter start).
   wait_for_proxy_socket "$PROXY_SOCK" "$PROXY_PID" || exit 1
+  fi
   PODMAN_ARGS+=(
     -v "$SCRIPT_DIR/relay.py:/opt/relay.py:ro"
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
   # The relay is waited for (up to 5s of connect attempts via bash's /dev/tcp), not slept on.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "(a small shell that starts the relay, sets the proxy variables and runs:)"; exit 0; fi
+  recheck_paths
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
     for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/'"$RELAY_PORT"') 2>/dev/null && break; sleep 0.1; done
@@ -1127,6 +1503,9 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print ""; exit 0; fi
+  recheck_paths
+  # 9>&-: the --job-nodes lock (see above) is not handed to podman and the container.
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 9>&- &
 fi
 PODMAN_PID=$!
@@ -1160,9 +1539,8 @@ WATCHDOG_PID=$!
 
 EXIT_CODE=0
 wait "$PODMAN_PID" || EXIT_CODE=$?
-# `|| true`: the watchdog has already gone when podman finished before it first looked (a very
-# short command), and under `set -e` a failed kill would end the script here with status 1
-# instead of the command's own.
+# `|| true`: the watchdog ends by itself once podman is gone, and it can get there first. Under
+# `set -e` a failed kill would end the script here with status 1 instead of the command's own.
 kill "$WATCHDOG_PID" 2>/dev/null || true
 wait "$WATCHDOG_PID" 2>/dev/null || true
 exit "$EXIT_CODE"

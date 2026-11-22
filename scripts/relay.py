@@ -11,6 +11,10 @@ instead of needing unix-socket-proxy support (inconsistent across tools).
 Quiet on success: the wrapper waits for the port itself, and anything printed
 here lands on the sandboxed command's stderr. Failures are still reported.
 
+Why Python and not socat: socat is not installed on the compute nodes, and it could
+replace only this relay, never the allowlist proxy. Worth another look if this relay
+ever proves unreliable.
+
 Usage:
     python3 relay.py 127.0.0.1 8080 /run/proxy.sock
 """

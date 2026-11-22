@@ -10,7 +10,7 @@
 #
 # User-agnostic: uses $USER/$HOME/$(whoami) throughout, no hardcoded account names.
 # --keep-id tests require a /etc/subuid//etc/subgid range wider than the invoking account's
-# real GID -- see ADMIN-NOTES.md's "--userns=keep-id, revisited" section if those fail. The
+# real GID -- if those fail, the account's subuid/subgid range is too small (SETUP.md §3). The
 # --csub section runs only when csub-broker is on PATH and CSUB_TEST_ROOT is set. Whatever is
 # skipped is counted in the summary line.
 set -uo pipefail
@@ -27,6 +27,20 @@ cleanup_tests() { cd /; rm -rf "$TR" ${EXTRA_CLEANUP[@]+"${EXTRA_CLEANUP[@]}"}; 
 trap cleanup_tests EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Files an agent could leave in its working directory so that the wrapper's own host-side Python
+# imports them on the next start, outside the sandbox. Each writes a marker next to itself when
+# it is imported; the marker must never appear.
+plant_modules() {  # $1 = directory
+  local m
+  for m in csub json sqlite3 os; do
+    printf '%s\n' 'import sys' "open(__file__ + '.RAN', 'a').write('imported outside the sandbox\\n')" 'sys.exit(99)' > "$1/$m.py"
+  done
+}
+
+# The per-job record goes to ~/.agentic-sandbox/records. Off for the suite, so that a run does not
+# leave a file there for every --allow test; the section that tests the record turns it on.
+export SANDBOX_RECORD=off
 
 PASS=0
 FAIL=0
@@ -130,10 +144,10 @@ s_5() {
   need_llm "Claude Code one-shot" || return 0
   OUT=$("$PODMAN_RUN" --gpu --scratch --claude \
     --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- \
-    claude -p "who am i speaking to?" --model sonnet 2>&1)
+    claude -p "who am i speaking to?" --model sonnet 2>&1); RC=$?
   # See test-bwrap.sh's comment on this same check -- don't assert on specific wording.
-  if echo "$OUT" | grep -qE "^(Error|error):|Failed to authenticate"; then
-    echo "FAIL: claude one-shot (sandbox/tool error): $OUT"
+  if [[ $RC -ne 0 ]] || echo "$OUT" | grep -qE "^(bwrap|sandbox-run\.sh|podman-run\.sh|Error|error|API Error):|Failed to authenticate"; then
+    echo "FAIL: claude one-shot (exit $RC, or a sandbox/tool error): $OUT"
     FAIL=$((FAIL + 1))
   elif [[ -n "$OUT" ]]; then
     echo "PASS: claude one-shot ($OUT)"
@@ -209,7 +223,7 @@ s_11() {
   echo "--- 11b. no --keep-id, WITH --rw <dir under \$HOME>: in-container identity stays root, but bind-mount"
   echo "    writes ALREADY land with real ownership -- rootless podman's default mapping already"
   echo "    writes bind-mounted files as your real host identity; --keep-id changes in-container"
-  echo "    identity (whoami/\$HOME), not this. See ADMIN-NOTES.md's keep-id section."
+  echo "    identity (whoami/\$HOME), not this. See SETUP.md §3 on the subuid/subgid range."
   WORKDIR="$HOME/test-podman-nohome-$$"; EXTRA_CLEANUP+=("$WORKDIR")
   mkdir -p "$WORKDIR" 2>/dev/null
   "$PODMAN_RUN" --gpu --rw "$WORKDIR" -- bash -c "echo hi > $WORKDIR/f.txt" >/dev/null 2>&1
@@ -279,6 +293,12 @@ s_13() {
     OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && csub submit --walltime 5 --wait --name t13 -- sh -c 'echo child-ok' 2>&1 | grep -c child-ok" 2>&1 | tail -1)
     check "--csub: child job ran from inside the container" "$OUT" "1"
     check "--csub: no broker left behind" "$(brokers)" "$BASE_BROKERS"
+    mkdir -p "$CW/planted"; plant_modules "$CW/planted"
+    OUT=$(cd "$CW/planted" && "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
+    check "--csub: Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
+    OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$PODMAN_RUN" --csub --rw "$CW" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
+    check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
+    check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
       mkdir -p "$DECOY"
       OUT=$("$PODMAN_RUN" --csub --rw "$CW" -- bash -c "cd $CW && CSUB_MOUNTS=$CW:rw,$DECOY:rw csub submit --walltime 5 -- true >/dev/null 2>&1; echo \$?" 2>&1 | tail -1)
@@ -345,17 +365,26 @@ s_18() {
   echo "=== 18. No host environment, nothing of the host outside the mounts ==="
   OUT=$(SANDBOX_TEST_SECRET=leaked "$PODMAN_RUN" -- bash -c "echo \"\${SANDBOX_TEST_SECRET:-unset}\"; test -e '$HOME' && echo home-VISIBLE || echo home-absent; test -e /scratch/$USER && echo scratch-VISIBLE || echo scratch-absent" 2>/dev/null | tail -3 | tr '\n' ',')
   check "exported variable not forwarded; \$HOME and /scratch/\$USER absent" "$OUT" "unset,home-absent,scratch-absent,"
+  OUT=$(SANDBOX_TEST_SECRET=leaked "$PODMAN_RUN" -- bash -c 'n=0; for p in /proc/[0-9]*; do tr "\0" "\n" < "$p/environ" 2>/dev/null | grep -q "^SANDBOX_TEST_SECRET=" && n=$((n + 1)); done; echo "$n"' 2>/dev/null | tail -1)
+  check "no process inside the container carries the host variable" "$OUT" "0"
+  OUT=$(http_proxy=http://user:secret@proxy.invalid:3128 https_proxy=http://user:secret@proxy.invalid:3128 "$PODMAN_RUN" -- bash -c 'echo "${http_proxy:-unset},${https_proxy:-unset},${HTTP_PROXY:-unset}"' 2>/dev/null | tail -1)
+  check "the host's proxy variables are not copied into the container" "$OUT" "unset,unset,unset"
+  # The wrapper runs a small Python repair of the shared store on the host at every start, from
+  # the working directory, with or without --csub.
+  mkdir -p "$TR/planted"; plant_modules "$TR/planted"
+  OUT=$(cd "$TR/planted" && "$PODMAN_RUN" -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$TR/planted/*.RAN" | wc -l)")
+  check "Python modules planted in the working directory are not imported on the host" "$OUT" "rc=0,ran=0"
 }
 
 s_19() {
   echo "=== 19. TERM to the wrapper's process group cleans up (the bkill/walltime path) ==="
   setsid "$PODMAN_RUN" --allow example.com -- sleep 300 >/dev/null 2>&1 &
-  local wp=$! i rc
-  for i in $(seq 1 120); do [[ "$(conmons)" -ge 1 ]] && break; sleep 1; done
+  local wp=$! rc
+  for _ in $(seq 1 120); do [[ "$(conmons)" -ge 1 ]] && break; sleep 1; done
   check "container is running before the signal" "$(conmons)" "1"
   kill -TERM -- "-$wp" 2>/dev/null
   wait "$wp" 2>/dev/null; rc=$?
-  for i in $(seq 1 30); do [[ "$(state_dirs)" == "$BASE_STATE" && "$(conmons)" == 0 ]] && break; sleep 1; done
+  for _ in $(seq 1 30); do [[ "$(state_dirs)" == "$BASE_STATE" && "$(conmons)" == 0 ]] && break; sleep 1; done
   check "wrapper exits 143 after TERM" "$rc" "143"
   check "no container, no proxy, no state dir left" "$(conmons),$(proxies),$(state_dirs)" "0,$BASE_PROXIES,$BASE_STATE"
 }
@@ -369,7 +398,115 @@ s_20() {
   check "both cleaned up" "$(state_dirs)" "$BASE_STATE"
 }
 
-ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
+# A project with the files that tools run or load later (section "files that run later").
+make_protect_repo() {  # $1 = directory
+  # The host's own git configuration (signing, templates with hooks) must not shape the test repo.
+  mkdir -p "$1/.vscode" "$1/.claude" && ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null; cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
+    && git -c user.name=t -c user.email=t@t commit -q -m init && echo '{}' > .mcp.json && echo '{}' > .claude/settings.json \
+    && echo 'repos: []' > .pre-commit-config.yaml && echo SECRET > .claude/.credentials.json ) >/dev/null 2>&1
+}
+PROTECT_INNER=$(cat <<'INNER'
+cd "$0" || exit 9
+git config --global --add safe.directory "$0" 2>/dev/null
+o=""
+t() { if eval "$1" >/dev/null 2>&1; then o="$o$2-WRITABLE,"; else o="$o$2,"; fi; }
+t "echo x > .git/hooks/pre-commit" hook
+t "git config user.name agent" config
+t "echo x > .mcp.json" mcp
+t "touch .vscode/tasks.json" vscode
+t "echo x > .claude/settings.json" claude
+t "echo x > .pre-commit-config.yaml" precommit
+t "mv .git .git2" mvgit
+t "rm -rf .vscode" rmvscode
+t "mv .mcp.json m2" mvmcp
+echo y >> f
+git -c user.name=t -c user.email=t@t commit -q -am second >/dev/null 2>&1 && o="${o}commit-ok," || o="${o}COMMIT-FAILED,"
+git checkout -q -b nb >/dev/null 2>&1 && o="${o}branch-ok," || o="${o}BRANCH-FAILED,"
+o="${o}cred=$(wc -c < .claude/.credentials.json 2>/dev/null | tr -d " "),readme=$(grep -c "read-only here" "$SANDBOX_README")"
+echo "$o"
+INNER
+)
+
+s_21() {
+  echo "=== 21. Files that run later are read-only; new ones are reported ==="
+  local R="$TR/protect" R2="$TR/protect2" R3="$TR/protect3" before OUT
+  make_protect_repo "$R"; make_protect_repo "$R3"; mkdir -p "$R2"
+  before=$(md5sum < "$R/.git/config")
+  OUT=$("$PODMAN_RUN" --rw "$R" -- bash -c "$PROTECT_INNER" "$R" 2>/dev/null | tail -1)
+  # No credential masking under podman (documented), so that file is readable: 7 bytes.
+  check "hooks, git config, .mcp.json, .vscode, .claude settings read-only; .git cannot be moved; commits work" "$OUT" "hook,config,mcp,vscode,claude,precommit,mvgit,rmvscode,mvmcp,commit-ok,branch-ok,cred=7,readme=1"
+  check "outside afterwards: no hook planted, .git/config unchanged, the commit is there" \
+    "$([[ -e "$R/.git/hooks/pre-commit" ]] && echo 1 || echo 0),$([[ "$(md5sum < "$R/.git/config")" == "$before" ]] && echo same),$(git -C "$R" log --oneline | wc -l | tr -d ' ')" "0,same,2"
+  OUT=$("$PODMAN_RUN" --rw "$R2" -- bash -c "cd $R2 && echo '{}' > .mcp.json && mkdir .vscode && mkdir -p .git/hooks" 2>&1 >/dev/null | grep -c -E "^  $R2/(\.mcp\.json|\.vscode|\.git)$")
+  check "files of that kind created during the run are named at exit" "$OUT" "3"
+  OUT=$("$PODMAN_RUN" --no-protect --rw "$R3" -- bash -c "cd $R3 && echo x > .git/hooks/pre-commit && echo writable" 2>/dev/null | tail -1)
+  check "--no-protect leaves them writable" "$OUT,$([[ -e "$R3/.git/hooks/pre-commit" ]] && echo 1 || echo 0)" "writable,1"
+
+  # Layouts in which an earlier version of this protection made things worse or was skipped.
+  local RP="$TR/roparent" L="$TR/linked" S="$TR/secret-outside" H="$TR/hookspath" Wt="$TR/wtfile"
+  mkdir -p "$RP"; make_protect_repo "$RP/sub"; make_protect_repo "$L"; make_protect_repo "$H"; mkdir -p "$S/hooks" "$Wt"; echo TOP-SECRET > "$S/hooks/key"
+  ( cd "$L" && ln -s ../secret-outside lnk && git config core.hooksPath lnk/hooks ) >/dev/null 2>&1
+  ( cd "$H" && mkdir -p tools/githooks && git config core.hooksPath tools/githooks ) >/dev/null 2>&1
+  echo "gitdir: /nonexistent/worktree" > "$Wt/.git"
+  make_protect_repo "$RP/data/repo"
+  OUT=$("$PODMAN_RUN" --ro "$RP/data" --rw "$RP/data/repo" -- bash -c "cd $RP/data/repo && (echo x > .git/hooks/pre-commit) 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only" 2>/dev/null | tail -1)
+  check "a --rw inside a --ro is still protected" "$OUT" "hook-read-only"
+  OUT=$("$PODMAN_RUN" --rw "$L" -- bash -c "cat $L/lnk/hooks/key 2>/dev/null || echo not-visible" 2>&1)
+  check "a hooks path through a symlink is not mounted, and is named in a note" "$(echo "$OUT" | grep -c 'TOP-SECRET'),$(echo "$OUT" | grep -c 'not protected, because a symlink is involved')" "0,1"
+  OUT=$("$PODMAN_RUN" --rw "$H" -- bash -c "cd $H; (echo x > tools/githooks/pre-commit) 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only; mv tools t2 2>/dev/null && echo MOVED || echo pinned" 2>/dev/null | tail -2 | tr '\n' ',')
+  check "a hooks directory named in .git/config is read-only and the way to it is pinned" "$OUT" "hook-read-only,pinned,"
+  OUT=$("$PODMAN_RUN" --rw "$R3" -- bash -c "echo ../alt > $R3/.git/commondir" 2>&1 | grep -c -E "^  $R3/\.git/commondir$")
+  check ".git/commondir created during the run is named at exit" "$OUT" "1"
+  rm -f "$R3/.git/commondir"
+  ( cd "$R" && mkdir -p .husky && GIT_CONFIG_GLOBAL=/dev/null git config --file .git/config core.hooksPath .husky ) 2>/dev/null
+  OUT=$("$PODMAN_RUN" --rw "$R" --rw "$R/.vscode" -- bash -c "touch $R/.vscode/explicit && echo explicit-rw-kept" 2>/dev/null | tail -1)
+  check "a protected name mounted twice (your own --rw on it, a hooks path that is also on the list) still starts" "$OUT" "explicit-rw-kept"
+}
+
+s_22() {
+  echo "=== 22. A checkout inside a read-write mount cannot be swapped; credential directories are refused ==="
+  local C="$TR/co" FH="$TR/fakehome22" OUT
+  mkdir -p "$C/tools/agentic" && cp -r "$SCRIPT_DIR/../scripts" "$C/tools/agentic/scripts"
+  OUT=$("$C/tools/agentic/scripts/podman-run.sh" --rw "$C" -- bash -c "
+    mv $C/tools $C/t2 2>/dev/null && echo TOOLS-MOVED || echo tools-pinned
+    mv $C/tools/agentic $C/tools/a2 2>/dev/null && echo CHECKOUT-MOVED || echo checkout-pinned
+    echo x >> $C/tools/agentic/scripts/podman-run.sh 2>/dev/null && echo SCRIPT-WRITABLE || echo script-read-only
+    touch $C/tools/agentic/other 2>/dev/null && echo rest-writable" 2>/dev/null | tail -4 | tr '\n' ',')
+  check "the directories above the wrappers cannot be renamed, the wrappers are read-only, the rest stays writable" "$OUT" "tools-pinned,checkout-pinned,script-read-only,rest-writable,"
+  mkdir -p "$FH/.ssh" "$FH/.config/gcloud" "$FH/.config/other" "$FH/.claude" "$FH/proj"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.ssh" -- true 2>&1 | grep -c "holds credentials"; echo "rc=${PIPESTATUS[0]}")
+  check "--ro ~/.ssh refused, with the reason" "$(echo "$OUT" | tr '\n' ',')" "1,rc=1,"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --rw "$FH/.config" -- true 2>&1 | grep -c "holds credentials")
+  check "--rw ~/.config refused (it contains ~/.config/gcloud)" "$OUT" "1"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.claude" -- true 2>&1 | grep -c "holds credentials")
+  check "--ro ~/.claude refused" "$OUT" "1"
+  mkdir -p "$FH/.cache/huggingface"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.cache" -- true 2>&1 | grep -c "holds credentials")
+  check "--ro ~/.cache refused (it contains the Hugging Face token)" "$OUT" "1"
+  # No command: the wrapper stops at "No command given", after the mount checks, and starts nothing.
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.config/other" 2>&1 | grep -c "holds credentials")
+  check "an ordinary directory under ~/.config is not refused for that reason" "$OUT" "0"
+  check "the refusals left no per-job state" "$(state_dirs)" "$BASE_STATE"
+}
+
+s_23() {
+  echo "=== 23. --dry-run starts nothing; the per-job record ==="
+  local OUT RD before after new
+  OUT=$("$PODMAN_RUN" --dry-run --allow example.com --rw "$TR" -- touch "$TR/dry-run-ran" 2>&1)
+  check "--dry-run prints the podman command and the proxy, and runs nothing" \
+    "$(echo "$OUT" | grep -c '^  podman --events-backend=none run .*--network=none'),$(echo "$OUT" | grep -c 'allowlist_proxy.py'),$([[ -e "$TR/dry-run-ran" ]] && echo RAN || echo not-run)" "1,1,not-run"
+  check "--dry-run left no container and no per-job state" "$(conmons),$(state_dirs)" "0,$BASE_STATE"
+  RD="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  before=$(ls "$RD" 2>/dev/null | sort)
+  SANDBOX_RECORD=on "$PODMAN_RUN" --allow example.com -- bash -c 'curl -s -o /dev/null -m 15 https://example.com/; curl -s -o /dev/null -m 8 https://denied.invalid/; exit 0' >/dev/null 2>&1
+  after=$(ls "$RD" 2>/dev/null | sort)
+  new=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
+  check "a run with --allow writes one record, outside the container, with what was allowed and refused" \
+    "$(comm -13 <(echo "$before") <(echo "$after") | grep -c .),$(grep -cE '^[0-9T:-]+ ALLOW CONNECT example.com:443$' "$RD/$new" 2>/dev/null),$(grep -cE '^[0-9T:-]+ DENY CONNECT denied.invalid:443$' "$RD/$new" 2>/dev/null)" "1,1,1"
+  [[ -n "$new" ]] && rm -f "$RD/$new"
+}
+
+ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-podman.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

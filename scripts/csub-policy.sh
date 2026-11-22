@@ -72,14 +72,23 @@ done
 [[ -z "$COST" || "$COST" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "not a number: $COST"
 
 # A path goes into a TOML string and into a sed replacement: keep both simple.
-for d in "${RW[@]}" ${RO[@]+"${RO[@]}"}; do
+# The checks run on the physical path, and that is what goes into the policy: a trailing slash,
+# "..", "/" or a symlink into the home directory must not get past a comparison of text.
+HOME_P="$(cd "$HOME" 2>/dev/null && pwd -P)" || HOME_P="$HOME"
+canon() {  # $1 = a path given with --rw or --ro; prints its physical form
+  local d="$1" c
   [[ "$d" == /* ]] || die "not an absolute path: $d"
   [[ "$d" =~ ^[A-Za-z0-9_./+@-]+$ ]] || die "unsupported character in path: $d"
   [[ -d "$d" ]] || die "no such directory: $d"
+  c="$(cd -- "$d" && pwd -P)" || die "cannot enter $d"
+  [[ "$c" =~ ^[A-Za-z0-9_./+@-]+$ ]] || die "unsupported character in path: $c"
   # csub refuses jobs that mount the home directory, and its policy rejects /scratch.
-  [[ "$HOME" != "$d" && "$HOME" != "$d"/* ]] || die "$d is or contains your home directory; give a project directory"
-  [[ "$d" != /scratch && "$d" != /scratch/* ]] || die "/scratch cannot be a job directory: $d"
-done
+  [[ "$c" != "$HOME_P" && "$HOME_P" != "${c%/}"/* ]] || die "$d is or contains your home directory; give a project directory"
+  [[ "$c" != /scratch && "$c" != /scratch/* ]] || die "/scratch cannot be a job directory: $d"
+  printf '%s\n' "$c"
+}
+for i in "${!RW[@]}"; do RW[$i]="$(canon "${RW[$i]}")" || exit 1; done
+for i in ${RO[@]+"${!RO[@]}"}; do RO[$i]="$(canon "${RO[$i]}")" || exit 1; done
 for h in ${HOSTS[@]+"${HOSTS[@]}"}; do
   [[ "$h" =~ ^[a-z0-9.*-]+$ ]] || die "not a hostname (lower case, digits, dots, dashes, *): $h"
 done
@@ -91,6 +100,7 @@ SAMPLE="$CSUB_DIR/deploy/broker.janelia.toml"
 
 # csub expands a leading ~/ itself, which keeps the file free of the account name.
 SCRIPTS="$SCRIPT_DIR"
+# shellcheck disable=SC2088  # a literal "~/" on purpose: csub expands it, the shell must not
 [[ "$SCRIPTS" == "$HOME"/* ]] && SCRIPTS="~/${SCRIPTS#"$HOME"/}"
 
 toml_list() {  # "a" "b" -> ["a", "b"]

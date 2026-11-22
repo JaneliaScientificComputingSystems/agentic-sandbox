@@ -14,8 +14,9 @@ that agent-generated code never runs with a user's full permissions. Everything 
 live on the cluster as an ordinary user account.
 
 **Which document:** [`SETUP.md`](SETUP.md) first (one-time, per account) · this README to use the
-wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`ADMIN-NOTES.md`](ADMIN-NOTES.md)
-for the evidence and reasoning behind each decision · [`config/`](config/) for the files setup copies.
+wrappers · [`CHANGELOG.md`](CHANGELOG.md) for behaviour changes · [`config/`](config/) for the files
+setup copies. The reasoning behind each decision is in the comments of the scripts, next to the code
+it explains.
 
 **Which setup:**
 
@@ -38,7 +39,7 @@ not protect against](#what-it-does-and-does-not-protect-against).
 | `--claude` | `claude auth login` outside the sandbox | `SETUP.md` §4 |
 | `--opencode` | opencode installed and run once, and a LiteLLM key for `kimi-k3` from HPC | `SETUP.md` §5 |
 | `sandbox-run.sh --gpu` | nothing more; run it inside an LSF GPU job | `SETUP.md` §2 |
-| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**) and the two files in `config/` | `SETUP.md` §3 |
+| `podman-run.sh` (a container image) | a subuid/subgid range from HPC (**not self-service, ask first**), plus `storage.conf` and `containers.conf` from `config/` | `SETUP.md` §3 |
 | `--csub` (optional) | csub installed and a policy, written by `scripts/csub-policy.sh` | `SETUP.md` §6 |
 | `ssh-entry.sh` (an agent on your laptop) | a dedicated ssh key, one line in `~/.ssh/authorized_keys`, and normally `--csub` | `SETUP.md` §8 |
 
@@ -86,8 +87,9 @@ default and these clients don't fail fast. On a non-zero exit the wrapper prints
 
 The sandbox is identical in the three ways to run it; only the submission differs:
 
-- **A — one-shot.** A single command as a plain `bsub` job. This is the unsupervised case the
-  policy targets:
+- **A — one-shot.** A single command as a plain `bsub` job, submitted from a project directory on
+  shared storage (not from `$HOME`, where the wrapper refuses to start). This is the unsupervised
+  case the policy targets:
   ```bash
   bsub -q short -o out.log "$SANDBOX/sandbox-run.sh --scratch --opencode --allow litellm.int.janelia.org -- \
     opencode run 'who am I speaking to?' --model litellm/kimi-k3"
@@ -99,8 +101,9 @@ The sandbox is identical in the three ways to run it; only the submission differ
 ## Adapting your project
 
 - **Start from the directory the agent may change.** `$PWD` is the only read-write path by default.
-  Don't start from `$HOME` or from this checkout (the wrapper re-binds its own directory read-only if
-  you do).
+  Don't start from `$HOME` or a directory above it (`sandbox-run.sh` refuses; `podman-run.sh` does
+  not mount the working directory at all) or from this checkout (the wrapper re-binds its own
+  directory read-only if you do).
 - **Data in, results out.** `--ro /groups/lab/reference-data` for inputs, `--rw
   /groups/lab/project/results` for outputs: specific subdirectories, never `$HOME`. Write results to
   durable storage. `/scratch` is node-local and wiped hourly on nodes where you have no job, so a
@@ -110,7 +113,8 @@ The sandbox is identical in the three ways to run it; only the submission differ
   changed afterwards.
 - **Dependencies.** Install them beforehand into a venv under a path you bind `--ro`, so the agent
   can't change it. A venv records the interpreter that built it, so build it with the Python the
-  sandbox will use. For podman, inside the image (verified with the gpu image):
+  sandbox will use, in a directory that exists (`mkdir -p /groups/lab/venv`). For podman, inside the
+  image (verified with the gpu image, `--image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest`):
   `podman-run.sh --keep-id --rw /groups/lab/venv --allow pypi.org --allow files.pythonhosted.org -- bash -c
   'python3 -m venv --system-site-packages /groups/lab/venv && /groups/lab/venv/bin/pip install PKG'`.
   `--system-site-packages` keeps torch and the rest of the image. For bwrap, build it with the host's
@@ -120,9 +124,11 @@ The sandbox is identical in the three ways to run it; only the submission differ
   every run warns `Failed to initialize NumPy`).
 - **Git.** Credentials (`~/.ssh`, `.git-credentials`) aren't bound, so the agent can commit locally
   but can't push or clone private repos. Push from outside after reviewing.
-- **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
-  and some run later as you, outside the sandbox: `.git/hooks/*`, project-level `.claude/settings.json`
-  and `.mcp.json`. Review them before using the directory outside the sandbox.
+- **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job.
+  The ones tools run by themselves (`.git/hooks/*`, project-level `.claude/settings.json`,
+  `.mcp.json` and the like) are read-only inside when they existed at start, and new ones are named
+  at exit ("Files that run later"). The code itself is the agent's to change: review it before you
+  build or run it outside the sandbox.
 - **Resuming a Claude session.** The per-job config starts without history, so `claude --resume` and
   `--continue` find nothing. `--claude-history` (with `--claude`, `sandbox-run.sh` only) binds the
   past sessions of the directory you start from, and only those, read-only; the conversation can be
@@ -148,20 +154,26 @@ own mode, whatever the flag order: a `--rw` inside a `--ro` tree is writable for
 and a `--ro` inside a `--rw` tree (or inside `$PWD`) stays read-only.
 
 **Credential masking (bwrap only).** Directly under every bound root (`$PWD`, `$HOME` if bound, every
-`--ro`/`--rw`/`--scratch` path), `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud` and `.docker`
+`--ro`/`--rw`/`--scratch` path), `.ssh`, `.aws`, `.azure`, `.kube`, `.config/gcloud`, `.docker` and others
 appear as empty directories, and `.git-credentials`, `.npmrc`, `.pypirc`, `.netrc`, `.env`,
-`.env.local` as empty files. The same names under `$HOME` are masked
+`.env.local` and others as empty files. The same names under `$HOME` are masked
 whenever they are inside a bound root (from `~/.config`, `gcloud/` is empty), and a root that is one
 of those `$HOME` locations, or inside one, is refused, as is `~/.claude` itself read-write. Only
 paths that exist at start are masked, and under a project root only direct children: a `.env` two
 levels down is readable. The full list is in the sandbox's own `/run/sandbox/README.md`.
 Podman can't do this (a `--tmpfs` can't shadow a path under an ancestor `-v` bind), so
-`podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME` (a subdirectory is fine),
+`podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME`, on a credential directory
+under it (`~/.ssh`, `~/.aws`, `~/.claude`, ...) or a directory that contains one (`~/.config`); another
+subdirectory is fine,
 and on one that contains `/scratch/$USER/.agentic-sandbox`.
 
-**Network, default-deny.** Without `--allow` there is no network. `scripts/allowlist_proxy.py` runs
+**Network, default-deny.** Without `--allow` there is no network (the workers of a multi-node job
+are the one exception, see "Multi-node jobs"). `scripts/allowlist_proxy.py` runs
 outside the sandbox on a Unix socket and allows `CONNECT`/HTTP to the listed hostnames and their
-subdomains, **on any port**, refusing everything else. The socket is bound into the sandbox and
+subdomains, **on any port**, refusing everything else. A listed name is not trusted to point
+anywhere: the proxy resolves it and refuses it (403) when it resolves to a loopback, link-local
+(169.254), multicast or reserved address, so an allowed name cannot be used to reach services on
+the node. Private addresses are allowed, since the cluster's own services have them. The socket is bound into the sandbox and
 `scripts/relay.py` exposes it on loopback; `http_proxy`/`https_proxy` (both cases) and `no_proxy` are
 set. There is no direct route out: no raw TCP, no package registries you didn't list. But a
 `CONNECT` tunnel to a listed host's non-HTTP port (its ssh port, say) is permitted, so list only
@@ -174,11 +186,38 @@ with `--env`. LSF forwards your whole shell environment into a job, so otherwise
 environment. When stdin is not a terminal the bwrap sandbox gets its own session (`--new-session`) so
 it can't type into your terminal.
 
+**Files that run later are read-only.** Some files in a project are instructions to tools, not
+work product: git runs `.git/hooks` and what `.git/config` names, Claude Code loads `.mcp.json` and
+`.claude/`, an editor runs `.vscode` tasks, pre-commit runs what `.pre-commit-config.yaml` lists. A
+process that can write them gets code run later, as you, outside the sandbox, the next time you use
+git or open the project. Where they exist directly under a read-write directory, both wrappers bind
+them read-only: `.git/hooks`, `.git/config` and a hooks directory it names, `.mcp.json`,
+`.claude/{settings.json,settings.local.json,commands,agents,hooks,skills}`, `.vscode`,
+`.devcontainer`, `.husky`, `.codex`, `.opencode`, `opencode.json` and `.pre-commit-config.yaml`.
+`.git` and `.claude` themselves are pinned, so they cannot be moved aside and rebuilt. Commits,
+branches and everything else in git still work. `git config` and `git remote add` in an existing
+repository do not, nor does editing `.claude/settings*.json`: do those outside, or start with
+`--no-protect`. Your git identity is passed in as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, taken from
+your global git configuration when it has one. What does not exist at start
+cannot be protected: if the command creates one of these, the wrapper names it at exit (a new
+repository is named once, as `.git`), and it is protected from the next start on. Only the
+top level of each read-write directory is covered, like the credential masks. `--no-protect` turns
+all of this off.
+
+**See what a run would do, and what it did.** `--dry-run` goes through every check and prints the
+`bwrap` or `podman` command, the proxy and broker it would start, and (for bwrap) the environment the
+command would get, without starting anything; values passed with `--env` are not shown. After a real
+run that used `--allow` or `--csub`, a record is in `~/.agentic-sandbox/records/<date>/<job>.log`:
+the command, its exit status, every host the proxy allowed or refused with the time, and the csub
+jobs recorded while the sandbox ran. `$HOME` is not bound into the sandbox, so the sandboxed process
+cannot change a record. `SANDBOX_RECORD=off` in the environment turns it off, and nothing removes
+old records.
+
 **Harness config is copied, not bound.** `--claude` gives the sandbox a per-job copy of
 `~/.claude.json`, `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with `CLAUDE_CONFIG_DIR`
 pointing at it; only `~/.claude/.credentials.json` is bound through, so logins and token refreshes
-persist. `--opencode` copies `~/.config/opencode` and binds the three data dirs (`~/.local/share`,
-`~/.local/state`, `~/.cache`) read-write. Why: hooks, MCP entries and plugins are commands the harness
+persist. `--opencode` copies `~/.config/opencode` and binds its three data dirs (`~/.local/share/opencode`,
+`~/.local/state/opencode`, `~/.cache/opencode`) read-write. Why: hooks, MCP entries and plugins are commands the harness
 runs *as you, outside the sandbox, in your next session*; an agent that could write them would have a
 way out that outlives the job. Edits to the copies die with the job. The CLI binaries are bound
 read-only and put on `PATH`.
@@ -215,9 +254,11 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   socket crosses the boundary, at `/run/csub.sock`.
 - Inside, `csub` and `import csub` work with the sandbox's own `python3` (the csub package is
   bound read-only on `PYTHONPATH`, a shim is on `PATH`). `CSUB_TRANSPORT`, `CSUB_SOCKET` and `CSUB_MOUNTS` are set;
-  `CSUB_MOUNTS` comes from `$PWD` and the `--rw`/`--ro` paths not under `$HOME` or `/scratch` (nested
-  ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
-  does not.
+  `CSUB_MOUNTS` comes from `$PWD` (under `sandbox-run.sh`, always) and the `--rw`/`--ro` paths not under
+  `$HOME` or `/scratch` (nested ones dropped); a preset `$CSUB_MOUNTS` may only narrow that list, and the wrapper refuses one that
+  does not. With a `--ro` directory inside a `--rw` one, the outer directory is passed to csub as
+  read-only (csub cannot express the nesting), so `csub submit` from inside it is refused: submit
+  from a read-write directory that has no read-only part.
 - The broker applies **your** `~/.config/csub/broker.toml` (roots, images, hosts, queues, limits); the
   agent gets a job id or a `policy_violation`. Child jobs run through these wrappers (`sandbox =
   "podman"` or `"bwrap"` in the policy) and can submit again. GPU children under `sandbox = "bwrap"`
@@ -231,7 +272,9 @@ sandbox-run.sh / podman-run.sh --csub …                                 csub's
   envelope (podman with only `/scratch` mounted and no `--allow`, say) or a csub without it, the
   wrapper refuses to start; `CSUB_ENVELOPE=off` accepts a broker bounded by the policy alone. Keep
   `allowed_roots` as narrow as the project either way.
-- Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). Without `bsub` on the host,
+- Needs `csub-broker` on `PATH` at start and a policy (`SETUP.md` §6). `CSUB_BROKER_CMD` names
+  another broker command; anything but the `csub-broker` command itself is started from `/`, so a
+  relative `--policy` path in it does not resolve. Without `bsub` on the host,
   `--csub` fails at start; csub's `csub relay` is the tool for that case.
 - **The limits are per job, checked at submit.** A job asks for slots, GPUs and a walltime; the broker
   refuses one above `max_slots`, `max_gpus` or `max_walltime_min`. `max_estimated_cost_usd` is the same
@@ -263,20 +306,21 @@ command="env PATH=$HOME/.venvs/csub/bin:$PATH $HOME/agentic-sandbox/scripts/ssh-
 ```
 
 ```
-laptop                         login node                       compute node
-─────────────────────────      ─────────────────────────        ─────────────────────────────
-agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
-                               (the script and bsub only)           in the project directory
+laptop                               login node                       compute node
+───────────────────────────────      ─────────────────────────        ─────────────────────────────
+agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
+                                     (the script and bsub only)           in the project directory
 ```
 
-- **Each `ssh cluster '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
+- **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
   `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are
-  relayed, so `scp` to the project directory works too. A job takes from seconds to a minute to
+  relayed, each on its own stream, so `scp` to the project directory works too, with `--podman` as well
+  (tested through the forced command, not yet through a real sshd). A job takes from seconds to a minute to
   start, and nothing carries over between commands except files in the project directory.
 - **Only the script and `bsub` run on the login node.** The agent's command reaches the compute node
   in the job's environment, not on a command line.
-- **`--project DIR`** is the one directory the agent can read and write; it must exist and be outside
-  `$HOME`. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
+- **`--project DIR`** is the one directory the agent can read and write. It must exist and be
+  outside `$HOME`; `ssh-entry.sh` refuses your home directory and anything inside or above it. `--queue`, `--slots` (default 1) and `--walltime` (minutes, default 240) shape the job each
   command runs in. `--podman` runs the command through `podman-run.sh` in a container image, with
   the project bound read-write at the same path; it needs `SETUP.md` §3.
 - **Options after ` -- ` go to the wrapper unchanged**: `--csub`, `--allow HOST`, `--ro DIR`, `--gpu`,
@@ -287,10 +331,11 @@ agent: ssh cluster '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──
   answers `not allowed in the parent job`.
 - **Tell the agent.** It runs outside the sandbox and cannot know the rules unless told. `config/` has
   the instruction file to put in the agent's working directory on the laptop: `CLAUDE.md` for Claude
-  Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`). They point the agent at
-  `$SANDBOX_README`, the sandbox's own description, with `ssh cluster 'cat $SANDBOX_README'`.
+  Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`, saved under either name). They point the agent at
+  `$SANDBOX_README`, the sandbox's own description, with `ssh janelia-agent 'cat $SANDBOX_README'`.
 - **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions and `bkill -g /csub/$USER 0` the jobs it
-  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date.
+  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date (the
+  date is the first day the key is refused).
 
 What this does not change: the agent's own process runs on the laptop with whatever that harness
 allows there. The sandbox bounds what it can do on the cluster, not on the laptop. Give the key no
@@ -304,13 +349,16 @@ Verified live under bwrap, with Claude Code and Codex on a Mac between them: com
 
 ## Images (podman)
 
-Neither is required; `--image` takes any OCI image. A csub policy decides which images child jobs may use.
+Neither is required; `--image` takes any OCI image (for `scp` through `ssh-entry.sh --podman` it
+must have `sftp-server` at `/usr/libexec/openssh/sftp-server`). A csub policy decides which images child jobs may use.
 
 | Image | Base | Contents | Size | Use when |
 | --- | --- | --- | --- | --- |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, Codex, `git`, `rsync`, `python3` | about 2 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
-| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, NCCL 2.30, Ray 2.60 (Train and Data), `libibverbs` for `--ib`, `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, plus the same CLIs | 26 GB | real ML work, native extensions, "set up a venv and pip install" tasks |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest` (default, `podman/Dockerfile`) | `nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04` | CUDA runtime libraries, Node.js, Claude Code, opencode, Codex, `git`, `rsync`, `python3` with `pip` and `venv`, `sftp-server` | about 2 GB | coding agent on a GPU node that isn't doing ML itself; `nvidia-smi` and the CUDA runtime API work, `nvcc`/cuDNN do not |
+| `ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest` (`podman/Dockerfile.pytorch`) | `nvcr.io/nvidia/pytorch:26.07-py3` | PyTorch 2.13, cuDNN, NCCL 2.30, Ray 2.60 (Train and Data), `libibverbs` for `--ib`, `gcc`/`g++`/`make`, `pip`/`venv`, `curl`/`wget`, `vim`, `jq`, `ssh`, `sftp-server`, plus the same CLIs | 26 GB | real ML work, native extensions, anything that needs PyTorch |
 
+Both images carry `sftp-server`, so `scp` and `sftp` through `ssh-entry.sh --podman` work, and the
+GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout holds only its own output.
 `podman-run.sh` checks for a newer image on every run (a digest check; a download only if it changed).
 `--allow` needs `bash` and `python3` in the image for the in-container relay; a minimal image such as
 `alpine` fails with `executable file /bin/bash not found`.
@@ -321,7 +369,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **Claude Code.** A fresh `claude auth login` inside the sandbox works only if
   `~/.claude/.credentials.json` already exists on the host. An API key beats an expired login; never
   put it on a `bsub` command line. Not carried in: `~/.claude/plugins`, skills, `projects/` history
-  (add `--ro`/`--rw` for a path a task needs; for this directory's history, `--claude-history`).
+  (under `sandbox-run.sh`, add `--ro`/`--rw` for a path a task needs, and `--claude-history` for this
+  directory's history; `podman-run.sh` refuses paths inside `~/.claude`).
 - **opencode + Kimi K3.** **Always name the model** interactively, `opencode -m litellm/kimi-k3`: bare
   `opencode` defaults to its hosted "OpenCode Zen" model, which talks to hosts outside your allowlist
   and fails with a bare `Forbidden`. One-shot `opencode run ... --model litellm/kimi-k3` is unaffected.
@@ -331,7 +380,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
   directory and cannot ask in a batch job, so the read is auto-rejected and the model may give up and
   exit 0. The sandbox is the boundary, so allow it: `export
   OPENCODE_CONFIG_CONTENT='{"permission":{"external_directory":"allow"}}'` and pass `--env
-  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh` (tested under bwrap, not podman). An agent that gives up
+  OPENCODE_CONFIG_CONTENT` to `sandbox-run.sh`. `podman-run.sh` has no `--env`; there the same permission would have to go
+  into `~/.config/opencode/opencode.json`, which the wrapper copies into the container (not tested). An agent that gives up
   still exits 0, so check for the output you expect, not the exit code.
 - **The Kimi K3 safeguard.** Requests to `kimi-k3` pass through a gateway guardrail (an LLM-as-judge
   for harmful content and jailbreaks) whatever the client. A refusal is either the gateway's
@@ -348,8 +398,8 @@ image.**
 
 | | `sandbox-run.sh --gpu` (bwrap) | `podman-run.sh --gpu` |
 | --- | --- | --- |
-| One-time setup | none | a subuid/subgid range from HPC and a `storage.conf` (`SETUP.md` §3) |
-| Start-up | seconds | an image pull (1.2 GB, or several GB) on each new node, and again after the hourly scratch cleanup |
+| One-time setup | none | a subuid/subgid range from HPC, plus `storage.conf` and `containers.conf` from `config/` (`SETUP.md` §3) |
+| Start-up | seconds | an image pull (about 2 GB, or 26 GB) on each new node, and again after the hourly scratch cleanup |
 | Software | the node's own: `module load`, your venvs and conda envs, the same as in a CPU job | the image's: CUDA toolkit, cuDNN and PyTorch already in it |
 | Credential masking | yes | no, which is why `$HOME` cannot be mounted |
 | What the sandbox sees of the node | device nodes for the job's GPUs only; `/sys/devices` and `/sys/module`, read-only | a device node for every GPU on the node (LSF's device cgroup blocks the ones that are not yours) and all of `/sys`, read-only |
@@ -369,7 +419,7 @@ what the node has installed, which varies, or on a venv you build (see "Dependen
   LD_LIBRARY_PATH` for anything that loads `libcudart` or `libcublas` dynamically. Prefer a 13.x
   toolkit: on the L4 nodes checked, cuda/12.4 and 12.9 (`cuda/12-latest`) lack `cuda_runtime.h`.
 - For PyTorch, bind a venv or conda env with `--ro`.
-- How the GPUs are found and why `/sys` is needed: `ADMIN-NOTES.md`, "bwrap `--gpu`".
+- How the GPUs are found and why `/sys` is needed: the comments at `--gpu` in `scripts/sandbox-run.sh`.
 
 **Under podman:**
 
@@ -458,12 +508,12 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network. `--ib`
   refuses `--csub`, `--claude` and `--opencode` for the same reason. `--host-net` refuses `--ib`:
   a job on InfiniBand takes `--job-nodes --ib` and keeps its network limited.
-- **Connections in.** A host outside the job can open a TCP connection to the relay's ports, but
-  nothing it sends reaches the sandboxed program, and the program never sees the connection.
+- **Connections in** are accepted from the job's nodes only. What another host sends to those
+  ports does not reach the sandboxed program.
 - **What it tells the agent.** `$SANDBOX_README` lists the reachable nodes, this node's address
   and the ports, or says that the network is the node's own.
 
-Measured, with the evidence in `ADMIN-NOTES.md`, "Multi-node jobs": two H200 nodes, 16 GPUs,
+Measured: two H200 nodes, 16 GPUs,
 482 GB/s sustained inside `--job-nodes --ib` against 483 GB/s unsandboxed, with either wrapper;
 four H100 nodes, 32 GPUs, 378 (Bubblewrap) and 379 GB/s (podman) against 378 unsandboxed; two L4
 nodes, 6.3 GB/s inside `--host-net` against 6.4 to 6.7 GB/s unsandboxed.
@@ -484,9 +534,12 @@ Assuming the agent is fully adversarial, it **is** stopped from:
 It is **not** stopped from:
 
 - **Anything you gave it read-write, persistently.** That includes the real credentials file bound
-  into `--claude` sandboxes, opencode's three data dirs, and in the working directory `.git/hooks`,
-  project-level `.claude/settings.json` and `.mcp.json`. Those can run later as you, outside the
-  sandbox; review them before using the directory outside.
+  into `--claude` sandboxes and opencode's three data dirs. In the working directory, the files that
+  tools run later (`.git/hooks`, `.git/config`, `.mcp.json`, `.claude/`, `.vscode` and the rest of
+  the list under "Files that run later") are read-only where they existed at start, but the agent
+  can still create ones that did not exist (the wrapper names them at exit), write them in a
+  repository below the top level, and change the project's own code, build files and scripts, which
+  you run when you build or test. Review what an agent wrote before you run it outside.
 - **Using a listed host over any port**, not just HTTPS (a `CONNECT` tunnel to its ssh port works);
   the proxy doesn't inspect content.
 - **Credentials deeper than direct children**, e.g. a `.env` in a subdirectory; and, with podman, any
@@ -495,8 +548,8 @@ It is **not** stopped from:
   the cluster's bwrap 0.6 predates `--disable-userns`, so nested user namespaces stay available).
 - **Reading the node's hardware inventory with `sandbox-run.sh --gpu`**: `/sys/devices` and
   `/sys/module` are visible read-only (PCI topology, NICs and MACs, DMI strings). Without `--gpu`
-  there is no `/sys` at all.
-- Anything multi-node: one sandbox, one host. No MPI, Ray, DDP, Spark or Dask across nodes.
+  there is no `/sys` at all. (The multi-node flags bind `/sys/devices` and the network and PCI
+  entries as well.)
 - Your own mistakes in Mode C: a human is present and the sandbox limits damage but doesn't review.
 
 ## Running under LSF
@@ -519,6 +572,9 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --env NAME      (sandbox-run.sh) copy host variable NAME into the sandbox (repeatable)
   --csub          Start a csub broker outside the sandbox and give the agent `csub` inside
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing)
+  --dry-run       Do every check, start nothing, and print the command a real run would use
+  --no-protect    Leave .git/hooks, .git/config, .mcp.json, .claude/, .vscode and the like writable
+                  (read-only by default where they exist in a read-write directory)
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH
   --claude-history[-rw]  (sandbox-run.sh, with --claude) this directory's past Claude sessions, so
                   `claude --resume`/`--continue` work; read-only, or -rw to keep new ones too
@@ -546,7 +602,7 @@ csub-policy.sh --bwrap|--podman --rw DIR [--ro DIR] [--allow HOST] [--gpus N] [-
 
 ## Testing
 
-Five suites in `tests/`:
+Six suites in `tests/`:
 
 | Suite | Tests | Run it |
 | --- | --- | --- |
@@ -566,7 +622,7 @@ Five suites in `tests/`:
   need a model to answer (a Claude login, a LiteLLM key); everything else is the sandbox itself.
 - The `--csub` sections need `csub-broker` on `PATH` and `CSUB_TEST_ROOT` set to a directory under
   your policy's allowed roots.
-- The summary line counts what was skipped (`82 passed, 0 failed, 0 skipped`), so a run without a
+- The summary line counts what was skipped (`N passed, 0 failed, 0 skipped`), so a run without a
   GPU or without csub does not look like a full one.
 - "Nothing left behind" checks compare with the state at the start, and a killed run removes its
   own test directories.
@@ -580,12 +636,27 @@ Five suites in `tests/`:
   against the job's memory.
 - **A request hangs, or `claude`/`opencode` retries with `Request timed out`**: the host isn't on your
   allowlist (the wrapper prints the denied ones). Claude Code needs `api.anthropic.com`, `claude.ai`,
-  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`.
+  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`. If a host you did allow is
+  in the denied list, its name resolves to a loopback or link-local address, which the proxy refuses.
 - **`GuardrailRaisedException`/400 from `kimi-k3`**: the safeguard, not a bug. **opencode `Forbidden`**:
   no `-m litellm/kimi-k3`. **`Failed to execute statement`/`UnknownError`**: another `--opencode`
   sandbox of yours is running.
 - **`Failed to initialize NVML: GPU access blocked`**: pass `--gpu` (bwrap or podman).
 - **`potentially insufficient UIDs or GIDs`**: `--keep-id` with a too-narrow subuid range; ask HPC.
+- **`error: could not write config file .git/config: Device or resource busy`**, or **`Read-only file
+  system`** on `.git/hooks`, `.mcp.json`, `.vscode` or `.claude/`: these are read-only inside on purpose
+  ("Files that run later"). Commits, branches, fetch and pull work, and so does `git clone`; `git
+  remote add` and branch tracking do not (git may still print "set up to track" after the error). Change such a file outside the sandbox, or start
+  with `--no-protect` if the task is to edit them.
+- **`... the command created files that tools run or load outside the sandbox`** (at exit): the
+  command made a `.mcp.json`, `.vscode`, git hooks or similar where there was none. Look at them
+  before you use git, an editor or an agent in that directory.
+- **`crun: cannot stat ...libnvidia-nscq.so.<version>`** with `podman-run.sh --gpu`: the node's CDI
+  spec (`/etc/cdi/nvidia.yaml`) predates a driver upgrade. An administrator regenerates it with
+  `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
+- **`Author identity unknown`** from `git commit` inside: your global git configuration has no
+  `user.name` and `user.email`, so the wrapper had none to pass in. Set them outside
+  (`git config --global ...`), or pass `--env GIT_AUTHOR_NAME` and the other three variables.
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
 - **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a
@@ -594,10 +665,15 @@ Five suites in `tests/`:
 - **`csub: policy_violation: mount ... home directory`**: `CSUB_MOUNTS` includes something under
   `$HOME`; work from a directory under an allowed root. `csub --json probe` (`--json` before the
   subcommand) shows the policy.
-- **`--csub: nothing to bound child jobs to`** (at start): the sandbox has no mount outside `$HOME`
+- **`--csub: nothing to bound child jobs to`** (at start, in practice only from `podman-run.sh`, since
+  `sandbox-run.sh` always passes on its working directory): the sandbox has no mount outside `$HOME`
   and `/scratch` and no `--allow` host, so the broker's envelope would be empty. Add the `--rw`/`--ro`
   path or `--allow` host the child jobs may use, or `CSUB_ENVELOPE=off` for a policy-only broker.
-- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`**: a preset `CSUB_MOUNTS`
+- **`--csub: ... contains a comma or a colon`**, or **`CSUB_MOUNTS entry ... is not a plain absolute
+  path`**: the list of mounts handed to csub separates entries with commas and colons and is compared
+  as text. Use a directory without those characters, and give `CSUB_MOUNTS` plain absolute paths.
+- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`** (`podman-run.sh` says
+  "this container's mounts"): a preset `CSUB_MOUNTS`
   names a path the sandbox does not have, or asks rw where it is ro. Unset it, or add the path with
   `--rw`/`--ro`.
 - **`csub: policy_violation: ... not allowed in the parent`** (from a child's submission): the child
@@ -605,13 +681,15 @@ Five suites in `tests/`:
   top-level sandbox the mount or `--allow` host if the child really needs it.
 - **`Permission denied (publickey)` through an `ssh-entry.sh` key**: the key line is wrong or past its
   `expiry-time`, or `~/.ssh` on the cluster is not mode 700. **`project directory ... does not
-  exist`**: fix `--project` in the key line.
+  exist`**: fix `--project` in the key line. **`project directory ... is your home directory, or inside
+  it, or above it`**: move the project outside `$HOME` and edit the key line. **`cannot enter <project>
+  on <node>`**: the directory is not visible on the compute nodes. **`scp: Received message too
+  long`** with `--podman`: the checkout behind the key line predates 2026-11-21; update it.
 - **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
   policy or the `--allow` list, outside the sandbox.
 
 ## Known limitations
-- bwrap has no image (so no packaged CUDA toolkit); podman can't mask credentials. The proxy is
-  HTTP-style only (no SOCKS5), but allows any port on a listed host.
+- bwrap has no image (so no packaged CUDA toolkit). The proxy is HTTP-style only (no SOCKS5).
 - One opencode sandbox per account at a time; `--keep-id` needs a widened subuid/subgid range.
 - Per-job state needs a writable `/scratch/$USER`; `sandbox-run.sh` falls back to `$TMPDIR` only off
   the cluster and says so, `podman-run.sh` requires it.

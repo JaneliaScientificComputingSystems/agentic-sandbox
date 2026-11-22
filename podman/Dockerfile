@@ -40,4 +40,18 @@ RUN chmod o+rx /root && chmod -R o+rX /root/.local /root/.opencode
 # readable by every user, so --keep-id needs nothing extra).
 RUN npm install -g @openai/codex && codex --version
 
+# What an agent that reaches this container through ssh-entry.sh --podman needs, so that it can do
+# here what it can do in the Bubblewrap sandbox:
+#  - pip and venv, to install Python packages into a venv in the project directory (the base
+#    image has python3 but neither);
+#  - the server half of sftp, which is what `scp` and `sftp` from the laptop talk to. It runs
+#    inside the sandbox like every other command. Ubuntu's package brings the ssh client with
+#    it as a dependency; no daemon comes with it. The cluster's sshd asks for the server at
+#    the RHEL path, so that path is linked to Ubuntu's.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip python3-venv openssh-sftp-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /usr/libexec/openssh && \
+    ln -s /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server
+
 WORKDIR /work

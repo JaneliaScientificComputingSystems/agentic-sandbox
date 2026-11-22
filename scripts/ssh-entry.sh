@@ -7,7 +7,7 @@
 #
 #   command="/path/to/agentic-sandbox/scripts/ssh-entry.sh --project /groups/lab/proj",no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... agent
 #
-# Whatever the agent then sends (`ssh cluster '<command>'`) never runs on the login node. This
+# Whatever the agent then sends (`ssh janelia-agent '<command>'`) never runs on the login node. This
 # script submits it as an interactive LSF job (`bsub -I`) whose command is sandbox-run.sh
 # started in the project directory, and relays stdin, stdout, stderr and the exit status. The
 # only things that run on the login node are this script and bsub.
@@ -21,7 +21,7 @@
 #
 # Options after `--` go to the wrapper unchanged (--csub, --allow HOST, --ro DIR, --gpu, and
 # for podman --image NAME, ...). For GPU work pick a GPU queue with --queue.
-# With no command (a plain `ssh cluster`), the job is an interactive shell in the sandbox.
+# With no command (a plain `ssh janelia-agent`), the job is an interactive shell in the sandbox.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,7 +59,7 @@ if [[ $INNER -eq 1 ]]; then
   CMD="${AGENT_SSH_COMMAND:-}"
   # BSUB_QUIET was for the login-node bsub only: left set, it silences the "Job <n> is submitted"
   # line that csub's broker reads the job id from.
-  unset AGENT_SSH_COMMAND BSUB_QUIET
+  unset AGENT_SSH_COMMAND BSUB_QUIET LSF_INTERACTIVE_STDERR
   if [[ $PODMAN -eq 1 ]]; then
     # podman-run.sh binds nothing by default and starts in the image's own directory: bind
     # the project and enter it before running the command.
@@ -80,7 +80,13 @@ fi
 
 # On the login node: submit, and nothing else.
 [[ -d "$PROJECT" ]] || die "project directory $PROJECT does not exist"
-PROJECT="$(cd "$PROJECT" && pwd -P)"
+PROJECT="$(cd -- "$PROJECT" && pwd -P)" || die "cannot enter the project directory"
+# The project is the one directory the agent gets read-write. Under $HOME it could be ~/.ssh or
+# the directory of a harness's settings; the wrappers refuse $HOME itself but not what is in it.
+HOME_P="$(cd "$HOME" 2>/dev/null && pwd -P)" || HOME_P="$HOME"
+if [[ "$PROJECT" == "$HOME_P" || "$PROJECT" == "${HOME_P%/}/"* || "$HOME_P" == "${PROJECT%/}/"* ]]; then
+  die "project directory $PROJECT is your home directory, or inside it, or above it; use a directory outside \$HOME"
+fi
 if ! command -v bsub >/dev/null 2>&1; then
   # A forced command gets a non-login shell; pick up LSF if the startup files did not.
   [[ -r /etc/profile.d/profile.lsf.sh ]] && . /etc/profile.d/profile.lsf.sh
@@ -92,7 +98,16 @@ export BSUB_QUIET=1   # no "Job <n> is submitted" / "<<Waiting for dispatch>>" l
 BSUB=(bsub -n "$SLOTS" -W "$WALLTIME" -J agent-ssh)
 [[ -n "$QUEUE" ]] && BSUB+=(-q "$QUEUE")
 # A pty only for an interactive login with a terminal; commands get plain pipes.
-if [[ -z "$AGENT_SSH_COMMAND" && -t 0 ]]; then BSUB+=(-Is); else BSUB+=(-I); fi
+if [[ -z "$AGENT_SSH_COMMAND" && -t 0 ]]; then
+  BSUB+=(-Is)
+else
+  BSUB+=(-I)
+  # Without this, LSF sends an interactive job's stderr back on stdout. Everything the wrapper or
+  # the command writes to stderr (podman's "Trying to pull ...", a warning) then lands in the
+  # command's output, and in a file transfer it corrupts the stream: scp and sftp under --podman
+  # failed with "Received message too long". With it, stdout and stderr come back separately.
+  export LSF_INTERACTIVE_STDERR=y
+fi
 
 INNER_ARGV=("$SCRIPT_DIR/ssh-entry.sh" --inner --project "$PROJECT")
 [[ $PODMAN -eq 1 ]] && INNER_ARGV+=(--podman)
