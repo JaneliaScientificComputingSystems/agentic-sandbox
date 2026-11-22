@@ -385,6 +385,9 @@ flowchart TB
   `--gpu` to the wrapper. It needs a GPU queue in `--queue` and the `--slots` that queue expects.
   Each command then holds those GPUs while it runs, so for most work leave it out and let the
   agent submit GPU jobs with `csub`.
+- **`--csub-policy FILE`** (before the ` -- `) gives this key line its own csub policy and passes
+  `--csub` to the wrapper. Without it every key uses `~/.config/csub/broker.toml`. Use it when two
+  projects need different limits. The file must be outside the project.
 - **A host or directory has to be allowed twice** when jobs go through `--csub`: here in the key line,
   and in the csub policy (`csub-policy.sh --allow HOST --ro DIR`). A job the agent submits must pass
   the policy and stay inside the sandbox it was submitted from; with only one of the two, csub
@@ -650,7 +653,7 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --image NAME    (podman-run.sh) any OCI image; default agentic-sandbox-lite
   -h, --help      Show help
 
-ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN] [-- wrapper options]
+ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN] [--csub-policy FILE] [-- wrapper options]
                   # forced command for an agent's ssh key: each ssh command becomes a sandboxed LSF job
 
 csub-policy.sh --bwrap|--podman --rw DIR [--ro DIR] [--allow HOST] [--gpus N] [--slots N]

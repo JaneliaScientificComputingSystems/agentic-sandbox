@@ -12,7 +12,8 @@
 # started in the project directory, and relays stdin, stdout, stderr and the exit status. The
 # only things that run on the login node are this script and bsub.
 #
-#   ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN] [-- wrapper options]
+#   ssh-entry.sh --project DIR [--podman] [--queue Q] [--slots N] [--gpus N] [--walltime MIN]
+#                [--csub-policy FILE] [-- wrapper options]
 #
 # The sandbox is bwrap (sandbox-run.sh) unless --podman is given, which runs the command in a
 # container image through podman-run.sh instead, with the project directory bound read-write
@@ -25,17 +26,21 @@
 # needs a GPU queue with --queue and enough --slots for that queue. Every command then holds
 # those GPUs while it runs, so for most work leave it out and let the agent submit GPU jobs
 # with csub.
+# --csub-policy FILE makes the csub broker of this key line read FILE as its policy, and gives
+# the wrapper --csub. Without it the broker reads ~/.config/csub/broker.toml, the same for every
+# key. Use it to give two projects different limits. FILE must be outside the project, which
+# the agent can write.
 # With no command (a plain `ssh janelia-agent`), the job is an interactive shell in the sandbox.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { echo "ssh-entry.sh: $*" >&2; exit 1; }
 
-PROJECT="" QUEUE="" SLOTS=1 WALLTIME=240 INNER=0 PODMAN=0 GPUS=0
+PROJECT="" QUEUE="" SLOTS=1 WALLTIME=240 INNER=0 PODMAN=0 GPUS=0 POLICY=""
 SANDBOX_OPTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project|--queue|--slots|--walltime|--gpus)
+    --project|--queue|--slots|--walltime|--gpus|--csub-policy)
       [[ $# -ge 2 ]] || die "$1 needs an argument"
       case "$1" in
         --project) PROJECT="$2" ;;
@@ -43,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --slots) SLOTS="$2" ;;
         --gpus) GPUS="$2" ;;
         --walltime) WALLTIME="$2" ;;
+        --csub-policy) POLICY="$2" ;;
       esac
       shift 2 ;;
     --inner) INNER=1; shift ;;
@@ -55,6 +61,7 @@ done
 [[ -n "$PROJECT" ]] || die "--project DIR is required"
 [[ "$SLOTS" =~ ^[0-9]+$ && "$WALLTIME" =~ ^[0-9]+$ && "$GPUS" =~ ^[0-9]+$ ]] || die "--slots, --gpus and --walltime take whole numbers"
 if [[ $GPUS -gt 0 && " ${SANDBOX_OPTS[*]:-} " != *" --gpu "* ]]; then SANDBOX_OPTS+=(--gpu); fi
+if [[ -n "$POLICY" && " ${SANDBOX_OPTS[*]:-} " != *" --csub "* ]]; then SANDBOX_OPTS+=(--csub); fi
 [[ -z "$QUEUE" || "$QUEUE" =~ ^[A-Za-z0-9_]+$ ]] || die "--queue $QUEUE: not a queue name"
 
 if [[ $INNER -eq 1 ]]; then
@@ -66,6 +73,13 @@ if [[ $INNER -eq 1 ]]; then
   # BSUB_QUIET was for the login-node bsub only: left set, it silences the "Job <n> is submitted"
   # line that csub's broker reads the job id from.
   unset AGENT_SSH_COMMAND BSUB_QUIET LSF_INTERACTIVE_STDERR
+  if [[ -n "$POLICY" ]]; then
+    # The wrapper starts the broker from this command, and reads the state directory from the
+    # file named after --policy.
+    BROKER="${CSUB_BROKER_CMD:-$(command -v csub-broker || true)}"
+    [[ -n "$BROKER" ]] || die "--csub-policy needs csub-broker on PATH on $(hostname)"
+    export CSUB_BROKER_CMD="$BROKER --policy $POLICY"
+  fi
   if [[ $PODMAN -eq 1 ]]; then
     # podman-run.sh binds nothing by default and starts in the image's own directory: bind
     # the project and enter it before running the command.
@@ -93,6 +107,12 @@ HOME_P="$(cd "$HOME" 2>/dev/null && pwd -P)" || HOME_P="$HOME"
 if [[ "$PROJECT" == "$HOME_P" || "$PROJECT" == "${HOME_P%/}/"* || "$HOME_P" == "${PROJECT%/}/"* ]]; then
   die "project directory $PROJECT is your home directory, or inside it, or above it; use a directory outside \$HOME"
 fi
+if [[ -n "$POLICY" ]]; then
+  [[ "$POLICY" == /* && -f "$POLICY" && -r "$POLICY" ]] || die "--csub-policy $POLICY: not a readable file with an absolute path"
+  POLICY="$(cd -- "$(dirname -- "$POLICY")" && pwd -P)/$(basename -- "$POLICY")" || die "cannot resolve --csub-policy"
+  [[ "$POLICY" =~ ^[A-Za-z0-9_./@+,-]+$ ]] || die "--csub-policy $POLICY: the path may hold letters, digits and _ . / @ + , - only"
+  [[ ! -L "$POLICY" && "$POLICY" != "${PROJECT%/}/"* ]] || die "--csub-policy $POLICY: the policy must not be a symbolic link or inside the project, which the agent can write"
+fi
 if ! command -v bsub >/dev/null 2>&1; then
   # A forced command gets a non-login shell; pick up LSF if the startup files did not.
   [[ -r /etc/profile.d/profile.lsf.sh ]] && . /etc/profile.d/profile.lsf.sh
@@ -118,6 +138,7 @@ fi
 
 INNER_ARGV=("$SCRIPT_DIR/ssh-entry.sh" --inner --project "$PROJECT")
 [[ $PODMAN -eq 1 ]] && INNER_ARGV+=(--podman)
+[[ -n "$POLICY" ]] && INNER_ARGV+=(--csub-policy "$POLICY")
 INNER_ARGV+=(-- "${SANDBOX_OPTS[@]}")
 # bsub joins its arguments into one string for a shell on the execution host: quote each.
 exec "${BSUB[@]}" "$(printf '%q ' "${INNER_ARGV[@]}")"

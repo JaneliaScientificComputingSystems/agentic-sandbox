@@ -299,6 +299,16 @@ command rm ~/agent_cluster.pub
    `~/.ssh/authorized_keys`: running the block again would append a second line for the same key.
    For podman, add `--podman` before `--queue` and write the policy with `--podman`.
 
+   With more than one project, each key line can have its own csub policy, for different limits
+   per project. This is optional: without it every key uses the one policy from step 1. Write the
+   second policy to its own file with `--out`, outside the project, and name it in the key line
+   before the ` -- `:
+
+```bash
+"$SANDBOX"/csub-policy.sh --bwrap --rw $PROJECT2 --out ~/.config/csub/project2.toml
+OPTS="--project $PROJECT2 --queue interactive --walltime 60 --csub-policy $HOME/.config/csub/project2.toml -- --csub"
+```
+
 5. `LAPTOP`: test by hand. Each command is a cluster job, so each takes up to a minute to start.
 
 ```bash
