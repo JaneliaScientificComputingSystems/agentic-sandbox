@@ -295,6 +295,11 @@ s_17() {
     OUT=$(cd "$CW/planted" && CSUB_BROKER_CMD="$(dirname "$(command -v csub-broker)")/python3 -m csub.broker" "$SANDBOX_RUN" --csub -- true >/dev/null 2>&1; echo "rc=$?,ran=$(compgen -G "$CW/planted/*.RAN" | wc -l)")
     check "--csub: same with the broker given as 'python3 -m csub.broker'" "$OUT" "rc=0,ran=0"
     check "--csub: no broker left behind after the planted-module runs" "$(brokers)" "$BASE_BROKERS"
+    # With the per-job record on (the default; this suite turns it off) and no job submitted, the
+    # record has nothing to list. That must not stop the cleanup: status kept, broker gone.
+    OUT=$(cd "$CW" && SANDBOX_RECORD=on "$SANDBOX_RUN" --csub -- bash -c 'exit 7' >/dev/null 2>&1; echo "rc=$?")
+    check "--csub with the record on and no job submitted: exit status kept" "$OUT" "rc=7"
+    check "--csub with the record on: no broker left behind" "$(brokers)" "$BASE_BROKERS"
     if csub-broker --help 2>&1 | grep -q -- --envelope-mount; then
       # A directory under the same allowed root that the sandbox does not mount: the policy would
       # accept the claim, the envelope must not (rc 3; without the envelope this exits 0).

@@ -792,13 +792,13 @@ record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started
   state="$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$policy" 2>/dev/null | head -1)"
   state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
   [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
-  find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200
+  { find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200; } || true   # no match is not a failure
 }
 write_record() {  # $1 = exit status of the command
   [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
   local plog="" jobs="" dir file
   [[ -n "${PROXY_DIR:-}" && -s "$PROXY_DIR/proxy.log" ]] && grep -qE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$PROXY_DIR/proxy.log" 2>/dev/null && plog="$PROXY_DIR/proxy.log"
-  [[ ${WANT_CSUB:-0} -eq 1 ]] && jobs="$(record_csub_jobs)"
+  if [[ ${WANT_CSUB:-0} -eq 1 ]]; then jobs="$(record_csub_jobs)" || jobs=""; fi
   [[ -n "$plog" || -n "$jobs" ]] || return 0
   dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
   mkdir -p "$dir" 2>/dev/null || return 0
@@ -847,7 +847,7 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ $rc -ne 0 ]] && summarize_proxy_denials
   declare -F report_new_config >/dev/null && report_new_config
-  write_record "$rc"
+  write_record "$rc" || true   # the record is best effort; nothing in it may stop the cleanup below
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
