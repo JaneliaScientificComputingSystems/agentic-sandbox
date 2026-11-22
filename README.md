@@ -569,6 +569,11 @@ podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --
   through the sandbox's network, so `--ib` opens the InfiniBand fabric to the sandboxed process.
   Under podman the image must bring the user-space side (`libibverbs` and the mlx5 provider);
   `agentic-sandbox-gpu` does.
+- **"Connection reset by peer" in the first seconds is expected.** `pasta` accepts a connection
+  from another node before anything inside the sandbox listens on that port, and then drops it.
+  Without a sandbox the same attempt is refused. Programs that retry carry on: PyTorch logs a
+  warning with a stack trace for each attempt and then connects. It happens when a worker on
+  one node starts a moment before the process it connects to on another.
 - **Refused together.** `--job-nodes` and `--host-net` each refuse `--allow`, `--csub`, `--claude`
   and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network. `--ib`
   refuses `--csub`, `--claude` and `--opencode` for the same reason. `--host-net` refuses `--ib`:
