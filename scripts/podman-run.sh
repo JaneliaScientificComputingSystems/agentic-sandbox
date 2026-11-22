@@ -777,7 +777,7 @@ elif [[ $WANT_JOBNET -eq 1 ]]; then
   # narrows the routes; /etc/hosts names the job's nodes, since no DNS server is reachable.
   mkdir "$JOB_DIR/hooks"
   { echo "127.0.0.1 localhost"; printf '%s' "$JOBNET_HOSTS_TEXT"; } > "$JOB_DIR/hosts"
-  PODMAN_ARGS+=(--network=pasta --hooks-dir "$JOB_DIR/hooks" --hostname "$(hostname)" --no-hosts)
+  PODMAN_ARGS+=(--network=pasta --hooks-dir "$JOB_DIR/hooks" --hostname "$(hostname)" --no-hosts --cap-drop=NET_ADMIN --cap-drop=NET_RAW)
   net_mount "$JOB_DIR/hosts" /etc/hosts
 else
   PODMAN_ARGS+=(--network=none)

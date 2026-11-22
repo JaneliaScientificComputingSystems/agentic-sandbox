@@ -160,6 +160,50 @@ else
 fi
 "$W" --job-nodes -- true </dev/null >/dev/null 2>&1 && ok "a sandbox starts right after the dry runs" || bad "a sandbox after the dry runs"
 
+echo "8. a socket bound to the interface does not get past the limit"
+# SO_BINDTODEVICE needs no privilege and skips a failed route lookup; pasta would then forward
+# the packet to any host. The sandbox here has no peer, so the job's other node is an outsider;
+# a listener there, outside any sandbox, must hear the control and nothing from inside.
+OTHER=""; for i in "${!HOSTS[@]}"; do [[ "${ADDRS[$i]}" != "$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" ]] && OTHER="${HOSTS[$i]}" && OTHERIP="${ADDRS[$i]}"; done
+cat > listen.py <<'EOF'
+import socket, sys, time
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("0.0.0.0", 47123)); u.settimeout(1)
+t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("0.0.0.0", 47124)); t.listen(5); t.settimeout(1)
+open(sys.argv[2], "w").close()
+end = time.time() + float(sys.argv[1])
+while time.time() < end and not __import__("os").path.exists(sys.argv[2] + ".stop"):
+    try:
+        d, a = u.recvfrom(100); open(sys.argv[2], "a").write("UDP %s\n" % d.decode())
+    except socket.timeout: pass
+    try:
+        c, a = t.accept(); open(sys.argv[2], "a").write("TCP %s\n" % c.recv(100).decode()); c.close()
+    except socket.timeout: pass
+EOF
+cat > send.py <<'EOF'
+import socket, sys
+target, tag = sys.argv[1], sys.argv[2]
+for dev in [None] + [n for _, n in socket.if_nameindex() if n != "lo"]:
+    for kind in ("udp", "tcp"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM); s.settimeout(4)
+        try:
+            if dev: s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
+            if kind == "udp": s.sendto(tag.encode(), (target, 47123))
+            else: s.connect((target, 47124)); s.sendall(tag.encode())
+        except OSError: pass
+EOF
+if [[ -n "$OTHER" ]]; then
+  blaunch -z "$OTHER" python3 "$TR/listen.py" 300 "$TR/heard" >/dev/null 2>&1 &
+  LP=$!
+  for _ in $(seq 1 30); do [[ -e heard ]] && break; sleep 1; done
+  python3 send.py "$OTHERIP" control
+  "$W" --peers "$(hostname)" ${MNT[@]+"${MNT[@]}"} -- python3 "$TR/send.py" "$OTHERIP" inside >/dev/null 2>&1
+  sleep 3; : > heard.stop; wait $LP 2>/dev/null
+  [[ "$(grep -c control heard)" -ge 2 ]] && ok "the listener on the other node hears a sender outside the sandbox" || bad "control: the listener heard nothing ($(tr '\n' ';' < heard))"
+  [[ "$(grep -c inside heard)" -eq 0 ]] && ok "nothing from inside the sandbox reaches it, bound to the interface or not" || bad "packets from inside reached a node that is not a peer: $(grep inside heard | tr '\n' ';')"
+else
+  bad "no second node found for the bound-socket check"
+fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

@@ -34,9 +34,14 @@ for a in "$@"; do
   ns ip -4 route add "$a/32" dev "$ifn" || die "cannot add the route to $a"
   n=$((n + 1))
 done
-# Exactly the job's nodes, nothing else: no default route, no network route.
+# Every other address is made local to the container's namespace: a socket bound to the interface
+# skips a failed route lookup and pasta would forward its packets (see sandbox-run.sh).
+ns ip -4 route add local default dev "$ifn" || die "cannot add the catch-all local route"
+# Exactly the job's nodes in the main table (no default route, no network route), and the catch-all
+# in the local table.
 routes="$(ns ip -4 route show)" || die "cannot read the routes back"
 [[ "$(grep -c . <<< "$routes" || true)" -eq "$n" ]] || die "unexpected routes: $routes"
-! grep -qE '^default|/' <<< "$routes" || die "unexpected routes: $routes"
+! grep -qE 'default|/' <<< "$routes" || die "unexpected routes: $routes"
+[[ "$(ns ip -4 route show table local | grep -c "^local default dev $ifn " || true)" -eq 1 ]] || die "the catch-all local route is missing"
 rm -f "$dir/net.starting"
 exit 0

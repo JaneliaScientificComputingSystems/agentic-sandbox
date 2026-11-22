@@ -430,7 +430,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       _pre=(); command -v setpriv >/dev/null && _pre=(setpriv --pdeathsig KILL)
       JOBNET_PASTA=(${_pre[@]+"${_pre[@]}"} pasta --config-net -4 -q -i "$_hif" -I "$_hif" "${_fwd[@]}"
                     -u none -T none -U none --no-map-gw --
-                    ${_pre[@]+"${_pre[@]}"} "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"})
+                    ${_pre[@]+"${_pre[@]}"} "$SCRIPT_DIR/$(basename "$(readlink -f "${BASH_SOURCE[0]}")")" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"})
       if [[ $DRY_RUN -eq 1 ]]; then
         # A dry run starts nothing: no pasta, no second run of this script. What the inner stage
         # would be given is set here (not exported), the routes are left alone, and the script
@@ -449,8 +449,17 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       : > "$SANDBOX_NET_MARK"
       # pasta is stopped on every way out of this stage. (It normally ends with the inner stage,
       # and _pp is emptied once it has been waited for.)
-      _pp=""
+      _pp="" _sig=""
       trap '[[ -n "$_pp" ]] && kill "$_pp" 2>/dev/null || true' EXIT
+      # A signal sent to this pid alone (a launcher stopping one worker) is passed to everything
+      # below pasta: the inner stage, bwrap and the sandboxed command. The inner stage alone would
+      # not do: bash runs a trap only when its foreground command returns, so it would sit on the
+      # signal until the sandboxed command ended by itself. (bkill and walltime kills signal every
+      # process of the job anyway.) Set before pasta starts: a signal that arrives while the inner
+      # stage is still coming up is remembered and passed on once it is there.
+      _tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null || true); do echo "$c"; _tree "$c"; done; }
+      _fwd_sig() { local k=""; _sig="$1"; [[ -n "$_pp" ]] && k="$(_tree "$_pp")"; [[ -n "$k" ]] && kill -"$1" $k 2>/dev/null; true; }
+      trap '_fwd_sig TERM' TERM; trap '_fwd_sig INT' INT; trap '_fwd_sig USR2' USR2
       # In the background, so that the traps below run at once; `<&0` keeps the caller's stdin.
       "${JOBNET_PASTA[@]}" <&0 {_lockfd}>&- &
       _pp=$!
@@ -459,14 +468,11 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
         sleep 0.1
       done
       exec {_lockfd}>&-
-      # A signal sent to this pid alone (a launcher stopping one worker) is passed to everything
-      # below pasta: the inner stage, bwrap and the sandboxed command. The inner stage alone would
-      # not do: bash runs a trap only when its foreground command returns, so it would sit on the
-      # signal until the sandboxed command ended by itself. (bkill and walltime kills signal every
-      # process of the job anyway.)
-      _tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null || true); do echo "$c"; _tree "$c"; done; }
-      _fwd_sig() { local k; k="$(_tree "$_pp")"; [[ -n "$k" ]] && kill -"$1" $k 2>/dev/null; true; }
-      trap '_fwd_sig TERM' TERM; trap '_fwd_sig INT' INT; trap '_fwd_sig USR2' USR2
+      # A signal from the start-up window: pass it on now that the inner stage exists, or stop
+      # pasta if it has nothing below it.
+      if [[ -n "$_sig" ]]; then
+        if [[ -n "$(_tree "$_pp")" ]]; then _fwd_sig "$_sig"; else kill "$_pp" 2>/dev/null || true; fi
+      fi
       _rc=0
       while :; do
         wait "$_pp" && _rc=0 || _rc=$?
@@ -498,9 +504,18 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       "$IP_BIN" -4 route add "$a/32" dev "$SANDBOX_NET_IF" || jobnet_die "could not add the route to $a"
       _n=$((_n + 1))
     done
-    # Exactly one route per other node, and nothing else: fail closed on anything unexpected.
-    [[ "$("$IP_BIN" -4 route show | grep -c .)" == "$_n" && -z "$("$IP_BIN" -4 route show default)" ]] \
-      || jobnet_die "the routing table is not what was set: $("$IP_BIN" -4 route show | tr '\n' ';')"
+    # Every other address is made local to this namespace. Without it a socket bound to the
+    # interface (SO_BINDTODEVICE needs no privilege) skips the failed route lookup, the kernel
+    # treats the destination as on-link, and pasta forwards the packet: shown on the cluster on
+    # 21 November 2026, a datagram reached a node that was not a peer. With this route the lookup
+    # succeeds and the packet stays inside.
+    "$IP_BIN" -4 route add local default dev "$SANDBOX_NET_IF" || jobnet_die "could not add the catch-all local route"
+    # Exactly one route per other node in the main table, and that one in the local table: fail
+    # closed on anything unexpected.
+    _rt="$("$IP_BIN" -4 route show)"
+    [[ "$(grep -c . <<< "$_rt" || true)" == "$_n" && -z "$(grep -E 'default|/' <<< "$_rt" || true)" \
+       && "$("$IP_BIN" -4 route show table local | grep -c "^local default dev $SANDBOX_NET_IF " || true)" == 1 ]] \
+      || jobnet_die "the routing table is not what was set: $(tr '\n' ';' <<< "$_rt")"
     # Listeners that let the system pick a port get one from the top 1500 of the forwarded range.
     echo "$(( ${SANDBOX_NET_PORTS#* } - 1499 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
       || jobnet_die "could not set the port range"
