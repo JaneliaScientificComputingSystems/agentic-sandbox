@@ -136,6 +136,30 @@ if [[ $PODMAN -eq 0 ]]; then
   rm -rf "$STATE/$LSB_JOBID-"* 2>/dev/null   # a killed run cannot clean up after itself
 fi
 
+echo "7. --dry-run with the network options"
+# Prints what would run and starts nothing: no command, no pasta, no state directory, and no
+# port block held (a real sandbox started right after still gets one).
+dry() {  # dry "what" "text the output must contain" "text it must not contain" wrapper-args...
+  local what=$1 want=$2 not=$3 out rc; shift 3
+  out="$("$W" --dry-run "$@" ${MNT[@]+"${MNT[@]}"} -- touch "$TR/dry.ran" 2>&1 </dev/null)"; rc=$?
+  if [[ $rc -eq 0 && "$out" == *"$want"* && ( -z "$not" || "$out" != *"$not"* ) && ! -e "$TR/dry.ran" \
+        && -z "$(pgrep -u "$(id -u)" -x pasta || true)" && "$(left)" -eq 0 ]]; then
+    ok "--dry-run $what"
+  else
+    bad "--dry-run $what (exit $rc, ran=$([[ -e "$TR/dry.ran" ]] && echo yes || echo no), state dirs $(left): ${out:0:160})"
+  fi
+}
+dry "--job-nodes names pasta and the ports" "Ports open to the job's other nodes" "" --job-nodes --listen 40123
+dry "--peers" "the network relay (pasta)" "" --peers "$(hostname)"
+if [[ $PODMAN -eq 1 ]]; then
+  dry "--host-net" "--network=host" "--network=none" --host-net
+  dry "without a network option" "--network=none" "pasta"
+else
+  dry "--host-net" "no helper is started" "--unshare-net" --host-net
+  dry "without a network option" "--unshare-net" "pasta"
+fi
+"$W" --job-nodes -- true </dev/null >/dev/null 2>&1 && ok "a sandbox starts right after the dry runs" || bad "a sandbox after the dry runs"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
