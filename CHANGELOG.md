@@ -26,8 +26,7 @@ behind each change.
   relative `--policy` path works only with that form.
 - **`ssh-entry.sh` refuses a project directory inside `$HOME`** (and `$HOME` itself, or a directory
   above it), on the login node, before it submits anything. The script used to check only that the
-  directory existed, so a key line could hand the agent `~/.ssh` read-write. If your key line names
-  a project under your home directory, move the project and edit the line.
+  directory existed, so a key line could hand the agent `~/.ssh` read-write.
 - **Proxy: an allowed name is checked for where it points.** `--allow NAME` used to connect to
   whatever the name resolved to. The proxy now resolves it once, refuses loopback, link-local
   (169.254), multicast, unspecified and reserved addresses, and connects to the address it checked.
@@ -47,7 +46,7 @@ behind each change.
   cannot be moved aside. An agent could otherwise plant a git hook or an MCP server that ran as
   you the next time you used the project outside the sandbox. **This changes behaviour:**
   `git config` inside a repository fails (commits and branches work, and your git identity is
-  passed in), and a task that must edit these files needs `--no-protect`. If the command creates
+  passed in), and `--no-protect` turns the protection off. If the command creates
   such a file where there was none, the wrapper names it at exit.
 
 ### Other changes
@@ -55,7 +54,7 @@ behind each change.
 - **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on
   stdout, so anything the wrapper or the command wrote to stderr (with `--podman`, "Trying to pull
   ..." and an image id on every command) appeared in the command's output. Commands without a
-  terminal now get the two streams separately. If you parsed that mixed output, read stderr too.
+  terminal now get the two streams separately.
 - **`scp` and `sftp` work through `ssh-entry.sh --podman`.** This needs both the new images and
   this version of `ssh-entry.sh`; with an old checkout the copy still fails with "Received message
   too long". Both images now carry `sftp-server`. The default image also gained `pip` and `venv`.
@@ -143,7 +142,7 @@ behind each change.
   interactive agent, and the conversation itself -- was copied into the node's journal and the
   central syslog. Output still reaches your terminal and the job's output file as before;
   `podman logs` shows nothing for these containers (the wrapper never used it). There is no flag
-  to turn it back on. Update your copy of the wrapper to get this.
+  to turn it back on.
 - **`podman-run.sh --shm-size SIZE`**, and `/dev/shm` is **8g by default with `--gpu`** (it was
   podman's 64 MB, which PyTorch DataLoader workers fill at once: "unable to allocate shared
   memory(shm)"). Without `--gpu` and without the flag nothing changes. csub child jobs that run
@@ -183,8 +182,8 @@ behind each change.
 ## 2026-11-02
 
 - **`sandbox-run.sh` refuses to run from `$HOME`** (or a directory above it): `$PWD` is bound
-  read-write and that would expose the whole home directory. Use `--rw "$HOME"` from a project
-  directory if you really mean it.
+  read-write and that would expose the whole home directory. `--rw "$HOME"` from a project
+  directory is still accepted.
 - **More credential paths masked** under a visible `$HOME`/`$PWD`/bound root: `.gnupg`, `.config/gh`,
   `.config/git/credentials`, `.pgpass`, `.vault-token`, `.cache/huggingface/token`, shell history
   files, and the other harness's credentials (`~/.claude/.credentials.json` without `--claude`,
