@@ -77,7 +77,7 @@
 #                          .git/config, .mcp.json, .claude/, .vscode and the like). By default
 #                          they are read-only where they exist in a read-write directory, and
 #                          ones the command creates are reported at exit. See "Files that run
-#                          later" below.
+#                          later" in the README.
 #   -h, --help             Show this help
 #
 # The toolchain (/usr /bin /lib64 /lib /sbin /etc) and $PWD (read-write, wherever
@@ -168,7 +168,7 @@
 # with a csub that lacks it, the wrapper refuses to start; CSUB_ENVELOPE=off overrides that.
 #
 # Examples:
-#   sandbox-run.sh --scratch --allow litellm.int.janelia.org -- \
+#   sandbox-run.sh --scratch --opencode --allow litellm.int.janelia.org -- \
 #     opencode run "..." --model litellm/kimi-k3
 #
 #   sandbox-run.sh --scratch --claude \
@@ -178,7 +178,7 @@ set -euo pipefail
 # The environment as it was handed to this script, for --env: looked up later, a name such as CMD
 # or p would give this script's own variable of that name.
 declare -A ENV_AT_START=()
-while IFS= read -r _n; do ENV_AT_START[$_n]="${!_n}"; done < <(compgen -e)
+while IFS= read -r _n; do [[ "$_n" == ENV_AT_START ]] || ENV_AT_START[$_n]="${!_n-}"; done < <(compgen -e)
 unset _n
 
 # Python that this script starts on the host (the csub broker, its lookup) must never import from
@@ -626,7 +626,8 @@ if [[ $WANT_CLAUDE -eq 1 ]]; then
   CLAUDE_CFG="$SANDBOX_CFG_ROOT/claude"
   mkdir -p "$CLAUDE_CFG"
   for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md"; do
-    [[ -f "$f" ]] && cp "$f" "$CLAUDE_CFG/$(basename "$f")"
+    # --no-preserve=mode: a read-only original must still give a copy the wrapper can append to.
+    [[ -f "$f" ]] && cp --no-preserve=mode "$f" "$CLAUDE_CFG/$(basename "$f")"
   done
   CFG_BINDS+=(--bind "$CLAUDE_CFG" "$CLAUDE_CFG")
   if [[ -f "$HOME/.claude/.credentials.json" ]]; then
@@ -1187,6 +1188,12 @@ cleanup() {
   # (tests and user pipelines take `2>&1 | tail -1`), and opencode denials in a successful run
   # (its registry.npmjs.org / models.opencode.ai pings) are the allowlist working, not news.
   local rc=$?
+  # Nothing in here may end the cleanup early. `set -e` would, on any command that fails, and so
+  # would a message written to a stderr whose reader has gone (`... 2>&1 | head`, a closed
+  # terminal): bash dies of SIGPIPE in the middle. Either way the broker and the per-job state
+  # directory would be left. The status is restored by the `exit` at the end.
+  set +e
+  trap '' PIPE
   # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
   # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
   trap '' TERM INT USR2
@@ -1208,7 +1215,7 @@ cleanup() {
     chmod -R u+rwX "$JOB_DIR" 2>/dev/null || true
     rm -rf "$JOB_DIR" 2>/dev/null || echo "sandbox-run.sh: could not remove $JOB_DIR; remove it by hand (it holds copies of your agent configuration)" >&2
   fi
-  true
+  exit "$rc"
 }
 # Replaces early_cleanup (installed right after the per-job dir was made); the signal traps set
 # up there keep routing through whichever EXIT trap is current.

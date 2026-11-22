@@ -66,8 +66,8 @@ done
 
 [[ -n "$KIND" ]] || die "give --bwrap or --podman"
 [[ ${#RW[@]} -gt 0 ]] || die "give at least one --rw DIR (the project directory)"
-for n in $GPUS $SLOTS $WALLTIME $PENDING; do
-  [[ "$n" =~ ^[0-9]+$ ]] || die "not a whole number: $n"
+for n in "$GPUS" "$SLOTS" "$WALLTIME" "$PENDING"; do
+  [[ -z "$n" || "$n" =~ ^(0|[1-9][0-9]*)$ ]] || die "not a whole number: $n"
 done
 [[ -z "$COST" || "$COST" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "not a number: $COST"
 

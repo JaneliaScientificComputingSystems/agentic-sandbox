@@ -109,6 +109,20 @@ behind each change.
   `~/.agentic-sandbox/records/<date>/`, outside the sandbox: the command, its exit status, every
   host the proxy allowed or refused with the time, and the csub jobs recorded meanwhile. The proxy's
   log lines now carry the time. `SANDBOX_RECORD=off` turns the record off.
+- **`sandbox-run.sh`** refuses to run from `/tmp` and refuses `--ro`/`--rw` of `/`, `/tmp`, `/proc`
+  or `/dev`: the sandbox has its own, and the bind put the node's in their place. A directory
+  beneath them works as before.
+- **`csub-policy.sh`** refuses a directory inside the home directory, as `ssh-entry.sh` does.
+- **`--env NAME`** passes the value from the environment the wrapper was started with. A name the
+  wrapper also uses for itself (`CMD`, `p`) gave the wrapper's value.
+- **A proxy or broker that stops while starting:** the wrapper prints the last lines of its log.
+- **`bkill`'s USR2** ends a wrapper with status 140, not 141.
+- **Cleanup always runs to its end**, also when the wrapper's messages go to a pipe whose reader has
+  gone (`... 2>&1 | head`) or to a closed terminal. It could stop there and leave the csub broker
+  and the per-job directory.
+- **`podman-run.sh`** asks for a terminal only when both input and output are one. With the output
+  sent to a file or a pipe from an interactive shell, it held carriage returns and error messages.
+- **`--claude`** starts when `~/.claude/CLAUDE.md` is read-only.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20

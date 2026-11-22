@@ -466,7 +466,7 @@ if [[ $WANT_CLAUDE -eq 1 ]]; then
   CLAUDE_CFG="$SANDBOX_CFG_ROOT/claude"
   mkdir -p "$CLAUDE_CFG"
   for f in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md"; do
-    [[ -f "$f" ]] && cp "$f" "$CLAUDE_CFG/$(basename "$f")"
+    [[ -f "$f" ]] && cp --no-preserve=mode "$f" "$CLAUDE_CFG/$(basename "$f")"
   done
   VOLUMES+=("-v" "$CLAUDE_CFG:$CLAUDE_CFG:rw")
   # The credentials file is bind-mounted THROUGH to the real one, exactly as sandbox-run.sh
@@ -797,7 +797,9 @@ fi
 # exits immediately (looks like the container "won't stay open", but it ran fine and exited
 # on its own). Only add -t when a real terminal is attached; podman errors on -t under a
 # tty-less bsub/one-shot job.
-if [[ -t 0 ]]; then
+# Both ends: with only stdin a terminal and the output going to a file or a pipe, a pty would
+# put carriage returns and the command's stderr into that output.
+if [[ -t 0 && -t 1 ]]; then
   PODMAN_ARGS+=(-it)
 else
   PODMAN_ARGS+=(-i)
@@ -1068,6 +1070,12 @@ write_record() {  # $1 = exit status of the command
 }
 cleanup() {
   local rc=$?   # the script's exit status on entry; see the denied-host summary below
+  # Nothing in here may end the cleanup early. `set -e` would, on any command that fails, and so
+  # would a message written to a stderr whose reader has gone (`... 2>&1 | head`, a closed
+  # terminal): bash dies of SIGPIPE in the middle. Either way the broker and the per-job state
+  # directory would be left. The status is restored by the `exit` at the end.
+  set +e
+  trap '' PIPE
   # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
   # second would run its own `exit` trap in the middle of cleanup and skip the rest of it.
   trap '' TERM INT USR2
@@ -1153,9 +1161,9 @@ cleanup() {
     kill_orphaned_catatonit_for_this_job
   done
   if [[ -e "$JOB_DIR" ]]; then
-    echo "podman-run.sh: couldn't clean up $JOB_DIR (still busy after 30s) -- remove later with: podman unshare rm -rf $JOB_DIR" >&2
+    echo "podman-run.sh: couldn't clean up $JOB_DIR (still busy after 5s) -- remove later with: podman unshare rm -rf $JOB_DIR" >&2
   fi
-  true
+  exit "$rc"
 }
 # Replaces early_cleanup (installed right after the per-job dir was made): from here on an exit
 # may have a container, a pause process or a populated per-job store to tear down. The signal
