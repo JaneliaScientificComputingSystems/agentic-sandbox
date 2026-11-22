@@ -125,9 +125,8 @@
 #   --host-net is the fallback for queues without InfiniBand. There NCCL sends its data over
 #   TCP, through the relay, and a bandwidth test on two L4 nodes ran about 40 times slower
 #   (0.15 GB/s against 6 GB/s). --host-net leaves the network namespace alone instead: full
-#   speed, and the sandboxed process can reach whatever the node can, including services on
-#   the node's own loopback and its abstract Unix sockets. What it cannot do is read anything
-#   outside its binds, so what could leave is the project directory and the mounted inputs.
+#   speed, on the node's own network, unrestricted. Files, credentials, environment and
+#   processes are sandboxed as always.
 #
 # Config isolation (--claude/--opencode): the harness's *configuration* is where a
 # prompt-injected agent can persist: ~/.claude/settings.json hooks and ~/.claude.json MCP
