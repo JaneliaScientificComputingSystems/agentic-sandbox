@@ -129,6 +129,8 @@ behind each change.
   the laptop may still ask for approval of the command.
 - **Records older than 30 days are removed** when a new one is written. `SANDBOX_RECORD_DAYS` sets
   another number of days, and `0` keeps them all.
+- **`ssh-entry.sh --csub-policy FILE`** gives one key line its own csub policy. Without the option
+  nothing changes: every key uses `~/.config/csub/broker.toml`.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20
