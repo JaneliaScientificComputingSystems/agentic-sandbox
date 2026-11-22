@@ -131,6 +131,10 @@ behind each change.
   another number of days, and `0` keeps them all.
 - **`ssh-entry.sh --csub-policy FILE`** gives one key line its own csub policy. Without the option
   nothing changes: every key uses `~/.config/csub/broker.toml`.
+- **Stopping the jobs an agent submitted:** the documented `bkill -g /csub/$USER 0` stopped nothing,
+  because csub puts each session's jobs in a group below that one. README and `SETUP.md` §8 now
+  give a line that stops them all.
+- **README:** the GPU example for podman names the GPU image; the default image has no PyTorch.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20

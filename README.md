@@ -77,8 +77,9 @@ mkdir -p /scratch/$USER/work && cd /scratch/$USER/work      # a work dir, not th
 bsub -q gpu_l4 -gpu "num=1" -n 8 -Is /bin/bash
 "$SANDBOX"/sandbox-run.sh --gpu --scratch --claude \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
-# ... or in a container image that brings CUDA, cuDNN and PyTorch
+# ... or in the container image that brings CUDA, cuDNN and PyTorch
 "$SANDBOX"/podman-run.sh --gpu --scratch --claude \
+  --image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest \
   --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- claude
 ```
 
@@ -358,7 +359,7 @@ flowchart TB
         cw --> cs --> job
     end
 
-    back["stdout, stderr and the exit status go back over the same ssh connection; scp works too.<br/>Nothing carries over between commands except files in the project directory.<br/>bkill -J agent-ssh 0 stops the ssh jobs, bkill -g /csub/$USER 0 the jobs the agent submitted."]
+    back["stdout, stderr and the exit status go back over the same ssh connection; scp works too.<br/>Nothing carries over between commands except files in the project directory.<br/>bkill -J agent-ssh 0 stops the ssh jobs. The command for the jobs the agent submitted is under 'To stop it' below."]
 
     harness -->|"the dedicated key"| sshd
     sshd -->|"seconds to a minute to start"| wrapper
@@ -395,8 +396,10 @@ flowchart TB
   the instruction file to put in the agent's working directory on the laptop: `CLAUDE.md` for Claude
   Code, `AGENTS.md` for Codex (`AGENTS-podman.md` with `--podman`, saved under either name). They point the agent at
   `$SANDBOX_README`, the sandbox's own description, with `ssh janelia-agent 'cat $SANDBOX_README'`.
-- **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions and `bkill -g /csub/$USER 0` the jobs it
-  submitted. Deleting the key line cuts the agent off; `expiry-time` does the same by date (the
+- **To stop it:** `bkill -J agent-ssh 0` ends the ssh sessions. The jobs it submitted sit in job
+  groups below `/csub/$USER`, one group per session, and this line stops them all:
+  `bjobs -noheader -o 'jobid job_group' | awk -v g="/csub/$USER/" 'index($2,g)==1 {print $1}' | xargs -r bkill`.
+  Deleting the key line cuts the agent off; `expiry-time` does the same by date (the
   date is the first day the key is refused).
 
 What this does not change: the agent's own process runs on the laptop with whatever that harness
@@ -430,9 +433,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 
 - **Claude Code.** A fresh `claude auth login` inside the sandbox works only if
   `~/.claude/.credentials.json` already exists on the host. An API key beats an expired login; never
-  put it on a `bsub` command line. Not carried in: `~/.claude/plugins`, skills, `projects/` history
-  (under `sandbox-run.sh`, add `--ro`/`--rw` for a path a task needs, and `--claude-history` for this
-  directory's history; `podman-run.sh` refuses paths inside `~/.claude`).
+  put it on a `bsub` command line. Not carried in: `~/.claude/plugins`, your own skills, `projects/` history
+  (under `sandbox-run.sh`, `--claude-history` brings this directory's history).
 - **opencode + Kimi K3.** **Always name the model** interactively, `opencode -m litellm/kimi-k3`: bare
   `opencode` defaults to its hosted "OpenCode Zen" model, which talks to hosts outside your allowlist
   and fails with a bare `Forbidden`. One-shot `opencode run ... --model litellm/kimi-k3` is unaffected.
@@ -616,7 +618,8 @@ that come from somewhere else.
   later"). Commits, branches, fetch, pull and `git clone` work; `git remote add` and branch tracking
   do not. Change such a file outside the sandbox, or start with `--no-protect`.
 - **A request hangs, or `claude`/`opencode` retries with `Request timed out`**: the host isn't on your
-  allowlist. Stop the command; the wrapper then prints the hosts it refused. Claude Code needs
+  allowlist. Stop the command; the wrapper then prints the hosts it refused (after a command that ends with
+  status 0 they are in the record only, `~/.agentic-sandbox/records/`). Claude Code needs
   `api.anthropic.com`, `claude.ai`, `platform.claude.com`; opencode+Kimi needs
   `litellm.int.janelia.org`. A host you did allow is also refused when its name resolves to a
   loopback or link-local address.
