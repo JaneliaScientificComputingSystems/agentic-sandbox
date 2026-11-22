@@ -131,7 +131,8 @@ need_arg() { [[ $# -ge 2 ]] || { echo "podman-run.sh: $1 needs an argument" >&2;
 #   - $HOME, or anything above it: .ssh, .aws, tokens, shell rc files, all exposed;
 #   - /scratch/$USER or anything above it, or anything inside .agentic-sandbox: every concurrent
 #     job's state dir (config copies, a proxy socket with a different allowlist).
-# A subdirectory of $HOME is fine. Checked on the canonical path.
+# A subdirectory of $HOME is fine unless it holds credentials (see refuse_wide_mount). Checked on
+# the canonical path.
 HOME_P="$(cd -P "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"
 SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
 STATE_PARENT_P="$(realpath -m -- "$SANDBOX_STATE_PARENT" 2>/dev/null || echo "$SANDBOX_STATE_PARENT")"
@@ -145,7 +146,8 @@ refuse_wide_mount() {
   # Credential locations under $HOME, and any directory that contains one (~/.config holds
   # gcloud and gh). sandbox-run.sh masks or refuses these; here nothing can hide them.
   local c
-  for c in .ssh .aws .azure .kube .config/gcloud .docker .gnupg .config/gh .claude; do
+  for c in .ssh .aws .azure .kube .config/gcloud .docker .gnupg .config/gh .config/git .claude \
+           .cache/huggingface .config/opencode .local/share/opencode .config/containers; do
     if [[ "$2" == "$HOME_P/$c" || "$2" == "$HOME_P/$c/"* || "$HOME_P/$c" == "$pre"* ]]; then
       echo "podman-run.sh: $1 $2: refusing to mount a directory that is, is inside, or contains ~/$c, which holds credentials. There is no credential masking under podman; mount a directory without them." >&2
       exit 1
@@ -183,7 +185,7 @@ while [[ $# -gt 0 ]]; do
       SHM_SIZE="$2"; shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
-    --scratch) SCRATCH_ROOT="/scratch/$USER/work"; mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
+    --scratch) mkdir -p "/scratch/$USER/work"; SCRATCH_ROOT="$(realpath -e -- "/scratch/$USER/work")"; VOLUMES+=("-v" "$SCRATCH_ROOT:$SCRATCH_ROOT:rw"); shift ;;
     --no-protect) PROTECT=0; shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
@@ -203,33 +205,70 @@ for p in "${RO_PATHS[@]:-}"; do
     [[ -n "$p" && "$p" == "$q" ]] && { echo "podman-run.sh: $p is given as both --ro and --rw; pick one" >&2; exit 1; }
   done
 done
-# This wrapper, allowlist_proxy.py and relay.py run on the HOST. If their directory is inside a
-# read-write mount, an agent could edit them and have the edit run unsandboxed on the next
+# The mode a path has from your own mounts: that of the deepest of --ro, --rw and --scratch that
+# contains it. Prints rw, ro or nothing.
+eff_mode() {
+  local p="$1" best=-1 mode="" r d
+  for r in "${RO_PATHS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=ro; fi
+  done
+  for r in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=rw; fi
+  done
+  echo "$mode"
+}
+user_named() {  # $1 = path; true if you named exactly this path with --ro, --rw or --scratch
+  local r
+  for r in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do [[ -n "$r" && "$1" == "$r" ]] && return 0; done
+  return 1
+}
+# True if no component of the path is a symlink. A path that goes through a link is never mounted
+# by name: the name could lead out of the directory it appears to be in.
+plain_path() { [[ "$(realpath -e -- "$1" 2>/dev/null)" == "$1" ]]; }
+# Podman refuses the same destination twice, so every extra mount goes through here once.
+declare -A EXTRA_DEST=()
+extra_mount() {  # $1 = rw|ro, $2 = path, $3 = name of the array to append to
+  local -n _arr="$3"
+  [[ -z "${EXTRA_DEST[$2]:-}" ]] || return 0
+  EXTRA_DEST[$2]=1
+  _arr+=("-v" "$2:$2:$1")
+}
+
+# PYTHONPATH once more, now that the mounts are known: an absolute entry inside a directory that
+# is writable in the container is as good as the working directory to host-side Python (the csub
+# broker), so those entries are dropped too.
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do
+    [[ "$(eff_mode "$(realpath -m -- "$_e" 2>/dev/null || echo "$_e")")" == rw ]] || _pp="${_pp:+$_pp:}$_e"
+  done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
+# This wrapper, allowlist_proxy.py and relay.py run on the HOST. If their directory is writable
+# in the container, an agent could edit them and have the edit run unsandboxed on the next
 # invocation, so it is mounted read-only on top (podman orders mounts by destination depth, so
-# the deeper mount wins, as the credentials file over its config dir does). When the directory
-# IS the read-write mount there is nothing deeper to add, so that is refused.
-for q in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
-  [[ -n "$q" ]] || continue
-  if [[ "$SCRIPT_DIR" == "$q" ]]; then
-    echo "podman-run.sh: --rw $q is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
+# the deeper mount wins). The read-only mount makes the script directory a mount point, which
+# cannot be renamed; the writable directories ABOVE it still could be, and a new checkout put
+# in their place, so each of them is mounted onto itself. When the directory IS a read-write
+# mount there is nothing deeper to add, so that is refused.
+if [[ "$(eff_mode "$SCRIPT_DIR")" == rw ]]; then
+  if user_named "$SCRIPT_DIR"; then
+    echo "podman-run.sh: --rw $SCRIPT_DIR is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
     exit 1
-  elif [[ "$SCRIPT_DIR" == "${q%/}/"* ]]; then
-    echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount ($q); mounting it read-only. Prefer running from a separate work directory." >&2
-    # The read-only mount makes the script directory a mount point, which cannot be renamed. The
-    # directories ABOVE it, up to the read-write one, still could be: a process could move the
-    # checkout aside and build its own in its place. Mounting each of them onto itself makes
-    # them mount points too.
-    _a="$(dirname "$SCRIPT_DIR")"
-    while [[ "$_a" != "$q" && "$_a" == "${q%/}/"* ]]; do
-      _ro=0
-      for _r in "${RO_PATHS[@]:-}"; do [[ -n "$_r" && ( "$_a" == "$_r" || "$_a" == "${_r%/}/"* ) ]] && _ro=1; done
-      [[ $_ro -eq 1 ]] || VOLUMES+=("-v" "$_a:$_a:rw")   # under your own --ro it is read-only already
-      _a="$(dirname "$_a")"
-    done
-    VOLUMES+=("-v" "$SCRIPT_DIR:$SCRIPT_DIR:ro")
-    break
   fi
-done
+  echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount; mounting it read-only. Prefer running from a separate work directory." >&2
+  _a="$(dirname "$SCRIPT_DIR")"
+  while [[ -n "$_a" && "$_a" != / ]]; do
+    if [[ "$(eff_mode "$_a")" == rw ]] && ! user_named "$_a"; then extra_mount rw "$_a" VOLUMES; fi
+    _a="$(dirname "$_a")"
+  done
+  extra_mount ro "$SCRIPT_DIR" VOLUMES
+fi
 if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   # Checked before anything is created: this is the most common early exit.
   echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
@@ -412,8 +451,8 @@ remove_stale_shared_pause_pidfile() {
 remove_stale_shared_pause_pidfile
 
 # Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
-# used the shared graphroot (Janelia's Harbor fork documents this). Cheap and harmless when
-# there's nothing to migrate. CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
+# used the shared graphroot (Janelia's Harbor fork documents this). It stops the containers of that
+# store, so it runs only when the store does not answer (see below). CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
 # these prologue calls must see the SHARED store from ~/.config/containers/storage.conf, both
 # to health-check it and to read its graphroot for the cache reference below.
 # Only when the store does not answer: `podman system migrate` stops the containers of that store,
@@ -493,7 +532,7 @@ fi
 # healthy), so this doesn't cost a re-pull for another job landing on the SAME node --
 # confirmed live: two concurrent invocations both saw the already-pulled image instantly and
 # ran to completion with no collision. (If storage.conf's graphroot is under /scratch, per the
-# README's one-time setup, that cache is node-local scratch, not cluster-wide -- a job that
+# SETUP.md §3, that cache is node-local scratch, not cluster-wide -- a job that
 # lands on a different node still pays a fresh pull regardless of this mechanism.)
 cat > "$JOB_STORAGE_DIR/storage.conf" <<STORAGECONF
 [storage]
@@ -617,7 +656,7 @@ fi
 # directory swapped for a symlink in between is not mounted under the name that was checked.
 recheck_paths() {
   local p
-  for p in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}"; do
+  for p in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
     [[ -n "$p" ]] || continue
     if [[ "$(realpath -e -- "$p" 2>/dev/null)" != "$p" ]]; then
       echo "podman-run.sh: $p changed while the sandbox was being set up (it is no longer the directory that was checked); not starting" >&2
@@ -633,58 +672,76 @@ recheck_paths() {
 # Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
 # .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
 # you, outside the sandbox, the next time you use git or open the project. So where they exist
-# under a read-write directory they are bound read-only, unless --no-protect is given.
-#   - Their parents (.git, .claude) are bound onto themselves first. That makes them mount points,
-#     which the kernel refuses to rename or remove: without it the process could move .git aside
-#     and build a new one with its own hooks.
-#   - Only what exists at start can be protected. Names that are absent are remembered, and the
-#     ones that appear during the run are reported at exit (see report_new_config).
-#   - Only directly under each read-write directory, like the credential masks: a repository
-#     two levels down is not covered.
+# in a directory that is writable in the container, they are mounted read-only, unless
+# --no-protect is given.
+#   - Their parents (.git, .claude) are mounted onto themselves first. That makes them mount
+#     points, which the kernel refuses to rename or remove: without it the process could move
+#     .git aside and build a new one with its own hooks.
+#   - Only what exists at start can be mounted. Names that are absent are remembered, and the
+#     ones that appear during the run are reported at exit (see report_new_config). That includes
+#     .git/commondir and .git/config.worktree, which redirect git to another configuration.
+#   - A name that is a symlink, or lies behind one, is not mounted (see plain_path) and is named
+#     in a note at start.
+#   - A path you named yourself with --ro or --rw keeps the mode you gave it.
+#   - Only directly under each read-write directory.
 PROTECT_PINS=(.git .claude)
 PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
               .vscode .devcontainer .husky .codex .opencode)
-PROTECT_FILES=(.git/config .mcp.json .claude/settings.json .claude/settings.local.json
-               .pre-commit-config.yaml opencode.json)
-PROTECTED=()   # what was bound read-only, for the in-sandbox README
+PROTECT_FILES=(.git/config .git/commondir .git/config.worktree .mcp.json .claude/settings.json
+               .claude/settings.local.json .pre-commit-config.yaml opencode.json)
+PROTECTED=()   # what was mounted read-only, for the in-sandbox README
 WATCHED=()     # absent at start; reported if present at exit
-protect_covered() {  # $1 = path; true if a --ro given by the user already covers it
-  local r
-  for r in "${RO_PATHS[@]:-}"; do
-    [[ -n "$r" && ( "$1" == "$r" || "$1" == "${r%/}/"* ) ]] && return 0
-  done
-  return 1
+LINKED=()      # not mounted because a symlink is involved
+declare -A PROTECT_SEEN=()
+protect_one() {  # $1 = dir|file, $2 = path
+  local p="$2"
+  [[ -z "${PROTECT_SEEN[$p]:-}" ]] || return 0
+  PROTECT_SEEN[$p]=1
+  user_named "$p" && return 0
+  [[ "$(eff_mode "$p")" == rw ]] || return 0
+  if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then LINKED+=("$p"); return 0; fi
+  if [[ ! -e "$p" ]]; then WATCHED+=("$p"); return 0; fi
+  if { [[ "$1" == dir && -d "$p" ]] || [[ "$1" == file && -f "$p" ]]; }; then
+    extra_mount ro "$p" PROTECT_VOLUMES; PROTECTED+=("$p")
+  fi
+  return 0
 }
-protect_root() {  # $1 = a read-write directory
-  local root="${1%/}" x hp
+protect_root() {  # $1 = a directory that is writable in the container
+  local root="${1%/}" x p hp part skip=" "
   [[ -d "$root" ]] || return 0
   for x in "${PROTECT_PINS[@]}"; do
-    # Not where the user's own --ro already covers it: a read-write self-bind would undo that.
-    [[ -d "$root/$x" && ! -L "$root/$x" ]] && ! protect_covered "$root/$x" && protect_emit pin "$root/$x"
+    p="$root/$x"
+    if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then
+      LINKED+=("$p"); skip+="$x "
+    elif [[ -d "$p" ]]; then
+      if [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then extra_mount rw "$p" PROTECT_VOLUMES; fi
+    elif [[ -f "$p" ]]; then
+      protect_one file "$p"; skip+="$x "       # .git as a file: a worktree or submodule pointer
+    else
+      # Not there yet (.git before a clone or `git init`): watched as one name, so that a new
+      # repository is reported once and not once per file inside it.
+      [[ "$(eff_mode "$p")" == rw ]] && WATCHED+=("$p")
+      skip+="$x "
+    fi
   done
-  # A hooks directory named in .git/config (read as text: this file is the sandboxed process's to
-  # write, and git itself is not run on it here).
-  local dirs=("${PROTECT_DIRS[@]}")
-  if [[ -f "$root/.git/config" && ! -L "$root/.git/config" ]]; then
-    hp="$(awk -F= 'tolower($1) ~ /^[ \t]*hookspath[ \t]*$/ { sub(/^[ \t]+/, "", $2); sub(/[ \t]+$/, "", $2); print $2; exit }' "$root/.git/config" 2>/dev/null || true)"
-    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "/$hp/" != */../* ]]; then dirs+=("$hp"); fi
+  for x in "${PROTECT_DIRS[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one dir "$root/$x"; done
+  for x in "${PROTECT_FILES[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one file "$root/$x"; done
+  # A hooks directory named in .git/config. git itself reads the file (from /, so that no
+  # repository on the host is consulted); the value is the sandboxed process's to write, so it is
+  # used only as a plain relative path inside this directory, and each directory on the way to
+  # it is pinned like .git.
+  if [[ "$skip" != *" .git "* && -f "$root/.git/config" ]] && command -v git >/dev/null 2>&1; then
+    hp="$(cd / && git config --file "$root/.git/config" --includes --get core.hooksPath 2>/dev/null || true)"
+    hp="${hp%/}"
+    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "$hp" != . && "/$hp/" != */../* && "/$hp/" != */./* && "$hp" != *$'\n'* ]]; then
+      p="$root"
+      while [[ "$hp" == */* ]]; do
+        part="${hp%%/*}"; hp="${hp#*/}"; p="$p/$part"
+        if [[ -d "$p" && ! -L "$p" ]] && plain_path "$p" && [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then extra_mount rw "$p" PROTECT_VOLUMES; fi
+      done
+      protect_one dir "$p/$hp"
+    fi
   fi
-  # A parent that does not exist yet (.git before a clone or `git init`) is watched as one
-  # name, so that a new repository is reported once and not once per file inside it.
-  local skip=" "
-  for x in "${PROTECT_PINS[@]}"; do
-    if [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); skip+="$x "; fi
-  done
-  for x in "${dirs[@]}"; do
-    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
-    elif [[ -d "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
-    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
-  done
-  for x in "${PROTECT_FILES[@]}"; do
-    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
-    elif [[ -f "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
-    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
-  done
   return 0
 }
 report_new_config() {  # at exit: which of the watched names did the command create?
@@ -695,20 +752,21 @@ report_new_config() {  # at exit: which of the watched names did the command cre
   printf '  %s\n' "${new[@]}" >&2
   return 0
 }
-protect_emit() {  # pin PATH | ro PATH
-  if [[ "$1" == pin ]]; then PROTECT_VOLUMES+=(-v "$2:$2:rw"); else PROTECT_VOLUMES+=(-v "$2:$2:ro"); fi
-}
 if [[ $PROTECT -eq 1 ]]; then
-  for root in "${RW_PATHS[@]:-}"; do [[ -n "$root" ]] && protect_root "$root"; done
+  for root in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do [[ -n "$root" ]] && protect_root "$root"; done
   [[ ${#PROTECT_VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${PROTECT_VOLUMES[@]}")
+  if [[ ${#LINKED[@]} -gt 0 ]]; then
+    echo "podman-run.sh: note: not protected, because a symlink is involved: ${LINKED[*]}" >&2
+  fi
   # With .git/config read-only, `git config user.name ...` fails inside. Pass your identity in
   # the variables git reads, so that commits still work (read from /, so that no repository's
-  # configuration is consulted on the host).
+  # configuration is consulted on the host). A name already in your environment wins.
   if command -v git >/dev/null 2>&1; then
     _gn="$(cd / && git config --global --get user.name 2>/dev/null || true)"
     _ge="$(cd / && git config --global --get user.email 2>/dev/null || true)"
-    [[ -n "$_gn" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_NAME=$_gn" -e "GIT_COMMITTER_NAME=$_gn")
-    [[ -n "$_ge" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_EMAIL=$_ge" -e "GIT_COMMITTER_EMAIL=$_ge")
+    _gn="${GIT_AUTHOR_NAME:-$_gn}"; _ge="${GIT_AUTHOR_EMAIL:-$_ge}"
+    [[ -n "$_gn" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_NAME=$_gn" -e "GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-$_gn}")
+    [[ -n "$_ge" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_EMAIL=$_ge" -e "GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-$_ge}")
     unset _gn _ge
   fi
 fi
@@ -1100,7 +1158,6 @@ PY
 
 write_sandbox_readme
 
-recheck_paths
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
   # socket (it is created 0755), and no one else's socket can stand in for ours. Node-local on
@@ -1120,6 +1177,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
   # The relay is waited for (up to 5s of connect attempts via bash's /dev/tcp), not slept on.
+  recheck_paths
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
     for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/'"$RELAY_PORT"') 2>/dev/null && break; sleep 0.1; done
@@ -1129,6 +1187,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
+  recheck_paths
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
 fi
 PODMAN_PID=$!

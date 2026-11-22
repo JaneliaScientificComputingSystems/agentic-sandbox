@@ -47,15 +47,16 @@ behind each change.
   you the next time you used the project outside the sandbox. **This changes behaviour:**
   `git config` inside a repository fails (commits and branches work, and your git identity is
   passed in), and `--no-protect` turns the protection off. If the command creates
-  such a file where there was none, the wrapper names it at exit.
+  such a file where there was none, the wrapper names it at exit. A path named with `--ro` or `--rw`
+  keeps the mode given to it, and a name that is a symlink is left alone and named in a note.
 
 - **A checkout inside a read-write directory cannot be swapped.** The wrappers already re-bound
   their own `scripts/` directory read-only when it lay inside a read-write mount. The directories
   above it could still be renamed, and a new checkout put in their place. They are now pinned,
   under both wrappers, and `podman-run.sh` applies the same to `--scratch`.
 - **`podman-run.sh` refuses credential directories.** `--ro` or `--rw` on `~/.ssh`, `~/.aws`,
-  `~/.claude` and the other credential locations, on a directory inside one, or on one that
-  contains one (`~/.config`), is refused, as `sandbox-run.sh` refuses or masks them. So is the
+  `~/.claude`, the Hugging Face cache and the other credential locations, on a directory inside
+  one, or on one that contains one (`~/.config`, `~/.cache`), is refused, as `sandbox-run.sh` refuses or masks them. So is the
   shared image store.
 - **Paths are checked again right before they are mounted,** in both wrappers, so a directory
   replaced by a link while the sandbox is being set up is not mounted.
@@ -71,8 +72,8 @@ behind each change.
   too long". Both images now carry `sftp-server`. The default image also gained `pip` and `venv`.
   The GPU image sends NVIDIA's start-up banner to stderr, so a command's stdout holds only its own
   output. `podman/Dockerfile` and `Dockerfile.pytorch` now match the published images (they lacked
-  the 2026-11-19 additions: Codex, Ray, the CUDA 13.5 base). Nodes pull the new layers on the next
-  run. Tested through the forced command, not yet through a real sshd.
+  Codex, Ray and the CUDA 13.5 base, added to the images on 2026-11-19). Nodes pull the new layers
+  on the next run. Tested through the forced command, not yet through a real sshd.
 - **Cleanup holds under races, in both wrappers.** A process that vanished between being found and
   being killed, a directory that was still busy or that the agent left without permissions, or a
   second signal from `bkill` could end the cleanup early: the state directory stayed behind (with
@@ -137,8 +138,8 @@ behind each change.
   `CUDA_VISIBLE_DEVICES`) get their `/dev/nvidiaN` nodes plus the control/UVM nodes, `/sys/devices` and
   `/sys/module` are bound read-only (NVML needs them), and `CUDA_VISIBLE_DEVICES` is set to their
   numbering inside (`0..n-1`, in the order given; a subset such as the job's second GPU alone is `0`
-  there). An error in a job with no GPU allocated. No CUDA toolkit comes with it: bind a venv/conda
-  env or use podman for an image. (#10, hokinus)
+  there). An error in a job with no GPU allocated. No CUDA toolkit comes with it; a bound venv or
+  conda env, or a podman image, supplies one. (#10, hokinus)
 - **`sandbox-run.sh --claude-history` and `--claude-history-rw`** (with `--claude`): the past Claude
   sessions of the directory you start from become visible, so `claude --resume` and `--continue`
   work. Read-only by default (new turns are not kept); `-rw` keeps them. Only that directory's
@@ -251,13 +252,13 @@ behind each change.
 
 - **`--scratch` now binds `/scratch/$USER/work`, not all of `/scratch/$USER`.** Everything a
   wrapper creates for a run lives in `/scratch/$USER/.agentic-sandbox/<job>/` and nothing is
-  written to `/tmp`; binding the whole tree would expose other jobs' state. Use
-  `--rw /scratch/$USER/<subdir>` for anything else; never bind `/scratch/$USER` itself.
+  written to `/tmp`; binding the whole tree would expose other jobs' state.
+  `--rw /scratch/$USER/<subdir>` covers anything else.
 - **`--claude` and `--opencode` no longer bind your real config read-write** (Maris Basha, #5).
   Each run gets a throwaway copy of `~/.claude.json`, `~/.claude/settings.json`,
   `~/.claude/CLAUDE.md` and `~/.config/opencode`; only `~/.claude/.credentials.json` is bound
   through, so logins and token refreshes persist but hooks/MCP edits made inside die with the
-  job. On a fresh account, log in once outside the sandbox first (or use an API key).
+  job. A first login done inside the sandbox on a fresh account is therefore not kept.
 - **`sandbox-run.sh` starts from an empty environment.** Only `PATH`, `HOME`, `USER`, `LOGNAME`,
   `SHELL`, `TERM`, `COLORTERM`, `LANG`/`LC_*`, `TZ` and the CA-bundle variables come through;
   anything else needs `--env NAME` (e.g. `--env ANTHROPIC_API_KEY`). `/tmp` inside is a private
@@ -270,8 +271,8 @@ behind each change.
   jobs and repeated calls in one job no longer collide); per-job `XDG_RUNTIME_DIR`; the shared
   store is never reset, only skipped when unhealthy; `--keep-id` works on the pytorch image too
   (`agentic-sandbox-gpu:latest` rebuilt 2026-10-08).
-- Run `tests/test-bwrap.sh` and `tests/test-podman.sh` one at a time: both drive opencode against
-  the same sqlite database on NFS.
+- `tests/test-bwrap.sh` and `tests/test-podman.sh` cannot run at the same time: both drive opencode
+  against the same sqlite database on NFS.
 
 ## 2026-09-23
 
@@ -281,8 +282,8 @@ behind each change.
 
 ## 2026-09-10
 
-- **`$HOME` is no longer bound by default** in `sandbox-run.sh` (it used to be, read-only). Add
-  `--ro`/`--rw` for the specific path a task needs; never for `$HOME` as a whole.
+- **`$HOME` is no longer bound by default** in `sandbox-run.sh` (it used to be, read-only).
+  `--ro`/`--rw` bind the specific paths a task needs.
 - `agentic-sandbox-lite` became the default podman image; the PyTorch image is the alternate
   (`agentic-sandbox-gpu`).
 - `--keep-id` works end to end on accounts with a widened subuid/subgid range.

@@ -551,7 +551,8 @@ s_29() {
 
 # A project with the files that tools run or load later (section "files that run later").
 make_protect_repo() {  # $1 = directory
-  mkdir -p "$1/.vscode" "$1/.claude" && ( cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
+  # The host's own git configuration (signing, templates with hooks) must not shape the test repo.
+  mkdir -p "$1/.vscode" "$1/.claude" && ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null; cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
     && git -c user.name=t -c user.email=t@t commit -q -m init && echo '{}' > .mcp.json && echo '{}' > .claude/settings.json \
     && echo 'repos: []' > .pre-commit-config.yaml && echo SECRET > .claude/.credentials.json ) >/dev/null 2>&1
 }
@@ -593,6 +594,24 @@ s_30() {
   check "--no-protect leaves them writable" "$OUT,$([[ -e "$R3/.git/hooks/pre-commit" ]] && echo 1 || echo 0)" "writable,1"
   OUT=$(cd "$TR" && "$SANDBOX_RUN" --rw "$R" --ro "$R/.git" -- bash -c "touch $R/.git/x 2>/dev/null && echo WRITABLE || echo still-read-only" 2>/dev/null)
   check "a --ro of your own over .git is not undone by the pin" "$OUT" "still-read-only"
+
+  # Layouts in which an earlier version of this protection made things worse or was skipped.
+  local RP="$TR/roparent" L="$TR/linked" S="$TR/secret-outside" H="$TR/hookspath" Wt="$TR/wtfile"
+  mkdir -p "$RP"; make_protect_repo "$RP/sub"; make_protect_repo "$L"; make_protect_repo "$H"; mkdir -p "$S/hooks" "$Wt"; echo TOP-SECRET > "$S/hooks/key"
+  ( cd "$L" && ln -s ../secret-outside lnk && git config core.hooksPath lnk/hooks ) >/dev/null 2>&1
+  ( cd "$H" && mkdir -p tools/githooks && git config core.hooksPath tools/githooks ) >/dev/null 2>&1
+  echo "gitdir: /nonexistent/worktree" > "$Wt/.git"
+  OUT=$(cd "$RP/sub" && "$SANDBOX_RUN" --ro "$RP" -- bash -c 'echo x > .git/hooks/pre-commit 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only; touch ../x 2>/dev/null && echo PARENT-WRITABLE || echo parent-read-only' 2>/dev/null | tr '\n' ',')
+  check "a working directory under a --ro parent is still protected" "$OUT" "hook-read-only,parent-read-only,"
+  OUT=$(cd "$L" && "$SANDBOX_RUN" -- bash -c 'cat lnk/hooks/key 2>/dev/null || echo not-visible' 2>&1 | tr '\n' ',')
+  check "a hooks path through a symlink is not mounted, and is named in a note" "$(echo "$OUT" | grep -c 'TOP-SECRET'),$(echo "$OUT" | grep -c 'not protected, because a symlink is involved')" "0,1"
+  OUT=$(cd "$H" && "$SANDBOX_RUN" -- bash -c 'echo x > tools/githooks/pre-commit 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only; mv tools t2 2>/dev/null && echo MOVED || echo pinned' 2>/dev/null | tr '\n' ',')
+  check "a hooks directory named in .git/config is read-only and the way to it is pinned" "$OUT" "hook-read-only,pinned,"
+  OUT=$(cd "$R3" && "$SANDBOX_RUN" -- bash -c 'echo ../alt > .git/commondir' 2>&1 | grep -c -E "^  $R3/\.git/commondir$")
+  check ".git/commondir created during the run is named at exit" "$OUT" "1"
+  rm -f "$R3/.git/commondir"
+  OUT=$(cd "$Wt" && "$SANDBOX_RUN" -- bash -c 'echo "gitdir: elsewhere" > .git 2>/dev/null && echo POINTER-WRITABLE || echo pointer-read-only' 2>/dev/null)
+  check "a .git that is a file (worktree pointer) is read-only" "$OUT" "pointer-read-only"
 }
 
 s_31() {
@@ -606,6 +625,9 @@ s_31() {
     touch $C/tools/agentic/other 2>/dev/null && echo rest-writable" 2>/dev/null | tr '\n' ',')
   check "the directories above the wrappers cannot be renamed, the wrappers are read-only, the rest stays writable" "$OUT" "tools-pinned,checkout-pinned,script-read-only,rest-writable,"
   check "outside afterwards the checkout is where it was" "$([[ -x "$C/tools/agentic/scripts/sandbox-run.sh" && ! -e "$C/t2" ]] && echo intact)" "intact"
+  mkdir -p "$C/tools/refdata"
+  OUT=$(cd "$TR/work31" && "$C/tools/agentic/scripts/sandbox-run.sh" --rw "$C" --ro "$C/tools/refdata" -- bash -c "touch $C/tools/refdata/x 2>/dev/null && echo REFDATA-WRITABLE || echo refdata-read-only" 2>/dev/null)
+  check "a --ro of your own beside the checkout stays read-only under the pin" "$OUT" "refdata-read-only"
 }
 
 ALL_SECTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)

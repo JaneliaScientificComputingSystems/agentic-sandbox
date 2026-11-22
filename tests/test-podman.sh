@@ -396,7 +396,8 @@ s_20() {
 
 # A project with the files that tools run or load later (section "files that run later").
 make_protect_repo() {  # $1 = directory
-  mkdir -p "$1/.vscode" "$1/.claude" && ( cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
+  # The host's own git configuration (signing, templates with hooks) must not shape the test repo.
+  mkdir -p "$1/.vscode" "$1/.claude" && ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null; cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
     && git -c user.name=t -c user.email=t@t commit -q -m init && echo '{}' > .mcp.json && echo '{}' > .claude/settings.json \
     && echo 'repos: []' > .pre-commit-config.yaml && echo SECRET > .claude/.credentials.json ) >/dev/null 2>&1
 }
@@ -436,6 +437,26 @@ s_21() {
   check "files of that kind created during the run are named at exit" "$OUT" "3"
   OUT=$("$PODMAN_RUN" --no-protect --rw "$R3" -- bash -c "cd $R3 && echo x > .git/hooks/pre-commit && echo writable" 2>/dev/null | tail -1)
   check "--no-protect leaves them writable" "$OUT,$([[ -e "$R3/.git/hooks/pre-commit" ]] && echo 1 || echo 0)" "writable,1"
+
+  # Layouts in which an earlier version of this protection made things worse or was skipped.
+  local RP="$TR/roparent" L="$TR/linked" S="$TR/secret-outside" H="$TR/hookspath" Wt="$TR/wtfile"
+  mkdir -p "$RP"; make_protect_repo "$RP/sub"; make_protect_repo "$L"; make_protect_repo "$H"; mkdir -p "$S/hooks" "$Wt"; echo TOP-SECRET > "$S/hooks/key"
+  ( cd "$L" && ln -s ../secret-outside lnk && git config core.hooksPath lnk/hooks ) >/dev/null 2>&1
+  ( cd "$H" && mkdir -p tools/githooks && git config core.hooksPath tools/githooks ) >/dev/null 2>&1
+  echo "gitdir: /nonexistent/worktree" > "$Wt/.git"
+  make_protect_repo "$RP/data/repo"
+  OUT=$("$PODMAN_RUN" --ro "$RP/data" --rw "$RP/data/repo" -- bash -c "cd $RP/data/repo && (echo x > .git/hooks/pre-commit) 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only" 2>/dev/null | tail -1)
+  check "a --rw inside a --ro is still protected" "$OUT" "hook-read-only"
+  OUT=$("$PODMAN_RUN" --rw "$L" -- bash -c "cat $L/lnk/hooks/key 2>/dev/null || echo not-visible" 2>&1)
+  check "a hooks path through a symlink is not mounted, and is named in a note" "$(echo "$OUT" | grep -c 'TOP-SECRET'),$(echo "$OUT" | grep -c 'not protected, because a symlink is involved')" "0,1"
+  OUT=$("$PODMAN_RUN" --rw "$H" -- bash -c "cd $H; (echo x > tools/githooks/pre-commit) 2>/dev/null && echo HOOK-WRITABLE || echo hook-read-only; mv tools t2 2>/dev/null && echo MOVED || echo pinned" 2>/dev/null | tail -2 | tr '\n' ',')
+  check "a hooks directory named in .git/config is read-only and the way to it is pinned" "$OUT" "hook-read-only,pinned,"
+  OUT=$("$PODMAN_RUN" --rw "$R3" -- bash -c "echo ../alt > $R3/.git/commondir" 2>&1 | grep -c -E "^  $R3/\.git/commondir$")
+  check ".git/commondir created during the run is named at exit" "$OUT" "1"
+  rm -f "$R3/.git/commondir"
+  ( cd "$R" && mkdir -p .husky && GIT_CONFIG_GLOBAL=/dev/null git config --file .git/config core.hooksPath .husky ) 2>/dev/null
+  OUT=$("$PODMAN_RUN" --rw "$R" --rw "$R/.vscode" -- bash -c "touch $R/.vscode/explicit && echo explicit-rw-kept" 2>/dev/null | tail -1)
+  check "a protected name mounted twice (your own --rw on it, a hooks path that is also on the list) still starts" "$OUT" "explicit-rw-kept"
 }
 
 s_22() {
@@ -455,7 +476,11 @@ s_22() {
   check "--rw ~/.config refused (it contains ~/.config/gcloud)" "$OUT" "1"
   OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.claude" -- true 2>&1 | grep -c "holds credentials")
   check "--ro ~/.claude refused" "$OUT" "1"
-  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.config/other" --gpu -- true 2>&1 | grep -c "holds credentials")
+  mkdir -p "$FH/.cache/huggingface"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.cache" -- true 2>&1 | grep -c "holds credentials")
+  check "--ro ~/.cache refused (it contains the Hugging Face token)" "$OUT" "1"
+  # No command: the wrapper stops at "No command given", after the mount checks, and starts nothing.
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.config/other" 2>&1 | grep -c "holds credentials")
   check "an ordinary directory under ~/.config is not refused for that reason" "$OUT" "0"
   check "the refusals left no per-job state" "$(state_dirs)" "$BASE_STATE"
 }

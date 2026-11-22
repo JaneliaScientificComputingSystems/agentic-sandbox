@@ -10,6 +10,9 @@ All computation, compilation and installation happens on the cluster, never on t
 - Each ssh command is a separate job on a compute node. It can take up to a minute to
   start. Nothing carries over between commands except files in the project directory.
 - Commands start in the project directory. Only that directory is readable and writable.
+  Some files in it are read-only on purpose (git hooks and configuration, .mcp.json, .claude/
+  settings, .vscode): leave them alone. If a command's error output says "the command created
+  files that tools run or load outside the sandbox", repeat that list to the user.
 - There is no bsub on the cluster side, and no network except the hosts the sandbox's
   description lists.
 - For anything longer than a few minutes, or needing more CPUs or a GPU, submit a job:

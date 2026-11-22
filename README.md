@@ -87,8 +87,9 @@ default and these clients don't fail fast. On a non-zero exit the wrapper prints
 
 The sandbox is identical in the three ways to run it; only the submission differs:
 
-- **A — one-shot.** A single command as a plain `bsub` job. This is the unsupervised case the
-  policy targets:
+- **A — one-shot.** A single command as a plain `bsub` job, submitted from a project directory on
+  shared storage (not from `$HOME`, where the wrapper refuses to start). This is the unsupervised
+  case the policy targets:
   ```bash
   bsub -q short -o out.log "$SANDBOX/sandbox-run.sh --scratch --opencode --allow litellm.int.janelia.org -- \
     opencode run 'who am I speaking to?' --model litellm/kimi-k3"
@@ -112,7 +113,8 @@ The sandbox is identical in the three ways to run it; only the submission differ
   changed afterwards.
 - **Dependencies.** Install them beforehand into a venv under a path you bind `--ro`, so the agent
   can't change it. A venv records the interpreter that built it, so build it with the Python the
-  sandbox will use. For podman, inside the image (verified with the gpu image):
+  sandbox will use, in a directory that exists (`mkdir -p /groups/lab/venv`). For podman, inside the
+  image (verified with the gpu image, `--image ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest`):
   `podman-run.sh --keep-id --rw /groups/lab/venv --allow pypi.org --allow files.pythonhosted.org -- bash -c
   'python3 -m venv --system-site-packages /groups/lab/venv && /groups/lab/venv/bin/pip install PKG'`.
   `--system-site-packages` keeps torch and the rest of the image. For bwrap, build it with the host's
@@ -122,9 +124,11 @@ The sandbox is identical in the three ways to run it; only the submission differ
   every run warns `Failed to initialize NumPy`).
 - **Git.** Credentials (`~/.ssh`, `.git-credentials`) aren't bound, so the agent can commit locally
   but can't push or clone private repos. Push from outside after reviewing.
-- **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job,
-  and some run later as you, outside the sandbox: `.git/hooks/*`, project-level `.claude/settings.json`
-  and `.mcp.json`. Review them before using the directory outside the sandbox.
+- **Treat what the agent wrote as untrusted.** Files in a read-write directory persist after the job.
+  The ones tools run by themselves (`.git/hooks/*`, project-level `.claude/settings.json`,
+  `.mcp.json` and the like) are read-only inside when they existed at start, and new ones are named
+  at exit ("Files that run later"). The code itself is the agent's to change: review it before you
+  build or run it outside the sandbox.
 - **Resuming a Claude session.** The per-job config starts without history, so `claude --resume` and
   `--continue` find nothing. `--claude-history` (with `--claude`, `sandbox-run.sh` only) binds the
   past sessions of the directory you start from, and only those, read-only; the conversation can be
@@ -190,8 +194,10 @@ them read-only: `.git/hooks`, `.git/config` and a hooks directory it names, `.mc
 `.claude/{settings.json,settings.local.json,commands,agents,hooks,skills}`, `.vscode`,
 `.devcontainer`, `.husky`, `.codex`, `.opencode`, `opencode.json` and `.pre-commit-config.yaml`.
 `.git` and `.claude` themselves are pinned, so they cannot be moved aside and rebuilt. Commits,
-branches and everything else in git still work; `git config` in the repository does not, so your
-git identity is passed in as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`. What does not exist at start
+branches and everything else in git still work. `git config` and `git remote add` in an existing
+repository do not, nor does editing `.claude/settings*.json`: do those outside, or start with
+`--no-protect`. Your git identity is passed in as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, taken from
+your global git configuration when it has one. What does not exist at start
 cannot be protected: if the command creates one of these, the wrapper names it at exit (a new
 repository is named once, as `.git`), and it is protected from the next start on. Only the
 top level of each read-write directory is covered, like the credential masks. `--no-protect` turns
@@ -353,7 +359,8 @@ Logging in and configuring are in `SETUP.md` §4–5. At run time:
 - **Claude Code.** A fresh `claude auth login` inside the sandbox works only if
   `~/.claude/.credentials.json` already exists on the host. An API key beats an expired login; never
   put it on a `bsub` command line. Not carried in: `~/.claude/plugins`, skills, `projects/` history
-  (add `--ro`/`--rw` for a path a task needs; for this directory's history, `--claude-history`).
+  (under `sandbox-run.sh`, add `--ro`/`--rw` for a path a task needs, and `--claude-history` for this
+  directory's history; `podman-run.sh` refuses paths inside `~/.claude`).
 - **opencode + Kimi K3.** **Always name the model** interactively, `opencode -m litellm/kimi-k3`: bare
   `opencode` defaults to its hosted "OpenCode Zen" model, which talks to hosts outside your allowlist
   and fails with a bare `Forbidden`. One-shot `opencode run ... --model litellm/kimi-k3` is unaffected.
@@ -552,6 +559,9 @@ Five suites in `tests/`:
 - **`crun: cannot stat ...libnvidia-nscq.so.<version>`** with `podman-run.sh --gpu`: the node's CDI
   spec (`/etc/cdi/nvidia.yaml`) predates a driver upgrade. An administrator regenerates it with
   `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
+- **`Author identity unknown`** from `git commit` inside: your global git configuration has no
+  `user.name` and `user.email`, so the wrapper had none to pass in. Set them outside
+  (`git config --global ...`), or pass `--env GIT_AUTHOR_NAME` and the other three variables.
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
 - **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a

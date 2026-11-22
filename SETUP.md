@@ -12,7 +12,7 @@ all of this is in place.
 cd
 git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git
 SANDBOX="$HOME/agentic-sandbox/scripts"       # the README's examples use this variable
-# a new job shell starts without it: put the line above in your shell startup file
+echo 'export SANDBOX="$HOME/agentic-sandbox/scripts"' >> ~/.bashrc    # so that new job shells have it too
 ```
 
 The rest of this document assumes the checkout is `~/agentic-sandbox`. Anywhere else works; set
@@ -222,7 +222,7 @@ Both are pre-built on GHCR and pulled automatically. Build your own only if you 
 they lack:
 
 ```bash
-cd agentic-sandbox/podman
+cd ~/agentic-sandbox/podman
 podman build -t agentic-sandbox-lite:latest .                                   # CUDA runtime + CLIs
 podman build -t agentic-sandbox-gpu:latest -f Dockerfile.pytorch .              # NVIDIA PyTorch + CLIs
 # then: podman-run.sh --image localhost/agentic-sandbox-lite:latest ...

@@ -356,7 +356,9 @@ if [[ $WANT_OPENCODE -eq 1 ]]; then
   # bwrap has a source path on a fresh account.
   for d in .local/share/opencode .local/state/opencode .cache/opencode; do
     mkdir -p "$HOME/$d"
-    RW_BINDS+=("$HOME/$d")
+    # The physical path: the binds are compared and re-checked by name, and $HOME may be reached
+    # through a symlink.
+    RW_BINDS+=("$(realpath -e -- "$HOME/$d")")
   done
   # opencode's own variables, not XDG_CONFIG_HOME: that would also hide git's, gh's and every
   # other tool's ~/.config from the sandboxed process. OPENCODE_CONFIG is the config file,
@@ -405,8 +407,10 @@ while IFS= read -r name; do PASSTHROUGH_ENV+=("$name"); done < <(compgen -e LC_)
 if [[ $PROTECT -eq 1 ]] && command -v git >/dev/null 2>&1; then
   _gn="$(cd / && git config --global --get user.name 2>/dev/null || true)"
   _ge="$(cd / && git config --global --get user.email 2>/dev/null || true)"
-  [[ -n "$_gn" && -z "${GIT_AUTHOR_NAME+x}" ]] && EXTRA_SETENV+=(GIT_AUTHOR_NAME "$_gn" GIT_COMMITTER_NAME "$_gn")
-  [[ -n "$_ge" && -z "${GIT_AUTHOR_EMAIL+x}" ]] && EXTRA_SETENV+=(GIT_AUTHOR_EMAIL "$_ge" GIT_COMMITTER_EMAIL "$_ge")
+  # A name or address already in your environment wins over the global configuration.
+  _gn="${GIT_AUTHOR_NAME:-$_gn}"; _ge="${GIT_AUTHOR_EMAIL:-$_ge}"
+  [[ -n "$_gn" ]] && EXTRA_SETENV+=(GIT_AUTHOR_NAME "$_gn" GIT_COMMITTER_NAME "${GIT_COMMITTER_NAME:-$_gn}")
+  [[ -n "$_ge" ]] && EXTRA_SETENV+=(GIT_AUTHOR_EMAIL "$_ge" GIT_COMMITTER_EMAIL "${GIT_COMMITTER_EMAIL:-$_ge}")
   unset _gn _ge
 fi
 ENV_ARGS=()
@@ -445,6 +449,159 @@ for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind "$p"; done
 for p in "${RO_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind-try "$p"; done
 for p in "${RW_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind "$p"; done
 for p in "${RW_TRY_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --bind-try "$p"; done
+# ---- What is added to the binds above before they are sorted ---------------------------------
+# Everything below goes through add_bind, into the same depth-sorted list as $PWD and the --ro
+# and --rw paths. That matters: a bind covers whatever was mounted beneath it before, so a bind
+# emitted AFTER the sorted list could uncover a deeper --ro of yours. In the sorted list the
+# deeper path always comes later and keeps its own mode.
+
+# The mode a path has from your own binds: that of the deepest of $PWD, --ro and --rw that
+# contains it (same path: $PWD, then --ro, then --rw, as in the sort). Prints rw, ro or nothing.
+eff_mode() {
+  local p="$1" best=-1 mode="" r d
+  if [[ "$p" == "$PWD" || "$p" == "${PWD%/}/"* ]]; then d="${PWD//[^\/]/}"; best=${#d}; mode=rw; fi
+  for r in "${RO_BINDS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=ro; fi
+  done
+  for r in "${RW_BINDS[@]:-}"; do
+    [[ -n "$r" && ( "$p" == "$r" || "$p" == "${r%/}/"* ) ]] || continue
+    d="${r//[^\/]/}"; if [[ ${#d} -ge $best ]]; then best=${#d}; mode=rw; fi
+  done
+  echo "$mode"
+}
+user_named() {  # $1 = path; true if you named exactly this path with --ro or --rw
+  local r
+  for r in "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do [[ -n "$r" && "$1" == "$r" ]] && return 0; done
+  return 1
+}
+# True if no component of the path is a symlink. A path that goes through a link is never bound
+# by name: the name could lead out of the directory it appears to be in.
+plain_path() { [[ "$(realpath -e -- "$1" 2>/dev/null)" == "$1" ]]; }
+
+# PYTHONPATH once more, now that the binds are known: an absolute entry inside a directory that is
+# writable in the sandbox is as good as the working directory to host-side Python (the csub
+# broker), so those entries are dropped too.
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  _pp=""
+  IFS=: read -ra _ppe <<< "$PYTHONPATH"
+  for _e in ${_ppe[@]+"${_ppe[@]}"}; do
+    [[ "$(eff_mode "$(realpath -m -- "$_e" 2>/dev/null || echo "$_e")")" == rw ]] || _pp="${_pp:+$_pp:}$_e"
+  done
+  if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
+  unset _pp _ppe _e
+fi
+
+# This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
+# the sandbox). If the directory they live in is writable inside -- which is the case whenever
+# the script is run from its own checkout, e.g. `cd agentic-sandbox/scripts &&
+# ./sandbox-run.sh` -- a prompt-injected agent could edit them and have the edit run
+# unsandboxed on the NEXT invocation. So the script directory is bound read-only, and every
+# writable directory above it is bound onto itself: a read-only bind makes the script
+# directory a mount point, which cannot be renamed, but the directories ABOVE it still could
+# be, and a new checkout put in their place. Mount points cannot.
+if [[ "$(eff_mode "$SCRIPT_DIR")" == rw ]]; then
+  echo "sandbox-run.sh: note: $SCRIPT_DIR is inside a read-write bind; re-binding it read-only. Prefer running from a separate work directory." >&2
+  _a="$(dirname "$SCRIPT_DIR")"
+  while [[ -n "$_a" && "$_a" != / ]]; do
+    if [[ "$(eff_mode "$_a")" == rw && "$_a" != "$PWD" ]] && ! user_named "$_a"; then add_bind --bind "$_a"; fi
+    _a="$(dirname "$_a")"
+  done
+  add_bind --ro-bind "$SCRIPT_DIR"
+fi
+
+# ---- Files that run later ------------------------------------------------------------------
+# Some files in a project are not the work product but instructions to tools: git runs
+# .git/hooks and what .git/config names (core.hooksPath, core.fsmonitor, aliases, an ssh command),
+# Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
+# .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
+# you, outside the sandbox, the next time you use git or open the project. So where they exist
+# in a directory that is writable inside, they are bound read-only, unless --no-protect is given.
+#   - Their parents (.git, .claude) are bound onto themselves first. That makes them mount points,
+#     which the kernel refuses to rename or remove: without it the process could move .git aside
+#     and build a new one with its own hooks.
+#   - Only what exists at start can be bound. Names that are absent are remembered, and the ones
+#     that appear during the run are reported at exit (see report_new_config). That includes
+#     .git/commondir and .git/config.worktree, which redirect git to another configuration.
+#   - A name that is a symlink, or lies behind one, is not bound (see plain_path) and is named
+#     in a note at start.
+#   - A path you named yourself with --ro or --rw keeps the mode you gave it.
+#   - Only directly under each read-write directory, like the credential masks.
+PROTECT_PINS=(.git .claude)
+PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
+              .vscode .devcontainer .husky .codex .opencode)
+PROTECT_FILES=(.git/config .git/commondir .git/config.worktree .mcp.json .claude/settings.json
+               .claude/settings.local.json .pre-commit-config.yaml opencode.json)
+PROTECTED=()   # what was bound read-only, for the in-sandbox README
+WATCHED=()     # absent at start; reported if present at exit
+LINKED=()      # not bound because a symlink is involved
+declare -A PROTECT_SEEN=()
+protect_one() {  # $1 = dir|file, $2 = path
+  local p="$2"
+  [[ -z "${PROTECT_SEEN[$p]:-}" ]] || return 0
+  PROTECT_SEEN[$p]=1
+  user_named "$p" && return 0
+  [[ "$(eff_mode "$p")" == rw ]] || return 0
+  if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then LINKED+=("$p"); return 0; fi
+  if [[ ! -e "$p" ]]; then WATCHED+=("$p"); return 0; fi
+  if { [[ "$1" == dir && -d "$p" ]] || [[ "$1" == file && -f "$p" ]]; }; then
+    add_bind --ro-bind "$p"; PROTECTED+=("$p")
+  fi
+  return 0
+}
+protect_root() {  # $1 = a directory that is writable inside
+  local root="${1%/}" x p hp part skip=" "
+  [[ -d "$root" ]] || return 0
+  for x in "${PROTECT_PINS[@]}"; do
+    p="$root/$x"
+    if [[ -L "$p" ]] || { [[ -e "$p" ]] && ! plain_path "$p"; }; then
+      LINKED+=("$p"); skip+="$x "
+    elif [[ -d "$p" ]]; then
+      if [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then add_bind --bind "$p"; fi
+    elif [[ -f "$p" ]]; then
+      protect_one file "$p"; skip+="$x "       # .git as a file: a worktree or submodule pointer
+    else
+      # Not there yet (.git before a clone or `git init`): watched as one name, so that a new
+      # repository is reported once and not once per file inside it.
+      [[ "$(eff_mode "$p")" == rw ]] && WATCHED+=("$p")
+      skip+="$x "
+    fi
+  done
+  for x in "${PROTECT_DIRS[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one dir "$root/$x"; done
+  for x in "${PROTECT_FILES[@]}"; do [[ "$skip" == *" ${x%%/*} "* ]] || protect_one file "$root/$x"; done
+  # A hooks directory named in .git/config. git itself reads the file (from /, so that no
+  # repository on the host is consulted); the value is the sandboxed process's to write, so it is
+  # used only as a plain relative path inside this directory, and each directory on the way to
+  # it is pinned like .git.
+  if [[ "$skip" != *" .git "* && -f "$root/.git/config" ]] && command -v git >/dev/null 2>&1; then
+    hp="$(cd / && git config --file "$root/.git/config" --includes --get core.hooksPath 2>/dev/null || true)"
+    hp="${hp%/}"
+    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "$hp" != . && "/$hp/" != */../* && "/$hp/" != */./* && "$hp" != *$'\n'* ]]; then
+      p="$root"
+      while [[ "$hp" == */* ]]; do
+        part="${hp%%/*}"; hp="${hp#*/}"; p="$p/$part"
+        if [[ -d "$p" && ! -L "$p" ]] && plain_path "$p" && [[ "$(eff_mode "$p")" == rw ]] && ! user_named "$p"; then add_bind --bind "$p"; fi
+      done
+      protect_one dir "$p/$hp"
+    fi
+  fi
+  return 0
+}
+report_new_config() {  # at exit: which of the watched names did the command create?
+  local x new=()
+  for x in ${WATCHED[@]+"${WATCHED[@]}"}; do [[ -e "$x" || -L "$x" ]] && new+=("$x"); done
+  [[ ${#new[@]} -gt 0 ]] || return 0
+  echo "sandbox-run.sh: the command created files that tools run or load outside the sandbox. Review them before you use git, an editor or an agent in that directory:" >&2
+  printf '  %s\n' "${new[@]}" >&2
+  return 0
+}
+if [[ $PROTECT -eq 1 ]]; then
+  for root in "$PWD" "${RW_BINDS[@]:-}"; do [[ -n "$root" ]] && protect_root "$root"; done
+  if [[ ${#LINKED[@]} -gt 0 ]]; then
+    echo "sandbox-run.sh: note: not protected, because a symlink is involved: ${LINKED[*]}" >&2
+  fi
+fi
+
 while IFS=$'\t' read -r _ _ _flag _path; do
   [[ -n "$_path" ]] || continue
   if [[ "$_flag" == --ro-bind-try && -L "$_path" ]]; then
@@ -457,109 +614,6 @@ while IFS=$'\t' read -r _ _ _flag _path; do
   fi
 done < <(printf '%s' "$_bind_lines" | sort -t$'\t' -k1,1n -k2,2n)
 
-# This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
-# the sandbox). If the directory they live in falls inside a read-write bind -- which is the
-# case whenever the script is run from its own checkout, e.g. `cd agentic-sandbox/scripts &&
-# ./sandbox-run.sh` -- a prompt-injected agent could edit them and have the edit run
-# unsandboxed on the NEXT invocation. Shadow the script directory read-only after all the
-# read-write binds (later mounts win in bwrap), and say so once.
-for root in "$PWD" "${RW_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
-  [[ -n "$root" ]] || continue
-  if [[ "$SCRIPT_DIR" == "$root" || "$SCRIPT_DIR" == "$root/"* ]]; then
-    echo "sandbox-run.sh: note: $SCRIPT_DIR is inside a read-write bind ($root); re-binding it read-only. Prefer running from a separate work directory." >&2
-    # The read-only bind makes the script directory a mount point, which cannot be renamed. The
-    # directories ABOVE it, up to the read-write one, still could be: a process could move the
-    # checkout aside and build its own in its place. Binding each of them onto itself makes
-    # them mount points too (outermost first, then the script directory read-only on top).
-    _pins=(); _a="$(dirname "$SCRIPT_DIR")"
-    while [[ "$_a" != "$root" && "$_a" == "$root/"* ]]; do _pins=("$_a" ${_pins[@]+"${_pins[@]}"}); _a="$(dirname "$_a")"; done
-    for _a in ${_pins[@]+"${_pins[@]}"}; do
-      _ro=0
-      for _r in "${RO_BINDS[@]:-}"; do [[ -n "$_r" && ( "$_a" == "$_r" || "$_a" == "${_r%/}/"* ) ]] && _ro=1; done
-      [[ $_ro -eq 1 ]] || BWRAP_ARGS+=(--bind "$_a" "$_a")   # under your own --ro it is read-only already
-    done
-    BWRAP_ARGS+=(--ro-bind "$SCRIPT_DIR" "$SCRIPT_DIR")
-    break
-  fi
-done
-# ---- Files that run later ------------------------------------------------------------------
-# Some files in a project are not the work product but instructions to tools: git runs
-# .git/hooks and what .git/config names (core.hooksPath, core.fsmonitor, aliases, an ssh command),
-# Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
-# .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
-# you, outside the sandbox, the next time you use git or open the project. So where they exist
-# under a read-write directory they are bound read-only, unless --no-protect is given.
-#   - Their parents (.git, .claude) are bound onto themselves first. That makes them mount points,
-#     which the kernel refuses to rename or remove: without it the process could move .git aside
-#     and build a new one with its own hooks.
-#   - Only what exists at start can be protected. Names that are absent are remembered, and the
-#     ones that appear during the run are reported at exit (see report_new_config).
-#   - Only directly under each read-write directory, like the credential masks: a repository
-#     two levels down is not covered.
-PROTECT_PINS=(.git .claude)
-PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
-              .vscode .devcontainer .husky .codex .opencode)
-PROTECT_FILES=(.git/config .mcp.json .claude/settings.json .claude/settings.local.json
-               .pre-commit-config.yaml opencode.json)
-PROTECTED=()   # what was bound read-only, for the in-sandbox README
-WATCHED=()     # absent at start; reported if present at exit
-protect_covered() {  # $1 = path; true if a --ro given by the user already covers it
-  local r
-  for r in "${RO_BINDS[@]:-}"; do
-    [[ -n "$r" && ( "$1" == "$r" || "$1" == "${r%/}/"* ) ]] && return 0
-  done
-  return 1
-}
-protect_root() {  # $1 = a read-write directory
-  local root="${1%/}" x hp
-  [[ -d "$root" ]] || return 0
-  for x in "${PROTECT_PINS[@]}"; do
-    # Not where the user's own --ro already covers it: a read-write self-bind would undo that.
-    [[ -d "$root/$x" && ! -L "$root/$x" ]] && ! protect_covered "$root/$x" && protect_emit pin "$root/$x"
-  done
-  # A hooks directory named in .git/config (read as text: this file is the sandboxed process's to
-  # write, and git itself is not run on it here).
-  local dirs=("${PROTECT_DIRS[@]}")
-  if [[ -f "$root/.git/config" && ! -L "$root/.git/config" ]]; then
-    hp="$(awk -F= 'tolower($1) ~ /^[ \t]*hookspath[ \t]*$/ { sub(/^[ \t]+/, "", $2); sub(/[ \t]+$/, "", $2); print $2; exit }' "$root/.git/config" 2>/dev/null || true)"
-    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "/$hp/" != */../* ]]; then dirs+=("$hp"); fi
-  fi
-  # A parent that does not exist yet (.git before a clone or `git init`) is watched as one
-  # name, so that a new repository is reported once and not once per file inside it.
-  local skip=" "
-  for x in "${PROTECT_PINS[@]}"; do
-    if [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); skip+="$x "; fi
-  done
-  for x in "${dirs[@]}"; do
-    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
-    elif [[ -d "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
-    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
-  done
-  for x in "${PROTECT_FILES[@]}"; do
-    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
-    elif [[ -f "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
-    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
-  done
-  return 0
-}
-report_new_config() {  # at exit: which of the watched names did the command create?
-  local x new=()
-  for x in ${WATCHED[@]+"${WATCHED[@]}"}; do [[ -e "$x" || -L "$x" ]] && new+=("$x"); done
-  [[ ${#new[@]} -gt 0 ]] || return 0
-  echo "sandbox-run.sh: the command created files that tools run or load outside the sandbox. Review them before you use git, an editor or an agent in that directory:" >&2
-  printf '  %s\n' "${new[@]}" >&2
-  return 0
-}
-protect_emit() {  # pin PATH | ro PATH
-  if [[ "$1" == pin ]]; then BWRAP_ARGS+=(--bind "$2" "$2"); else BWRAP_ARGS+=(--ro-bind "$2" "$2"); fi
-}
-if [[ $PROTECT -eq 1 ]]; then
-  for root in "$PWD" "${RW_BINDS[@]:-}"; do [[ -n "$root" ]] && protect_root "$root"; done
-fi
-
-
-# The pins below come BEFORE the credential masks on purpose: bwrap applies mounts in order, and
-# a self-bind of .claude placed after a mask inside it would uncover what the mask hid.
 
 
 # Mask well-known credential locations -- applied LAST, after every --ro/--rw

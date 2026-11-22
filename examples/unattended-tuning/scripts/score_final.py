@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Final comparison on the hidden test set, with seed noise measured.
 
-For the baseline and for the agent's final train.py: train with seeds 0..4 and score each run on both
-the validation set (what the agent saw) and the hidden test set (what it never saw).
+For the agent's final train.py: train with seeds 0..2 and score each run on both the validation set
+(what the agent saw) and the hidden test set (what it never saw).
 Writes FINAL/score_final.json. Run inside the gpu image with the venv's python (see score-final-job.sh).
 """
 import json
