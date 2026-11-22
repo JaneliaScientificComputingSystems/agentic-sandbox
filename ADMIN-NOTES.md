@@ -1014,6 +1014,45 @@ nodes, so another user cannot create `/scratch/<you>` first.
 - From the 2026-11-09/10 review: CONNECT reaches any port on an allowed host; opencode's cache and
   state dirs are bound read-write; `podman run` drops no capabilities and sets no pids limit.
 
+## Files that run later (2026-11-21)
+
+The review's remaining item with the most reach: a project directory holds files that tools
+execute or load without being asked (`.git/hooks`, `.git/config`, `.mcp.json`, `.claude/`,
+`.vscode`, `.pre-commit-config.yaml`), and the sandboxed process could write them. Anthropic's
+sandbox-runtime, Codex and `ai-bwrap` protect the same set.
+
+- **Read-only binds are not enough by themselves.** Probe on the cluster with `.git/hooks` and
+  `.git/config` bound read-only: `mv .git .git2` succeeded, so the process could build a new `.git`
+  beside it. A directory can be renamed although it contains mount points; only a mount point
+  itself cannot (`EBUSY`). So `.git` and `.claude` are first bound onto themselves.
+- **With the pin,** in both sandboxes: writes to the hook directory, `.mcp.json`, `.vscode` and
+  `.claude/settings.json` fail with "Read-only file system"; `git config`, `mv .git`, `mv
+  .mcp.json` and `rm -rf .vscode` fail with "Device or resource busy"; `git commit` and `git
+  checkout -b` work.
+- **Order matters under bwrap.** The pins are emitted before the credential masks. A self-bind of
+  `.claude` after the mask of `.claude/.credentials.json` would uncover it; the suite checks that
+  the file still reads as 0 bytes.
+- **A user's own `--ro` wins.** A path already under a `--ro` is neither pinned nor re-bound, since a
+  read-write self-bind would undo the `--ro`.
+- **`core.hooksPath`** is read from `.git/config` as text (`awk`), and the directory it names is
+  protected when it is a relative path without `..`. git is not run on that file on the host.
+- **What cannot be done:** a path that does not exist cannot be bound without creating it in the
+  real directory. Those names are recorded at start, and the ones that exist at exit are printed.
+- **Identity.** `$HOME` is not bound and `.git/config` is read-only, so the wrapper passes
+  `git config --global user.name` and `user.email` (read with the working directory at `/`) as
+  `GIT_AUTHOR_*` and `GIT_COMMITTER_*`.
+
+Evidence, on the cluster: the new sections pass (`test-bwrap.sh` section 30, six checks;
+`test-podman.sh` section 21, four), and the full suites with them: `test-bwrap.sh` 95,
+`test-podman.sh` 65, `test-proxy.py` 67, `test-csub-policy.sh` 51, `test-array.sh` 11 and 12. In a
+project that has `.mcp.json`, `.claude/settings.json`, `.vscode` and a git repository, `claude -p`
+answered, Claude Code edited a file and committed it (the commit is in the log outside), and
+`opencode run` answered.
+
+Not covered: repositories below the top level of a read-write directory; `.git` when it is a file
+(a worktree or submodule pointer); a protected name that is a symlink; and the project's own code
+and build files, which are the work product.
+
 ## Running under LSF — full evidence
 
 - LSF puts every job in its own cgroup v2 leaf (`/lsf/Janelia/job.<id>/leaf`). bwrap's

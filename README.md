@@ -180,6 +180,22 @@ with `--env`. LSF forwards your whole shell environment into a job, so otherwise
 environment. When stdin is not a terminal the bwrap sandbox gets its own session (`--new-session`) so
 it can't type into your terminal.
 
+**Files that run later are read-only.** Some files in a project are instructions to tools, not
+work product: git runs `.git/hooks` and what `.git/config` names, Claude Code loads `.mcp.json` and
+`.claude/`, an editor runs `.vscode` tasks, pre-commit runs what `.pre-commit-config.yaml` lists. A
+process that can write them gets code run later, as you, outside the sandbox, the next time you use
+git or open the project. Where they exist directly under a read-write directory, both wrappers bind
+them read-only: `.git/hooks`, `.git/config` and a hooks directory it names, `.mcp.json`,
+`.claude/{settings.json,settings.local.json,commands,agents,hooks,skills}`, `.vscode`,
+`.devcontainer`, `.husky`, `.codex`, `.opencode`, `opencode.json` and `.pre-commit-config.yaml`.
+`.git` and `.claude` themselves are pinned, so they cannot be moved aside and rebuilt. Commits,
+branches and everything else in git still work; `git config` in the repository does not, so your
+git identity is passed in as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`. What does not exist at start
+cannot be protected: if the command creates one of these, the wrapper names it at exit (a new
+repository is named once, as `.git`), and it is protected from the next start on. Only the
+top level of each read-write directory is covered, like the credential masks. `--no-protect` turns
+all of this off.
+
 **Harness config is copied, not bound.** `--claude` gives the sandbox a per-job copy of
 `~/.claude.json`, `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with `CLAUDE_CONFIG_DIR`
 pointing at it; only `~/.claude/.credentials.json` is bound through, so logins and token refreshes
@@ -421,9 +437,12 @@ Assuming the agent is fully adversarial, it **is** stopped from:
 It is **not** stopped from:
 
 - **Anything you gave it read-write, persistently.** That includes the real credentials file bound
-  into `--claude` sandboxes, opencode's three data dirs, and in the working directory `.git/hooks`,
-  project-level `.claude/settings.json` and `.mcp.json`. Those can run later as you, outside the
-  sandbox; review them before using the directory outside.
+  into `--claude` sandboxes and opencode's three data dirs. In the working directory, the files that
+  tools run later (`.git/hooks`, `.git/config`, `.mcp.json`, `.claude/`, `.vscode` and the rest of
+  the list under "Files that run later") are read-only where they existed at start, but the agent
+  can still create ones that did not exist (the wrapper names them at exit), write them in a
+  repository below the top level, and change the project's own code, build files and scripts, which
+  you run when you build or test. Review what an agent wrote before you run it outside.
 - **Using a listed host over any port**, not just HTTPS (a `CONNECT` tunnel to its ssh port works);
   the proxy doesn't inspect content.
 - **Credentials deeper than direct children**, e.g. a `.env` in a subdirectory; and, with podman, any
@@ -456,6 +475,8 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --env NAME      (sandbox-run.sh) copy host variable NAME into the sandbox (repeatable)
   --csub          Start a csub broker outside the sandbox and give the agent `csub` inside
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing)
+  --no-protect    Leave .git/hooks, .git/config, .mcp.json, .claude/, .vscode and the like writable
+                  (read-only by default where they exist in a read-write directory)
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH
   --claude-history[-rw]  (sandbox-run.sh, with --claude) this directory's past Claude sessions, so
                   `claude --resume`/`--continue` work; read-only, or -rw to keep new ones too
@@ -517,6 +538,14 @@ Five suites in `tests/`:
   sandbox of yours is running.
 - **`Failed to initialize NVML: GPU access blocked`**: pass `--gpu` (bwrap or podman).
 - **`potentially insufficient UIDs or GIDs`**: `--keep-id` with a too-narrow subuid range; ask HPC.
+- **`error: could not write config file .git/config: Device or resource busy`**, or **`Read-only file
+  system`** on `.git/hooks`, `.mcp.json`, `.vscode` or `.claude/`: these are read-only inside on purpose
+  ("Files that run later"). Commits, branches, fetch and pull work, and so does `git clone`; `git
+  remote add` and branch tracking do not (git may still print "set up to track" after the error). Change such a file outside the sandbox, or start
+  with `--no-protect` if the task is to edit them.
+- **`... the command created files that tools run or load outside the sandbox`** (at exit): the
+  command made a `.mcp.json`, `.vscode`, git hooks or similar where there was none. Look at them
+  before you use git, an editor or an agent in that directory.
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
 - **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a

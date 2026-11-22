@@ -394,7 +394,51 @@ s_20() {
   check "both cleaned up" "$(state_dirs)" "$BASE_STATE"
 }
 
-ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
+# A project with the files that tools run or load later (section "files that run later").
+make_protect_repo() {  # $1 = directory
+  mkdir -p "$1/.vscode" "$1/.claude" && ( cd "$1" && git init -q . && echo x > f && git -c user.name=t -c user.email=t@t add f \
+    && git -c user.name=t -c user.email=t@t commit -q -m init && echo '{}' > .mcp.json && echo '{}' > .claude/settings.json \
+    && echo 'repos: []' > .pre-commit-config.yaml && echo SECRET > .claude/.credentials.json ) >/dev/null 2>&1
+}
+PROTECT_INNER=$(cat <<'INNER'
+cd "$0" || exit 9
+git config --global --add safe.directory "$0" 2>/dev/null
+o=""
+t() { if eval "$1" >/dev/null 2>&1; then o="$o$2-WRITABLE,"; else o="$o$2,"; fi; }
+t "echo x > .git/hooks/pre-commit" hook
+t "git config user.name agent" config
+t "echo x > .mcp.json" mcp
+t "touch .vscode/tasks.json" vscode
+t "echo x > .claude/settings.json" claude
+t "echo x > .pre-commit-config.yaml" precommit
+t "mv .git .git2" mvgit
+t "rm -rf .vscode" rmvscode
+t "mv .mcp.json m2" mvmcp
+echo y >> f
+git -c user.name=t -c user.email=t@t commit -q -am second >/dev/null 2>&1 && o="${o}commit-ok," || o="${o}COMMIT-FAILED,"
+git checkout -q -b nb >/dev/null 2>&1 && o="${o}branch-ok," || o="${o}BRANCH-FAILED,"
+o="${o}cred=$(wc -c < .claude/.credentials.json 2>/dev/null | tr -d " "),readme=$(grep -c "read-only here" "$SANDBOX_README")"
+echo "$o"
+INNER
+)
+
+s_21() {
+  echo "=== 21. Files that run later are read-only; new ones are reported ==="
+  local R="$TR/protect" R2="$TR/protect2" R3="$TR/protect3" before OUT
+  make_protect_repo "$R"; make_protect_repo "$R3"; mkdir -p "$R2"
+  before=$(md5sum < "$R/.git/config")
+  OUT=$("$PODMAN_RUN" --rw "$R" -- bash -c "$PROTECT_INNER" "$R" 2>/dev/null | tail -1)
+  # No credential masking under podman (documented), so that file is readable: 7 bytes.
+  check "hooks, git config, .mcp.json, .vscode, .claude settings read-only; .git cannot be moved; commits work" "$OUT" "hook,config,mcp,vscode,claude,precommit,mvgit,rmvscode,mvmcp,commit-ok,branch-ok,cred=7,readme=1"
+  check "outside afterwards: no hook planted, .git/config unchanged, the commit is there" \
+    "$([[ -e "$R/.git/hooks/pre-commit" ]] && echo 1 || echo 0),$([[ "$(md5sum < "$R/.git/config")" == "$before" ]] && echo same),$(git -C "$R" log --oneline | wc -l | tr -d ' ')" "0,same,2"
+  OUT=$("$PODMAN_RUN" --rw "$R2" -- bash -c "cd $R2 && echo '{}' > .mcp.json && mkdir .vscode && mkdir -p .git/hooks" 2>&1 >/dev/null | grep -c -E "^  $R2/(\.mcp\.json|\.vscode|\.git)$")
+  check "files of that kind created during the run are named at exit" "$OUT" "3"
+  OUT=$("$PODMAN_RUN" --no-protect --rw "$R3" -- bash -c "cd $R3 && echo x > .git/hooks/pre-commit && echo writable" 2>/dev/null | tail -1)
+  check "--no-protect leaves them writable" "$OUT,$([[ -e "$R3/.git/hooks/pre-commit" ]] && echo 1 || echo 0)" "writable,1"
+}
+
+ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-podman.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

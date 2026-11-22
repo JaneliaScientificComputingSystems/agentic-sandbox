@@ -51,6 +51,15 @@ sandbox. All are closed in this version, and three things are yours to do:
   a preset `CSUB_MOUNTS` entry with `..` in it. Either could put a directory the sandbox does not
   have into the list handed to csub.
 
+- **Files that run later are read-only, in both wrappers.** `.git/hooks`, `.git/config`,
+  `.mcp.json`, `.claude/` settings and commands, `.vscode`, `.pre-commit-config.yaml` and similar
+  files are now bound read-only where they exist at the top of a read-write directory, and `.git`
+  cannot be moved aside. An agent could otherwise plant a git hook or an MCP server that ran as
+  you the next time you used the project outside the sandbox. **This changes behaviour:**
+  `git config` inside a repository fails (commits and branches work, and your git identity is
+  passed in), and a task that must edit these files needs `--no-protect`. If the command creates
+  such a file where there was none, the wrapper names it at exit.
+
 ### Other changes
 
 - **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on

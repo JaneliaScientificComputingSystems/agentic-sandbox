@@ -68,6 +68,10 @@
 #                    Fails with "potentially insufficient UIDs or GIDs available in user
 #                    namespace" if your range isn't wide enough -- ask HPC for a wider one
 #                    (width > your real gid, not just "a range") if you hit this.
+#   --no-protect    Leave the files that tools run later writable (.git/hooks, .git/config,
+#                    .mcp.json, .claude/, .vscode and the like). By default they are mounted
+#                    read-only where they exist under a --rw path, and ones the command
+#                    creates are reported at exit.
 #   -h, --help      Show help
 #
 # As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro on the subdirectory
@@ -108,6 +112,8 @@ ALLOW_HOSTS=()
 GPU=0
 SHM_SIZE=""
 WANT_CSUB=0
+PROTECT=1
+PROTECT_VOLUMES=()
 KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
@@ -163,6 +169,7 @@ while [[ $# -gt 0 ]]; do
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
+    --no-protect) PROTECT=0; shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -575,6 +582,92 @@ if [[ $KEEP_ID -eq 1 ]]; then
   PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
 fi
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
+
+# ---- Files that run later ------------------------------------------------------------------
+# Some files in a project are not the work product but instructions to tools: git runs
+# .git/hooks and what .git/config names (core.hooksPath, core.fsmonitor, aliases, an ssh command),
+# Claude Code loads .mcp.json and .claude/, an editor runs .vscode tasks, pre-commit runs what
+# .pre-commit-config.yaml lists. A sandboxed process that can write them gets code run LATER, as
+# you, outside the sandbox, the next time you use git or open the project. So where they exist
+# under a read-write directory they are bound read-only, unless --no-protect is given.
+#   - Their parents (.git, .claude) are bound onto themselves first. That makes them mount points,
+#     which the kernel refuses to rename or remove: without it the process could move .git aside
+#     and build a new one with its own hooks.
+#   - Only what exists at start can be protected. Names that are absent are remembered, and the
+#     ones that appear during the run are reported at exit (see report_new_config).
+#   - Only directly under each read-write directory, like the credential masks: a repository
+#     two levels down is not covered.
+PROTECT_PINS=(.git .claude)
+PROTECT_DIRS=(.git/hooks .claude/commands .claude/agents .claude/hooks .claude/skills
+              .vscode .devcontainer .husky .codex .opencode)
+PROTECT_FILES=(.git/config .mcp.json .claude/settings.json .claude/settings.local.json
+               .pre-commit-config.yaml opencode.json)
+PROTECTED=()   # what was bound read-only, for the in-sandbox README
+WATCHED=()     # absent at start; reported if present at exit
+protect_covered() {  # $1 = path; true if a --ro given by the user already covers it
+  local r
+  for r in "${RO_PATHS[@]:-}"; do
+    [[ -n "$r" && ( "$1" == "$r" || "$1" == "${r%/}/"* ) ]] && return 0
+  done
+  return 1
+}
+protect_root() {  # $1 = a read-write directory
+  local root="${1%/}" x hp
+  [[ -d "$root" ]] || return 0
+  for x in "${PROTECT_PINS[@]}"; do
+    # Not where the user's own --ro already covers it: a read-write self-bind would undo that.
+    [[ -d "$root/$x" && ! -L "$root/$x" ]] && ! protect_covered "$root/$x" && protect_emit pin "$root/$x"
+  done
+  # A hooks directory named in .git/config (read as text: this file is the sandboxed process's to
+  # write, and git itself is not run on it here).
+  local dirs=("${PROTECT_DIRS[@]}")
+  if [[ -f "$root/.git/config" && ! -L "$root/.git/config" ]]; then
+    hp="$(awk -F= 'tolower($1) ~ /^[ \t]*hookspath[ \t]*$/ { sub(/^[ \t]+/, "", $2); sub(/[ \t]+$/, "", $2); print $2; exit }' "$root/.git/config" 2>/dev/null || true)"
+    if [[ -n "$hp" && "$hp" != /* && "$hp" != "~"* && "/$hp/" != */../* ]]; then dirs+=("$hp"); fi
+  fi
+  # A parent that does not exist yet (.git before a clone or `git init`) is watched as one
+  # name, so that a new repository is reported once and not once per file inside it.
+  local skip=" "
+  for x in "${PROTECT_PINS[@]}"; do
+    if [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); skip+="$x "; fi
+  done
+  for x in "${dirs[@]}"; do
+    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
+    elif [[ -d "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
+    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
+  done
+  for x in "${PROTECT_FILES[@]}"; do
+    if [[ "$skip" == *" ${x%%/*} "* ]] || protect_covered "$root/$x"; then continue
+    elif [[ -f "$root/$x" && ! -L "$root/$x" ]]; then protect_emit ro "$root/$x"; PROTECTED+=("$root/$x")
+    elif [[ ! -e "$root/$x" && ! -L "$root/$x" ]]; then WATCHED+=("$root/$x"); fi
+  done
+  return 0
+}
+report_new_config() {  # at exit: which of the watched names did the command create?
+  local x new=()
+  for x in ${WATCHED[@]+"${WATCHED[@]}"}; do [[ -e "$x" || -L "$x" ]] && new+=("$x"); done
+  [[ ${#new[@]} -gt 0 ]] || return 0
+  echo "podman-run.sh: the command created files that tools run or load outside the sandbox. Review them before you use git, an editor or an agent in that directory:" >&2
+  printf '  %s\n' "${new[@]}" >&2
+  return 0
+}
+protect_emit() {  # pin PATH | ro PATH
+  if [[ "$1" == pin ]]; then PROTECT_VOLUMES+=(-v "$2:$2:rw"); else PROTECT_VOLUMES+=(-v "$2:$2:ro"); fi
+}
+if [[ $PROTECT -eq 1 ]]; then
+  for root in "${RW_PATHS[@]:-}"; do [[ -n "$root" ]] && protect_root "$root"; done
+  [[ ${#PROTECT_VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${PROTECT_VOLUMES[@]}")
+  # With .git/config read-only, `git config user.name ...` fails inside. Pass your identity in
+  # the variables git reads, so that commits still work (read from /, so that no repository's
+  # configuration is consulted on the host).
+  if command -v git >/dev/null 2>&1; then
+    _gn="$(cd / && git config --global --get user.name 2>/dev/null || true)"
+    _ge="$(cd / && git config --global --get user.email 2>/dev/null || true)"
+    [[ -n "$_gn" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_NAME=$_gn" -e "GIT_COMMITTER_NAME=$_gn")
+    [[ -n "$_ge" ]] && PODMAN_ARGS+=(-e "GIT_AUTHOR_EMAIL=$_ge" -e "GIT_COMMITTER_EMAIL=$_ge")
+    unset _gn _ge
+  fi
+fi
 [[ ${#ENV_ARGS[@]} -gt 0 ]] && PODMAN_ARGS+=("${ENV_ARGS[@]}")
 
 # NOTE: an earlier version of this script attempted to mask credential paths under $HOME
@@ -639,6 +732,7 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   # Only when the sandboxed command did not succeed (same reasoning as in sandbox-run.sh).
   [[ $rc -ne 0 ]] && summarize_proxy_denials
+  declare -F report_new_config >/dev/null && report_new_config
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -947,6 +1041,10 @@ PY
     echo
     [[ $WANT_CLAUDE -eq 1 ]] && echo "- Claude Code is available as \`claude\` (per-job config at \$CLAUDE_CONFIG_DIR; settings/MCP edits do not persist past this session)."
     [[ $WANT_OPENCODE -eq 1 ]] && echo "- opencode is available as \`opencode\`; name the model explicitly: \`--model ${SANDBOX_OPENCODE_MODEL:-litellm/kimi-k3}\` (or \`-m\`)."
+    if [[ ${#PROTECTED[@]} -gt 0 ]]; then
+      echo "- These are read-only here, because tools run or load them later outside the sandbox: ${PROTECTED[*]}. Do not try to change, move or replace them. \`git config\` in such a repository fails; commits work, your git identity is already set in GIT_AUTHOR_* and GIT_COMMITTER_*. If the task needs one of them changed, say so in your answer and the user will do it."
+    fi
+    [[ $PROTECT -eq 1 ]] && echo "- If you create .mcp.json, .vscode, .claude/ settings, git hooks or similar files, the user is told at exit."
     echo "- /tmp is private to this sandbox and discarded at exit. Keep results in the read-write directories above."
     echo "- When the sandbox exits, the user is shown which hosts were denied, if the command failed."
   } > "$SANDBOX_README_FILE"
