@@ -303,7 +303,8 @@ command rm ~/agent_cluster.pub
    per project. This is optional: without it every key uses the one policy from step 1. A second
    project needs its own key and alias (steps 2 and 3 again, under other names) and its own key
    line. Write its policy to a file of its own with `--out`, outside the project, and name that
-   file in `OPTS` before the ` -- `. Then run the rest of the block above with the new `PUBKEY`.
+   file in `OPTS` before the ` -- `. Then run the rest of the block above with the new `PUBKEY`. In
+   step 6, put the new alias in place of `janelia-agent` in that project's copy of the instruction file.
 
 ```bash
 PROJECT2=/groups/YOUR_LAB/YOUR_DIR/project2
