@@ -127,6 +127,8 @@ behind each change.
   alone could not work: the job was submitted without a GPU request, which the GPU queues reject.
 - **Laptop instruction files:** the `scp` rule says the agent need not ask the user first, and that
   the laptop may still ask for approval of the command.
+- **Records older than 30 days are removed** when a new one is written. `SANDBOX_RECORD_DAYS` sets
+  another number of days, and `0` keeps them all.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20
