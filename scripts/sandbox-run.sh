@@ -51,7 +51,7 @@
 #                         the node's own network, unrestricted. Files, credentials, environment
 #                         and processes are sandboxed as always; the network is not. Use it only
 #                         where --job-nodes is too slow, which is when the data itself travels
-#                         over TCP (NCCL on Ethernet). Not with --job-nodes, --allow, --csub,
+#                         over TCP (NCCL on Ethernet). Not with --job-nodes, --ib, --allow, --csub,
 #                         --claude or --opencode. See "Multi-node jobs" below.
 #   --ib                  Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and,
 #                         read-only, the sysfs entries NCCL and libibverbs read. Verbs traffic
@@ -363,7 +363,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     # `|| true`: an unknown name must reach the message below, not end the script under `set -e`.
     _myip="$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" || true
     [[ "$_myip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve this node's own address ($(hostname))"
-    _hif="$("$IP_BIN" -o -4 addr show | awk -v ip="$_myip" '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')"
+    _hif="$("$IP_BIN" -o -4 addr show | awk -v ip="$_myip" '{split($4, a, "/"); if (a[1] == ip && !f) {print $2; f = 1}}')"
     [[ -n "$_hif" ]] || jobnet_die "no network interface holds $_myip"
     _names=() _jobaddrs=""
     if [[ -n "$PEER_LIST" ]]; then

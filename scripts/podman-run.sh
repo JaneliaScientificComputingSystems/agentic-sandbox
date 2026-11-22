@@ -82,7 +82,7 @@
 #   --host-net      For one worker of a multi-node LSF job on a queue WITHOUT InfiniBand: the
 #                    node's own network (--network=host), unrestricted. Use it only where
 #                    --job-nodes is too slow, which is when the data itself travels over TCP
-#                    (NCCL on Ethernet). Not with --job-nodes, --allow, --csub, --claude or
+#                    (NCCL on Ethernet). Not with --job-nodes, --ib, --allow, --csub, --claude or
 #                    --opencode.
 #   --ib            Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and the
 #                    sysfs entries libibverbs reads. The IMAGE must bring the user-space side
@@ -368,7 +368,7 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   # `|| true`: an unknown name must reach the message below, not end the script under `set -e`.
   JOBNET_MYIP="$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" || true
   [[ "$JOBNET_MYIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve this node's own address ($(hostname))"
-  JOBNET_HIF="$("$IP_BIN" -o -4 addr show | awk -v ip="$JOBNET_MYIP" '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')"
+  JOBNET_HIF="$("$IP_BIN" -o -4 addr show | awk -v ip="$JOBNET_MYIP" '{split($4, a, "/"); if (a[1] == ip && !f) {print $2; f = 1}}')"
   [[ -n "$JOBNET_HIF" ]] || jobnet_die "no network interface holds $JOBNET_MYIP"
   [[ "$JOBNET_HIF" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || jobnet_die "unexpected interface name: $JOBNET_HIF"
   JOBNET_IF="$JOBNET_HIF"
