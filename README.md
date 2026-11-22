@@ -547,7 +547,7 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --env NAME      (sandbox-run.sh) copy host variable NAME into the sandbox (repeatable)
   --csub          Start a csub broker outside the sandbox and give the agent `csub` inside
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing)
-  --dry-run       Do every check, start nothing, and print the command a real run would use
+  --dry-run       Do every check, start no sandbox, proxy or broker, and print the command a real run would use
   --no-protect    Leave .git/hooks, .git/config, .mcp.json, .claude/, .vscode and the like writable
                   (read-only by default where they exist in a read-write directory)
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH

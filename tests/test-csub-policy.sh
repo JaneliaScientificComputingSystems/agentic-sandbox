@@ -84,6 +84,7 @@ refuses "6 above the home"       "home directory"        --bwrap --rw "$T"
 refuses "6 home, trailing slash" "home directory"        --bwrap --rw "$T/home/"
 refuses "6 home through .."      "home directory"        --bwrap --rw "$T/proj/../home"
 refuses "6 the root directory"   "home directory"        --bwrap --rw /
+refuses "6 a limit with a leading zero" "not a whole number" --bwrap --rw "$T/proj" --gpus 08
 mkdir -p "$T/home/sub"
 refuses "6 inside the home"      "home directory"        --bwrap --rw "$T/home/sub"
 ln -s "$T/home" "$T/link-to-home"

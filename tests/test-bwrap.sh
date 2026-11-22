@@ -356,6 +356,11 @@ s_19() {
   check "summary printed and rc 7 propagated" "$OUT" "denied=1 host=denied.invalid rc=7 "
   OUT=$({ "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 0'; echo "rc=$?"; } 2>&1 | grep -cE 'denied [0-9]+ request')
   check "no summary when the command succeeds" "$OUT" "0"
+  # The summary goes to stderr. With the reader of that pipe gone, the write must not end the
+  # cleanup: the per-job directory still goes.
+  "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s --max-time 8 http://denied.invalid/ >/dev/null; exit 7' 2>&1 | head -c 0
+  sleep 1
+  check "cleanup completes when stderr is a pipe whose reader has gone" "$(state_dirs)" "$BASE_STATE"
 }
 
 s_20() {
