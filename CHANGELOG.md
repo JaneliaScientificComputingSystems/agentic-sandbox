@@ -101,10 +101,11 @@ behind each change.
   ran at every start, and it stops the containers of that store.
 - **`examples/unattended-tuning`:** the evaluator passes the agent's `train.py` the images to
   predict without the labels.
-- **`--dry-run`**, in both wrappers: every check runs, nothing is started, and the `bwrap` or `podman`
-  command, the proxy, the broker and the command's environment are printed. Values passed with
+- **`--dry-run`**, in both wrappers: every check runs, no sandbox, proxy or broker is started, and the
+  `bwrap` or `podman` command, the proxy, the broker and (for bwrap) the command's environment are
+  printed. Values passed with
   `--env` are not shown.
-- **A record of each run** that used `--allow` or `--csub` is written to
+- **A record of each run** in which the proxy saw a request or csub recorded a job is written to
   `~/.agentic-sandbox/records/<date>/`, outside the sandbox: the command, its exit status, every
   host the proxy allowed or refused with the time, and the csub jobs recorded meanwhile. The proxy's
   log lines now carry the time. `SANDBOX_RECORD=off` turns the record off.
@@ -170,7 +171,7 @@ behind each change.
 
 - **`scripts/ssh-entry.sh`**: a forced command for an ssh key used by an agent that runs off the
   cluster, such as Claude Code or Codex on a laptop. Tied to the key in `~/.ssh/authorized_keys`, it
-  turns every `ssh cluster '<command>'` into an interactive LSF job that runs the command through
+  turns every `ssh janelia-agent '<command>'` into an interactive LSF job that runs the command through
   `sandbox-run.sh` (or `podman-run.sh` with `--podman`) in one project directory. Only the script and
   `bsub` run on the login node. Documented on 2026-11-16: README, "An agent on your laptop".
 - **`sandbox-run.sh --gpu`**: GPU jobs no longer need podman (csub GPU children under bwrap need PR #15 of the csub repo, merged 2026-11-15; see README). The LSF-allocated GPUs (from

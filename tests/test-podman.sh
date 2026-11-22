@@ -65,7 +65,7 @@ conmons() { ps -ww -u "$USER" -o args= | grep '[/]conmon ' | grep -cF "/.agentic
 BASE_STATE=$(state_dirs)
 BASE_BROKERS=$(brokers)
 BASE_PROXIES=$(proxies)
-TMP_SANDBOX_BEFORE=$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')
+TMP_SANDBOX_BEFORE=$(ls -d /tmp/agentic-sandbox-* 2>/dev/null | wc -l | tr -d ' ')
 
 CTRL_IP=$(python3 -c 'import socket; print(socket.gethostbyname("example.com"))' 2>/dev/null || true)
 tcp_open() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/443" 2>/dev/null; }
@@ -276,7 +276,7 @@ s_12() {
     check "host credentials untouched" "$(md5sum < "$CREDS")" "$B"
   fi
   check "per-job state dirs removed on exit" "$(state_dirs)" "$BASE_STATE"
-  check "no /tmp writes by the wrapper" "$(ls -d /tmp/podman-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
+  check "no /tmp writes by the wrapper" "$(ls -d /tmp/agentic-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
   # Early exits must not leave the cfg/ copies (~/.claude.json) behind either: --gpu in an LSF
   # job with no GPU allocated is the common one, and a missing command the other.
   OUT=$(env -u CUDA_VISIBLE_DEVICES "$PODMAN_RUN" --gpu --claude -- true >/dev/null 2>&1; echo $?)

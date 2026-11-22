@@ -146,8 +146,8 @@ python3 -m venv ~/.venvs/csub
 
 This worked in a plain shell on the compute nodes checked on 2026-11-15 (it pulls `hatchling` and, on
 Python 3.9, `tomli` from PyPI). If a node cannot reach PyPI, run the install through the wrappers'
-allowlist proxy instead: `cd ~/csub && sandbox-run.sh --rw ~/.venvs/csub --allow pypi.org --allow
-files.pythonhosted.org -- ~/.venvs/csub/bin/pip install .` (verified).
+allowlist proxy instead: `cd ~/csub && "$SANDBOX"/sandbox-run.sh --rw ~/.venvs/csub --allow pypi.org
+--allow files.pythonhosted.org -- ~/.venvs/csub/bin/pip install .` (verified).
 
 Write the policy with `scripts/csub-policy.sh`. It starts from csub's sample policy
 (`~/csub/deploy/broker.janelia.toml`), so the queue and price tables are csub's current ones, and
@@ -331,6 +331,9 @@ mkdir -p ~/codex-cluster ~/.codex/rules && cd ~/codex-cluster && git init -q
 curl -fsSL $RAW/AGENTS.md -o AGENTS.md
 echo 'prefix_rule(pattern = ["ssh", "janelia-agent"], decision = "allow")' >> ~/.codex/rules/default.rules
 ```
+
+   These lines let the agent run `ssh janelia-agent` without asking. The instruction file also has it
+   copy files with `scp`, which is not on the list, so the agent asks you each time it copies a file.
 
    Read the instruction file before you use it: it is what the agent will follow. Besides the sandbox's
    own description, it points the agent at the HPC team's hints page for AI agents

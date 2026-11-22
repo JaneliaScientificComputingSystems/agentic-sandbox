@@ -83,7 +83,7 @@ canon() {  # $1 = a path given with --rw or --ro; prints its physical form
   c="$(cd -- "$d" && pwd -P)" || die "cannot enter $d"
   [[ "$c" =~ ^[A-Za-z0-9_./+@-]+$ ]] || die "unsupported character in path: $c"
   # csub refuses jobs that mount the home directory, and its policy rejects /scratch.
-  [[ "$c" != "$HOME_P" && "$HOME_P" != "${c%/}"/* ]] || die "$d is or contains your home directory; give a project directory"
+  [[ "$c" != "$HOME_P" && "$HOME_P" != "${c%/}"/* && "$c" != "${HOME_P%/}"/* ]] || die "$d is your home directory, or inside it, or above it; give a project directory outside it"
   [[ "$c" != /scratch && "$c" != /scratch/* ]] || die "/scratch cannot be a job directory: $d"
   printf '%s\n' "$c"
 }

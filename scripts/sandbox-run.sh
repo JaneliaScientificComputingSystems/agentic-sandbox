@@ -70,8 +70,9 @@
 #                          (OPENCODE_CONFIG/OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is
 #                          left alone, so git/gh config still resolve) plus RW binds on its data dirs
 #                          (~/.local/share/opencode, ~/.local/state/opencode, ~/.cache/opencode)
-#   --dry-run             Do every check, start nothing, and print the bwrap command, the
-#                          host-side helpers and the environment a real run would use.
+#   --dry-run             Do every check, start no sandbox, proxy or broker, and print the bwrap
+#                          command, the host-side helpers and the environment a real run
+#                          would use.
 #   --no-protect          Leave the files that tools run later writable (.git/hooks,
 #                          .git/config, .mcp.json, .claude/, .vscode and the like). By default
 #                          they are read-only where they exist in a read-write directory, and
@@ -97,8 +98,7 @@
 # exported in your shell (ANTHROPIC_API_KEY, HF_TOKEN, GITHUB_TOKEN, AWS_*...) would be
 # readable by the sandboxed agent even though the credential FILES are masked.
 # /tmp inside the sandbox is a private tmpfs (TMPDIR points at it). When stdin is not a
-# terminal (Mode A/B, plain bsub) the sandbox also gets its own session (--new-session), so
-# it cannot inject keystrokes into the submitting terminal via TIOCSTI.
+# terminal (Mode A/B, plain bsub) the sandbox also gets its own session (--new-session).
 #
 # Multi-node jobs (--job-nodes, --ib): one sandbox per node, started by the job's launcher, which
 # stays outside. torchrun, NCCL and Ray need TCP between the job's nodes, which the default empty
@@ -143,9 +143,7 @@
 # copies above), proxy/ (the allowlist proxy's Unix socket + log), and the empty file used to
 # mask credential files. Nothing is ever written to /tmp. /scratch/$USER is node-local, which
 # is where a Unix socket belongs, and is swept by an hourly cleanup cron, which turns a crashed
-# job's leftovers into a non-problem. /scratch itself is owned by root and not world-writable
-# on the nodes, so no other user can create /scratch/$USER before you do; this layout relies on
-# that. Two consequences:
+# job's leftovers into a non-problem. Two consequences:
 #   - --scratch binds /scratch/$USER/work, not /scratch/$USER: binding the whole tree would
 #     expose every concurrent job's state dir (same uid, so permissions don't help) -- a
 #     sibling's proxy socket, which has a DIFFERENT allowlist, and its config copies. As
@@ -177,6 +175,11 @@
 #     --allow api.anthropic.com --allow claude.ai --allow platform.claude.com -- \
 #     claude
 set -euo pipefail
+# The environment as it was handed to this script, for --env: looked up later, a name such as CMD
+# or p would give this script's own variable of that name.
+declare -A ENV_AT_START=()
+while IFS= read -r _n; do ENV_AT_START[$_n]="${!_n}"; done < <(compgen -e)
+unset _n
 
 # Python that this script starts on the host (the csub broker, its lookup) must never import from
 # a directory the sandboxed process can write. An empty or relative PYTHONPATH entry means "the
@@ -226,6 +229,15 @@ usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut
 # An option that takes a value must have one: without this a trailing `--rw` died with bash's
 # own "unbound variable" instead of a usage error.
 need_arg() { [[ $# -ge 2 ]] || { echo "sandbox-run.sh: $1 needs an argument" >&2; exit 1; }; }
+# /, /tmp, /proc and /dev are the sandbox's own (a private /tmp, its own /proc and /dev). A bind of
+# one of them, or the working directory being one, would put the node's in their place.
+refuse_base_path() {  # $1 = how it was named, $2 = canonical path
+  case "$2" in
+    /|/tmp|/proc|/dev)
+      echo "sandbox-run.sh: $1: $2 cannot be bound: the sandbox has its own. Use a directory beneath it." >&2
+      exit 1 ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -234,6 +246,7 @@ while [[ $# -gt 0 ]]; do
       # Canonical, existing path: a relative or symlinked argument would otherwise be bound under
       # one name and compared (masking, script-dir shadowing, csub envelope) under another.
       p="$(realpath -e -- "$2" 2>/dev/null)" || { echo "sandbox-run.sh: $1 $2: no such path" >&2; exit 1; }
+      refuse_base_path "$1 $2" "$p"
       if [[ "$1" == --ro ]]; then RO_BINDS+=("$p"); else RW_BINDS+=("$p"); fi
       shift 2 ;;
     --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
@@ -298,6 +311,7 @@ if [[ "$PWD" == "$HOME_P" || "$HOME_P" == "${PWD%/}/"* ]]; then
   echo "sandbox-run.sh: refusing to run from $PWD: the working directory is bound read-write and would expose your whole home directory. cd into a project directory first." >&2
   exit 1
 fi
+refuse_base_path "the working directory" "$(pwd -P)"
 if [[ ${#CMD[@]} -eq 0 ]]; then
   echo "No command given after --" >&2; usage; exit 1
 fi
@@ -548,6 +562,8 @@ fi
 
 # Per-job state directory (see "Per-job state" in the header). Created here, before the bwrap
 # argument list, and removed whole by cleanup() on exit. The tag matches podman-run.sh's.
+# /scratch itself is owned by root and not world-writable on the nodes, so no other user can
+# create /scratch/$USER before you do; this layout relies on that.
 SANDBOX_STATE_PARENT="/scratch/$USER/.agentic-sandbox"
 if ! mkdir -p "$SANDBOX_STATE_PARENT" 2>/dev/null; then
   # Not a cluster node (no writable /scratch/$USER). Only then fall back to $TMPDIR.
@@ -575,7 +591,7 @@ trap early_cleanup EXIT
 # too; bwrap itself dies with the wrapper (--die-with-parent).
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'exit 141' USR2
+trap 'exit 140' USR2
 new_cfg_root() {
   [[ -n "$SANDBOX_CFG_ROOT" ]] && return 0
   SANDBOX_CFG_ROOT="$JOB_DIR/cfg"
@@ -691,8 +707,11 @@ if [[ $PROTECT -eq 1 ]] && command -v git >/dev/null 2>&1; then
   unset _gn _ge
 fi
 ENV_ARGS=()
-for name in "${PASSTHROUGH_ENV[@]}" "${PASS_ENV[@]:-}"; do
-  [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=(--setenv "$name" "${!name}")
+for name in "${PASSTHROUGH_ENV[@]}"; do
+  [[ -n "${!name+x}" ]] && ENV_ARGS+=(--setenv "$name" "${!name}")
+done
+for name in "${PASS_ENV[@]:-}"; do
+  [[ -n "$name" && -n "${ENV_AT_START[$name]+x}" ]] && ENV_ARGS+=(--setenv "$name" "${ENV_AT_START[$name]}")
 done
 for ((i = 0; i < ${#EXTRA_SETENV[@]}; i += 2)); do
   ENV_ARGS+=(--setenv "${EXTRA_SETENV[i]}" "${EXTRA_SETENV[i + 1]}")
@@ -1060,12 +1079,14 @@ wait_for_socket() {
   for _ in $(seq 1 100); do
     [[ -S "$2" ]] && return 0
     if ! kill -0 "$3" 2>/dev/null; then
-      echo "sandbox-run.sh: $1 exited before creating $2 -- see $4" >&2
+      echo "sandbox-run.sh: $1 exited before creating $2. Its last lines:" >&2
+      tail -n 8 "$4" 2>/dev/null | sed 's/^/  /' >&2
       return 1
     fi
     sleep 0.1
   done
-  echo "sandbox-run.sh: $1 did not create $2 within 10s -- see $4" >&2
+  echo "sandbox-run.sh: $1 did not create $2 within 10s. Its last lines:" >&2
+  tail -n 8 "$4" 2>/dev/null | sed 's/^/  /' >&2
   return 1
 }
 wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }
@@ -1136,7 +1157,7 @@ write_record() {  # $1 = exit status of the command
 # normally does not have its stragglers swept by LSF the way a `bkill`ed one does, so anything
 # left running would stay on the node.
 cleanup() {
-  # $? on entry is the script's exit status (the `exit $?` after bwrap, or 130/141/143 from the
+  # $? on entry is the script's exit status (the `exit $?` after bwrap, or 130/140/143 from the
   # signal traps). The denied-host summary is a troubleshooting hint, so it is printed only
   # when the sandboxed command did not succeed: a clean run must not grow an extra stderr line
   # (tests and user pipelines take `2>&1 | tail -1`), and opencode denials in a successful run
@@ -1452,7 +1473,7 @@ write_sandbox_readme
 # the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
 dry_run_print() {  # "$@" = everything after `bwrap`
   local i n
-  echo "sandbox-run.sh: dry run. Nothing was started. A real run would do this:"
+  echo "sandbox-run.sh: dry run. No sandbox, proxy or broker was started. A real run would do this:"
   if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     echo; echo "On the host, the allowlist proxy:"
     printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo

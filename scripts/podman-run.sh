@@ -89,8 +89,9 @@
 #                    (libibverbs and the mlx5 provider: rdma-core / ibverbs-providers). Verbs
 #                    traffic does not pass through the container's network, so this opens the
 #                    InfiniBand fabric to the container whatever else is closed.
-#   --dry-run       Do every check, start nothing (no image pull, no container), and print the
-#                    podman command and the host-side helpers a real run would use.
+#   --dry-run       Do every check, start no container, proxy or broker and pull no image, and
+#                    print the podman command and the host-side helpers a real run would use.
+#                    The checks themselves ask podman about its stores.
 #   --no-protect    Leave the files that tools run later writable (.git/hooks, .git/config,
 #                    .mcp.json, .claude/, .vscode and the like). By default they are mounted
 #                    read-only where they exist under a --rw path, and ones the command
@@ -112,7 +113,8 @@
 # here -- confirmed live 2026-09-10 that podman doesn't let a --tmpfs override a path already
 # covered by an ancestor -v bind the way bwrap's sequential mounts do (see the comment near
 # PODMAN_ARGS below for the full story). So --rw/--ro on a path that IS or CONTAINS
-# $HOME is refused (.ssh/.aws/.git-credentials/etc. would be fully exposed), as is one that
+# $HOME is refused (.ssh/.aws/.git-credentials/etc. would be fully exposed), as is a credential
+# directory under $HOME (or a directory that contains one), the shared image store, and a path that
 # contains /scratch/$USER/.agentic-sandbox. Scope --rw/--ro to the subdirectory you need.
 set -euo pipefail
 
@@ -447,7 +449,7 @@ trap early_cleanup EXIT
 # EXIT trap.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'exit 141' USR2
+trap 'exit 140' USR2
 
 SANDBOX_CFG_ROOT=""
 CLAUDE_CFG=""
@@ -576,13 +578,13 @@ remove_stale_shared_pause_pidfile() {
 remove_stale_shared_pause_pidfile
 
 # Reconcile podman's cached boot-ID state in case this node rebooted since the last job that
-# used the shared graphroot (Janelia's Harbor fork documents this). It stops the containers of that
-# store, so it runs only when the store does not answer (see below). CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
-# these prologue calls must see the SHARED store from ~/.config/containers/storage.conf, both
-# to health-check it and to read its graphroot for the cache reference below.
-# Only when the store does not answer: `podman system migrate` stops the containers of that store,
-# so running it at every start could stop one that you run on the node yourself.
-podman info >/dev/null 2>&1 || podman system migrate 2>/dev/null || true
+# used the shared graphroot (Janelia's Harbor fork documents this). Only when the store does not
+# answer: `podman system migrate` stops the containers of that store, so running it at every start
+# could stop one that you run on the node yourself. Never in a dry run.
+# CONTAINERS_STORAGE_CONF is deliberately NOT exported yet -- these prologue calls must see the
+# SHARED store from ~/.config/containers/storage.conf, both to health-check it and to read its
+# graphroot for the cache reference below.
+if ! podman info >/dev/null 2>&1 && [[ $DRY_RUN -eq 0 ]]; then podman system migrate >/dev/null 2>&1 || true; fi
 # Do NOT `podman system reset -f` the shared store on a failed `podman info` here: this
 # script deliberately runs multiple podman jobs concurrently on one node, so that store may
 # be in active use by a sibling job's additionalimagestores right now. Resetting it out from
@@ -821,7 +823,7 @@ fi
 # before the container starts (the image pull); recheck_paths looks once more, so that a
 # directory swapped for a symlink in between is not mounted under the name that was checked.
 dry_run_print() {  # $1 = a note about how the command is wrapped, or empty
-  echo "podman-run.sh: dry run. Nothing was started and no image was pulled. A real run would do this:"
+  echo "podman-run.sh: dry run. No container, proxy or broker was started and no image was pulled. A real run would do this:"
   if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     echo; echo "On the host, the allowlist proxy:"
     printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo
@@ -988,12 +990,14 @@ wait_for_socket() {
   for _ in $(seq 1 100); do
     [[ -S "$2" ]] && return 0
     if ! kill -0 "$3" 2>/dev/null; then
-      echo "podman-run.sh: $1 exited before creating $2 -- see $4" >&2
+      echo "podman-run.sh: $1 exited before creating $2. Its last lines:" >&2
+      tail -n 8 "$4" 2>/dev/null | sed 's/^/  /' >&2
       return 1
     fi
     sleep 0.1
   done
-  echo "podman-run.sh: $1 did not create $2 within 10s -- see $4" >&2
+  echo "podman-run.sh: $1 did not create $2 within 10s. Its last lines:" >&2
+  tail -n 8 "$4" 2>/dev/null | sed 's/^/  /' >&2
   return 1
 }
 wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DIR/proxy.log"; }

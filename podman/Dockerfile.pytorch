@@ -65,4 +65,8 @@ RUN printf '%s\n' \
       > /usr/local/bin/quiet-entrypoint && chmod 755 /usr/local/bin/quiet-entrypoint
 ENTRYPOINT ["/usr/local/bin/quiet-entrypoint"]
 
+# The installers above are piped into a shell, so a failed download still "succeeds" and leaves a
+# dangling link. Fail the build here instead.
+RUN claude --version && opencode --version && codex --version
+
 WORKDIR /work

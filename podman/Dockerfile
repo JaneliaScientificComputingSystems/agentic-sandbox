@@ -54,4 +54,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mkdir -p /usr/libexec/openssh && \
     ln -s /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server
 
+# The installers above are piped into a shell, so a failed download still "succeeds" and leaves a
+# dangling link. Fail the build here instead.
+RUN claude --version && opencode --version && codex --version
+
 WORKDIR /work
