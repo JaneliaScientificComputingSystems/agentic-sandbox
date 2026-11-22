@@ -73,7 +73,7 @@ BASE_STATE=$(state_dirs)
 BASE_BROKERS=$(brokers)
 BASE_PROXIES=$(proxies)
 # Wrapper-named /tmp entries before the suite, for the same reason.
-TMP_SANDBOX_BEFORE=$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')
+TMP_SANDBOX_BEFORE=$(ls -d /tmp/agentic-sandbox-* 2>/dev/null | wc -l | tr -d ' ')
 
 # A public address that answers on 443 from this node: the control for the network sections
 # (a connection that fails inside the sandbox must be one that works outside it).
@@ -229,7 +229,7 @@ s_12() {
   echo "=== 12. Own session when stdin is not a terminal (Mode A/B) ==="
   # Under --unshare-pid the session leader is bwrap's own init (pid 1), so a new session shows
   # as sid 1; an inherited (outer) session is not visible in the namespace and shows as sid 0.
-  OUT=$("$SANDBOX_RUN" -- bash -c 'test "$(ps -o sid= -p $$ | tr -d " ")" != "0" && echo own-session || echo shared' </dev/null)
+  OUT=$("$SANDBOX_RUN" -- bash -c 's="$(ps -o sid= -p $$ | tr -d " ")"; test -n "$s" && test "$s" != "0" && echo own-session || echo shared' </dev/null)
   check "--new-session applied without a tty" "$OUT" "own-session"
 }
 
@@ -274,7 +274,7 @@ s_16() {
   OUT=$("$SANDBOX_RUN" --rw "/scratch/$USER" --claude -- bash -c 'echo "$(ls -A /scratch/$USER/.agentic-sandbox | grep -c fake-sibling),$(test -d "$CLAUDE_CONFIG_DIR" && touch "$CLAUDE_CONFIG_DIR/probe" 2>/dev/null && echo own-cfg-ok)"' 2>/dev/null)
   check "--rw /scratch/\$USER: siblings masked by tmpfs, own cfg still bound" "$OUT" "0,own-cfg-ok"
   rm -rf "$FAKE"
-  check "no /tmp writes by the wrapper" "$(ls -d /tmp/sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
+  check "no /tmp writes by the wrapper" "$(ls -d /tmp/agentic-sandbox-* 2>/dev/null | wc -l | tr -d ' ')" "$TMP_SANDBOX_BEFORE"
 }
 
 s_17() {
@@ -391,6 +391,16 @@ s_22() {
   check "option without its argument is a usage error" "$OUT" "sandbox-run.sh: --rw needs an argument"
   OUT=$("$SANDBOX_RUN" --env FOO=bar -- true >/dev/null 2>&1; echo $?)
   check "--env NAME=value refused (rc 1)" "$OUT" "1"
+  # --env takes the value from the environment the wrapper was started with, not from a variable
+  # of the wrapper that happens to have the same name (CMD is its command array).
+  OUT=$(CMD=from-the-caller "$SANDBOX_RUN" --env CMD -- bash -c 'echo "$CMD"' 2>/dev/null)
+  check "--env passes the caller's value for a name the wrapper also uses" "$OUT" "from-the-caller"
+  OUT=$("$SANDBOX_RUN" --rw /tmp -- true 2>&1; echo "rc=$?")
+  check "--rw /tmp refused: the sandbox has its own /tmp" "$(grep -c 'cannot be bound' <<<"$OUT"),${OUT##*rc=}" "1,1"
+  OUT=$(cd /tmp && "$SANDBOX_RUN" -- true 2>&1; echo "rc=$?")
+  check "running from /tmp refused" "$(grep -c 'cannot be bound' <<<"$OUT"),${OUT##*rc=}" "1,1"
+  OUT=$("$SANDBOX_RUN" --ro / -- true 2>&1; echo "rc=$?")
+  check "--ro / refused" "$(grep -c 'cannot be bound' <<<"$OUT"),${OUT##*rc=}" "1,1"
   # The trailing `:` keeps bash from exec'ing ls directly, so ls lists bash's descriptors, not its own.
   OUT=$(exec 7</dev/null; "$SANDBOX_RUN" -- bash -c 'ls /proc/$$/fd; :' 2>&1 | tr "\n" " ")
   check "inherited descriptors are closed (only 0-2 inside)" "$OUT" "0 1 2 "

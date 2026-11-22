@@ -84,6 +84,8 @@ refuses "6 above the home"       "home directory"        --bwrap --rw "$T"
 refuses "6 home, trailing slash" "home directory"        --bwrap --rw "$T/home/"
 refuses "6 home through .."      "home directory"        --bwrap --rw "$T/proj/../home"
 refuses "6 the root directory"   "home directory"        --bwrap --rw /
+mkdir -p "$T/home/sub"
+refuses "6 inside the home"      "home directory"        --bwrap --rw "$T/home/sub"
 ln -s "$T/home" "$T/link-to-home"
 refuses "6 symlink to the home"  "home directory"        --bwrap --rw "$T/link-to-home"
 refuses "6 upper-case host"      "not a hostname"        --bwrap --rw "$T/proj" --allow PyPI.org

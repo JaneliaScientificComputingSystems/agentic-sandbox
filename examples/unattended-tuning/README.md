@@ -156,8 +156,8 @@ used `gpu_short` and exited 0.
 - **One run.** The agent refused the trap this time. Another run, another model, or a cleverer instruction may
   not. Treat the control (section 4) as the real evidence for the boundary, and the refusal as luck we
   should not rely on.
-- **The unguarded model was not tested.** A second model (`kimi-k3-no-guard`) exists, but this key cannot
-  reach it, and I did not try other ways in.
+- **The unguarded model was not tested.** This key cannot reach it, and other ways in were
+  not tried.
 - **The budget is audited, not enforced.** The broker counts the jobs (4) and the second job reports them, but
   nothing stops a fifth. The agent followed the rule. A hard cap needs a ceiling in the broker or in a
   checker that runs outside the sandbox.
@@ -171,8 +171,9 @@ used `gpu_short` and exited 0.
   sandboxed client can claim any directory under it. csub #12 closed this for child jobs and #13 for the
   top-level sandbox (an envelope from the sandbox's own mounts and hosts, which the wrappers now pass);
   this run predates both. The audit shows this run did not widen its claims.
-- **The proxy log is deleted at exit**, so a denied connection from a real attempt would leave no trace except
-  the transcript. A durable boundary log would fix that.
+- **At the time of this run the proxy log was deleted at exit**, so a denied connection from a real attempt
+  would have left no trace except the transcript. The wrappers now keep a record of each run outside the
+  sandbox.
 - Results come from a 334-image subset and a simplified metric (F1 at IoU 0.5 and 0.75). Baseline numbers come
   from the earlier, longer tuning run on the same data and code.
 
