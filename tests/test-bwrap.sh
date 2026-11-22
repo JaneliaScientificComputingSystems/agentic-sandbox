@@ -595,7 +595,20 @@ s_30() {
   check "a --ro of your own over .git is not undone by the pin" "$OUT" "still-read-only"
 }
 
-ALL_SECTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30)
+s_31() {
+  echo "=== 31. A checkout inside a read-write directory cannot be swapped ==="
+  local C="$TR/co" OUT
+  mkdir -p "$C/tools/agentic" "$TR/work31" && cp -r "$SCRIPT_DIR/../scripts" "$C/tools/agentic/scripts"
+  OUT=$(cd "$TR/work31" && "$C/tools/agentic/scripts/sandbox-run.sh" --rw "$C" -- bash -c "
+    mv $C/tools $C/t2 2>/dev/null && echo TOOLS-MOVED || echo tools-pinned
+    mv $C/tools/agentic $C/tools/a2 2>/dev/null && echo CHECKOUT-MOVED || echo checkout-pinned
+    echo x >> $C/tools/agentic/scripts/sandbox-run.sh 2>/dev/null && echo SCRIPT-WRITABLE || echo script-read-only
+    touch $C/tools/agentic/other 2>/dev/null && echo rest-writable" 2>/dev/null | tr '\n' ',')
+  check "the directories above the wrappers cannot be renamed, the wrappers are read-only, the rest stays writable" "$OUT" "tools-pinned,checkout-pinned,script-read-only,rest-writable,"
+  check "outside afterwards the checkout is where it was" "$([[ -x "$C/tools/agentic/scripts/sandbox-run.sh" && ! -e "$C/t2" ]] && echo intact)" "intact"
+}
+
+ALL_SECTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-bwrap.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

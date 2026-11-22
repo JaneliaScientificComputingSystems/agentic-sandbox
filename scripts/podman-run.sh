@@ -108,6 +108,7 @@ IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-lite:latest"
 VOLUMES=()
 RO_PATHS=()
 RW_PATHS=()
+SCRATCH_ROOT=""   # set by --scratch: a read-write mount that is not in RW_PATHS
 ALLOW_HOSTS=()
 GPU=0
 SHM_SIZE=""
@@ -141,6 +142,20 @@ refuse_wide_mount() {
     echo "podman-run.sh: $1 $2: refusing to mount your home directory (or a directory above it). There is no credential masking under podman; mount the specific subdirectory you need." >&2
     exit 1
   fi
+  # Credential locations under $HOME, and any directory that contains one (~/.config holds
+  # gcloud and gh). sandbox-run.sh masks or refuses these; here nothing can hide them.
+  local c
+  for c in .ssh .aws .azure .kube .config/gcloud .docker .gnupg .config/gh .claude; do
+    if [[ "$2" == "$HOME_P/$c" || "$2" == "$HOME_P/$c/"* || "$HOME_P/$c" == "$pre"* ]]; then
+      echo "podman-run.sh: $1 $2: refusing to mount a directory that is, is inside, or contains ~/$c, which holds credentials. There is no credential masking under podman; mount a directory without them." >&2
+      exit 1
+    fi
+  done
+  # The shared image store: every later job of yours on the node reads images from it.
+  if [[ "$2" == "/scratch/$USER/podman-storage" || "$2" == "/scratch/$USER/podman-storage/"* ]]; then
+    echo "podman-run.sh: $1 $2: refusing to mount the shared image store" >&2
+    exit 1
+  fi
   if [[ "$2" == "$STATE_PARENT_P" || "$STATE_PARENT_P" == "$pre"* || "$2" == "$STATE_PARENT_P/"* ]]; then
     echo "podman-run.sh: $1 $2: refusing to mount a directory that contains (or is inside) $SANDBOX_STATE_PARENT, where every concurrent job's state lives. Use --scratch, or a subdirectory of /scratch/$USER." >&2
     exit 1
@@ -168,7 +183,7 @@ while [[ $# -gt 0 ]]; do
       SHM_SIZE="$2"; shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
-    --scratch) mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
+    --scratch) SCRATCH_ROOT="/scratch/$USER/work"; mkdir -p "/scratch/$USER/work"; VOLUMES+=("-v" "/scratch/$USER/work:/scratch/$USER/work:rw"); shift ;;
     --no-protect) PROTECT=0; shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
@@ -193,13 +208,24 @@ done
 # invocation, so it is mounted read-only on top (podman orders mounts by destination depth, so
 # the deeper mount wins, as the credentials file over its config dir does). When the directory
 # IS the read-write mount there is nothing deeper to add, so that is refused.
-for q in "${RW_PATHS[@]:-}"; do
+for q in "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
   [[ -n "$q" ]] || continue
   if [[ "$SCRIPT_DIR" == "$q" ]]; then
     echo "podman-run.sh: --rw $q is this wrapper's own script directory; the agent could rewrite code that runs outside the sandbox. Work in a separate directory." >&2
     exit 1
   elif [[ "$SCRIPT_DIR" == "${q%/}/"* ]]; then
     echo "podman-run.sh: note: $SCRIPT_DIR is inside a read-write mount ($q); mounting it read-only. Prefer running from a separate work directory." >&2
+    # The read-only mount makes the script directory a mount point, which cannot be renamed. The
+    # directories ABOVE it, up to the read-write one, still could be: a process could move the
+    # checkout aside and build its own in its place. Mounting each of them onto itself makes
+    # them mount points too.
+    _a="$(dirname "$SCRIPT_DIR")"
+    while [[ "$_a" != "$q" && "$_a" == "${q%/}/"* ]]; do
+      _ro=0
+      for _r in "${RO_PATHS[@]:-}"; do [[ -n "$_r" && ( "$_a" == "$_r" || "$_a" == "${_r%/}/"* ) ]] && _ro=1; done
+      [[ $_ro -eq 1 ]] || VOLUMES+=("-v" "$_a:$_a:rw")   # under your own --ro it is read-only already
+      _a="$(dirname "$_a")"
+    done
     VOLUMES+=("-v" "$SCRIPT_DIR:$SCRIPT_DIR:ro")
     break
   fi
@@ -390,7 +416,9 @@ remove_stale_shared_pause_pidfile
 # there's nothing to migrate. CONTAINERS_STORAGE_CONF is deliberately NOT exported yet --
 # these prologue calls must see the SHARED store from ~/.config/containers/storage.conf, both
 # to health-check it and to read its graphroot for the cache reference below.
-podman system migrate 2>/dev/null || true
+# Only when the store does not answer: `podman system migrate` stops the containers of that store,
+# so running it at every start could stop one that you run on the node yourself.
+podman info >/dev/null 2>&1 || podman system migrate 2>/dev/null || true
 # Do NOT `podman system reset -f` the shared store on a failed `podman info` here: this
 # script deliberately runs multiple podman jobs concurrently on one node, so that store may
 # be in active use by a sibling job's additionalimagestores right now. Resetting it out from
@@ -583,6 +611,21 @@ if [[ $KEEP_ID -eq 1 ]]; then
   PODMAN_ARGS+=(--userns=keep-id --user "$(id -u):$(id -g)" -e "HOME=$HOME")
 fi
 [[ ${#VOLUMES[@]} -gt 0 ]] && PODMAN_ARGS+=("${VOLUMES[@]}")
+
+# Each --ro/--rw path was made physical and checked when the arguments were read. Minutes can pass
+# before the container starts (the image pull); recheck_paths looks once more, so that a
+# directory swapped for a symlink in between is not mounted under the name that was checked.
+recheck_paths() {
+  local p
+  for p in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$(realpath -e -- "$p" 2>/dev/null)" != "$p" ]]; then
+      echo "podman-run.sh: $p changed while the sandbox was being set up (it is no longer the directory that was checked); not starting" >&2
+      exit 1
+    fi
+  done
+  return 0
+}
 
 # ---- Files that run later ------------------------------------------------------------------
 # Some files in a project are not the work product but instructions to tools: git runs
@@ -1057,6 +1100,7 @@ PY
 
 write_sandbox_readme
 
+recheck_paths
 if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # A fresh 0700 directory holds the socket and its log: nobody else on the node can reach the
   # socket (it is created 0755), and no one else's socket can stand in for ours. Node-local on

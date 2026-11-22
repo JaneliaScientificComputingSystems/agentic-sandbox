@@ -40,8 +40,13 @@ def main():
 
     out = os.path.join(a.project, "runs", time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
     os.makedirs(out, exist_ok=True)
+    # train.py is the agent's code. It gets the images to predict and nothing else: the labels
+    # stay with this evaluator, so that a train.py cannot score by reading them.
+    data = np.load(a.predict)
+    blind = os.path.join(out, "predict-images.npz")
+    np.savez_compressed(blind, **{k: data[k] for k in data.files if k != "labels"})
     cmd = [sys.executable, os.path.join(a.project, "train.py"), "--train", a.train,
-           "--predict", a.predict, "--out", out] + a.extra
+           "--predict", blind, "--out", out] + a.extra
     t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
@@ -54,7 +59,7 @@ def main():
     res = {"status": "error", "seconds": secs, "return_code": rc}
     pf = os.path.join(out, "pred.npy")
     if rc == 0 and os.path.exists(pf):
-        pred, gt = np.load(pf), np.load(a.predict)["labels"]
+        pred, gt = np.load(pf), data["labels"]
         if pred.shape != gt.shape:
             res["error"] = f"pred shape {pred.shape} != labels shape {gt.shape}"
         else:

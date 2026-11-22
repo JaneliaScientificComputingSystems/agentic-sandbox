@@ -467,6 +467,17 @@ for root in "$PWD" "${RW_BINDS[@]:-}" "${RW_TRY_BINDS[@]:-}"; do
   [[ -n "$root" ]] || continue
   if [[ "$SCRIPT_DIR" == "$root" || "$SCRIPT_DIR" == "$root/"* ]]; then
     echo "sandbox-run.sh: note: $SCRIPT_DIR is inside a read-write bind ($root); re-binding it read-only. Prefer running from a separate work directory." >&2
+    # The read-only bind makes the script directory a mount point, which cannot be renamed. The
+    # directories ABOVE it, up to the read-write one, still could be: a process could move the
+    # checkout aside and build its own in its place. Binding each of them onto itself makes
+    # them mount points too (outermost first, then the script directory read-only on top).
+    _pins=(); _a="$(dirname "$SCRIPT_DIR")"
+    while [[ "$_a" != "$root" && "$_a" == "$root/"* ]]; do _pins=("$_a" ${_pins[@]+"${_pins[@]}"}); _a="$(dirname "$_a")"; done
+    for _a in ${_pins[@]+"${_pins[@]}"}; do
+      _ro=0
+      for _r in "${RO_BINDS[@]:-}"; do [[ -n "$_r" && ( "$_a" == "$_r" || "$_a" == "${_r%/}/"* ) ]] && _ro=1; done
+      [[ $_ro -eq 1 ]] || BWRAP_ARGS+=(--bind "$_a" "$_a")   # under your own --ro it is read-only already
+    done
     BWRAP_ARGS+=(--ro-bind "$SCRIPT_DIR" "$SCRIPT_DIR")
     break
   fi
@@ -1012,7 +1023,17 @@ write_sandbox_readme
 # fd for a sourced script). Close them in a subshell right before exec'ing bwrap: 0-2 stay, and
 # the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
 run_bwrap() {
-  local fd
+  local fd p
+  # Each path was made physical and checked when the arguments were read. Seconds have passed
+  # since (the proxy and the broker were started); look once more, so that a directory swapped
+  # for a symlink in between is not mounted under the name that was checked.
+  for p in "$PWD" "${RO_BINDS[@]:-}" "${RW_BINDS[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$(realpath -e -- "$p" 2>/dev/null)" != "$p" ]]; then
+      echo "sandbox-run.sh: $p changed while the sandbox was being set up (it is no longer the directory that was checked); not starting" >&2
+      exit 1
+    fi
+  done
   # The environment for the command, NUL-separated, on descriptor 9 (see ENV_ARGS above). printf
   # is a builtin, so the values are in no process's command line. bwrap reads the descriptor and
   # closes it; it is not passed on to the command.

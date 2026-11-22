@@ -438,7 +438,29 @@ s_21() {
   check "--no-protect leaves them writable" "$OUT,$([[ -e "$R3/.git/hooks/pre-commit" ]] && echo 1 || echo 0)" "writable,1"
 }
 
-ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)
+s_22() {
+  echo "=== 22. A checkout inside a read-write mount cannot be swapped; credential directories are refused ==="
+  local C="$TR/co" FH="$TR/fakehome22" OUT
+  mkdir -p "$C/tools/agentic" && cp -r "$SCRIPT_DIR/../scripts" "$C/tools/agentic/scripts"
+  OUT=$("$C/tools/agentic/scripts/podman-run.sh" --rw "$C" -- bash -c "
+    mv $C/tools $C/t2 2>/dev/null && echo TOOLS-MOVED || echo tools-pinned
+    mv $C/tools/agentic $C/tools/a2 2>/dev/null && echo CHECKOUT-MOVED || echo checkout-pinned
+    echo x >> $C/tools/agentic/scripts/podman-run.sh 2>/dev/null && echo SCRIPT-WRITABLE || echo script-read-only
+    touch $C/tools/agentic/other 2>/dev/null && echo rest-writable" 2>/dev/null | tail -4 | tr '\n' ',')
+  check "the directories above the wrappers cannot be renamed, the wrappers are read-only, the rest stays writable" "$OUT" "tools-pinned,checkout-pinned,script-read-only,rest-writable,"
+  mkdir -p "$FH/.ssh" "$FH/.config/gcloud" "$FH/.config/other" "$FH/.claude" "$FH/proj"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.ssh" -- true 2>&1 | grep -c "holds credentials"; echo "rc=${PIPESTATUS[0]}")
+  check "--ro ~/.ssh refused, with the reason" "$(echo "$OUT" | tr '\n' ',')" "1,rc=1,"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --rw "$FH/.config" -- true 2>&1 | grep -c "holds credentials")
+  check "--rw ~/.config refused (it contains ~/.config/gcloud)" "$OUT" "1"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.claude" -- true 2>&1 | grep -c "holds credentials")
+  check "--ro ~/.claude refused" "$OUT" "1"
+  OUT=$(HOME="$FH" "$PODMAN_RUN" --ro "$FH/.config/other" --gpu -- true 2>&1 | grep -c "holds credentials")
+  check "an ordinary directory under ~/.config is not refused for that reason" "$OUT" "0"
+  check "the refusals left no per-job state" "$(state_dirs)" "$BASE_STATE"
+}
+
+ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-podman.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

@@ -49,6 +49,17 @@ behind each change.
   passed in), and `--no-protect` turns the protection off. If the command creates
   such a file where there was none, the wrapper names it at exit.
 
+- **A checkout inside a read-write directory cannot be swapped.** The wrappers already re-bound
+  their own `scripts/` directory read-only when it lay inside a read-write mount. The directories
+  above it could still be renamed, and a new checkout put in their place. They are now pinned,
+  under both wrappers, and `podman-run.sh` applies the same to `--scratch`.
+- **`podman-run.sh` refuses credential directories.** `--ro` or `--rw` on `~/.ssh`, `~/.aws`,
+  `~/.claude` and the other credential locations, on a directory inside one, or on one that
+  contains one (`~/.config`), is refused, as `sandbox-run.sh` refuses or masks them. So is the
+  shared image store.
+- **Paths are checked again right before they are mounted,** in both wrappers, so a directory
+  replaced by a link while the sandbox is being set up is not mounted.
+
 ### Other changes
 
 - **`ssh-entry.sh`: stderr comes back on stderr.** LSF returned an interactive job's stderr on
@@ -85,6 +96,10 @@ behind each change.
 - **`SETUP.md` §8:** step 1 carries `--replace`, so it no longer stops when §6 already wrote a
   policy; `EXPIRES` in the key line is the first day the key no longer works, not the last day it
   works (sshd reads a date without a time as midnight at the start of that day).
+- **`podman-run.sh`** runs `podman system migrate` only when the shared store does not answer. It
+  ran at every start, and it stops the containers of that store.
+- **`examples/unattended-tuning`:** the evaluator passes the agent's `train.py` the images to
+  predict without the labels.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20

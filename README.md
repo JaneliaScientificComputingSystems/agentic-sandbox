@@ -158,7 +158,9 @@ of those `$HOME` locations, or inside one, is refused, as is `~/.claude` itself 
 paths that exist at start are masked, and under a project root only direct children: a `.env` two
 levels down is readable. The full list is in the sandbox's own `/run/sandbox/README.md`.
 Podman can't do this (a `--tmpfs` can't shadow a path under an ancestor `-v` bind), so
-`podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME` (a subdirectory is fine),
+`podman-run.sh` refuses `--rw`/`--ro` on a path that is or contains `$HOME`, on a credential directory
+under it (`~/.ssh`, `~/.aws`, `~/.claude`, ...) or a directory that contains one (`~/.config`); another
+subdirectory is fine,
 and on one that contains `/scratch/$USER/.agentic-sandbox`.
 
 **Network, default-deny.** Without `--allow` there is no network. `scripts/allowlist_proxy.py` runs
