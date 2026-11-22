@@ -106,7 +106,7 @@
 # network relay: pasta gives a new network namespace the node's own address, and connects it to
 # the node's network through ordinary sockets. Inside that namespace, before the sandbox starts,
 # every route is removed and one host route is added per other node of the job, so a connection
-# to anything else fails at once with "network unreachable". The sandbox then runs in a nested
+# to anything else is refused at once ("connection refused"). The sandbox then runs in a nested
 # user namespace, which holds no capability over the network namespace: the sandboxed process
 # cannot add a route. /etc/hosts inside lists the job's nodes (there is no DNS).
 #   Ports: connections FROM the job's other nodes are accepted on a block of 2000 ports and on
@@ -368,8 +368,10 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     _names=() _jobaddrs=""
     if [[ -n "$PEER_LIST" ]]; then
       IFS=, read -ra _names <<< "$PEER_LIST"
-      # Inside an LSF job --peers may only narrow the job's own nodes: otherwise it would be a
-      # way to open a path to any host by naming it.
+      # Inside an LSF job --peers may only narrow the job's own nodes, so that a launcher or a
+      # typing mistake cannot open a path to another host by naming it. The list comes from
+      # LSB_MCPU_HOSTS in the environment: it guards whoever starts the wrapper against a mistake,
+      # not against themselves. The sandboxed process never starts the wrapper outside the sandbox.
       if [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
         read -ra _mc <<< "$LSB_MCPU_HOSTS"
         for ((i = 0; i < ${#_mc[@]}; i += 2)); do
@@ -482,6 +484,11 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
       # which is what happens when another sandbox on this node took the same block of ports in
       # the same instant. Look again and retry; any other failure repeats and is reported as is.
       _pp=""   # waited for: nothing left for the EXIT trap to stop
+      # Stopped by a signal, at whatever point: that is the end, not a reason to try again.
+      if [[ -n "$_sig" ]]; then
+        rm -f "$SANDBOX_NET_MARK"
+        case "$_sig" in TERM) exit 143 ;; INT) exit 130 ;; *) exit 140 ;; esac
+      fi
       [[ -e "$SANDBOX_NET_MARK" ]] || exit "$_rc"
       rm -f "$SANDBOX_NET_MARK"
       [[ $_try -lt 3 ]] || exit "$_rc"
@@ -509,7 +516,9 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
     # treats the destination as on-link, and pasta forwards the packet: shown on the cluster on
     # 21 November 2026, a datagram reached a node that was not a peer. With this route the lookup
     # succeeds and the packet stays inside.
-    "$IP_BIN" -4 route add local default dev "$SANDBOX_NET_IF" || jobnet_die "could not add the catch-all local route"
+    # `src`: without it a UDP socket connected to an outside address reports that address as its own,
+    # and software that finds "my address" that way (Ray, Dask) would advertise it.
+    "$IP_BIN" -4 route add local default dev "$SANDBOX_NET_IF" src "$SANDBOX_NET_MYIP" || jobnet_die "could not add the catch-all local route"
     # Exactly one route per other node in the main table, and that one in the local table: fail
     # closed on anything unexpected.
     _rt="$("$IP_BIN" -4 route show)"
@@ -1400,7 +1409,7 @@ write_sandbox_readme() {
       for a in $SANDBOX_NET_PEERS; do echo "  - $a"; done
       [[ -n "$SANDBOX_NET_PEERS" ]] || echo "  - (none: this job has one node)"
       echo "- This node's address is $SANDBOX_NET_MYIP, on interface $SANDBOX_NET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
-      echo "- Everything else (other hosts, the internet, package registries) fails at once with 'network unreachable'. Do not retry or look for a route."
+      echo "- Everything else (other hosts, the internet, package registries) is refused at once ('connection refused'). Do not retry or look for a route."
       echo "- Other nodes can connect to this one on ports ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be in the lowest 500 of that range; the system hands out the rest."
     elif [[ $WANT_HOSTNET -eq 1 ]]; then
       echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."

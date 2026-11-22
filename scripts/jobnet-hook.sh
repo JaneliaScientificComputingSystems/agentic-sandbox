@@ -36,7 +36,10 @@ for a in "$@"; do
 done
 # Every other address is made local to the container's namespace: a socket bound to the interface
 # skips a failed route lookup and pasta would forward its packets (see sandbox-run.sh).
-ns ip -4 route add local default dev "$ifn" || die "cannot add the catch-all local route"
+# `src`: without it a UDP socket connected to an outside address reports that address as its own.
+me="$(ns ip -4 -o addr show dev "$ifn" | awk '{split($4, a, "/"); print a[1]; exit}')"
+[[ "$me" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot read the address of $ifn"
+ns ip -4 route add local default dev "$ifn" src "$me" || die "cannot add the catch-all local route"
 # Exactly the job's nodes in the main table (no default route, no network route), and the catch-all
 # in the local table.
 routes="$(ns ip -4 route show)" || die "cannot read the routes back"

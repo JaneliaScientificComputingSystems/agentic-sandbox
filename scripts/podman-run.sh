@@ -375,8 +375,10 @@ if [[ $WANT_JOBNET -eq 1 ]]; then
   _names=() _jobaddrs=""
   if [[ -n "$PEER_LIST" ]]; then
     IFS=, read -ra _names <<< "$PEER_LIST"
-    # Inside an LSF job --peers may only narrow the job's own nodes: otherwise it would be a way
-    # to open a path to any host by naming it.
+    # Inside an LSF job --peers may only narrow the job's own nodes, so that a launcher or a
+    # typing mistake cannot open a path to another host by naming it. The list comes from
+    # LSB_MCPU_HOSTS in the environment: it guards whoever starts the wrapper against a mistake,
+    # not against themselves. The sandboxed process never starts the wrapper outside the sandbox.
     if [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
       read -ra _mc <<< "$LSB_MCPU_HOSTS"
       for ((i = 0; i < ${#_mc[@]}; i += 2)); do
@@ -1343,7 +1345,7 @@ write_sandbox_readme() {
       for a in $JOBNET_PEERS; do echo "  - $a"; done
       [[ -n "$JOBNET_PEERS" ]] || echo "  - (none: this job has one node)"
       echo "- This node's address is $JOBNET_MYIP, on interface $JOBNET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
-      echo "- Everything else (other hosts, the internet, package registries) fails at once with 'network unreachable'. Do not retry or look for a route."
+      echo "- Everything else (other hosts, the internet, package registries) is refused at once ('connection refused'). Do not retry or look for a route."
       echo "- Other nodes can connect to this one on ports $JOBNET_LO-$JOBNET_HI${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be in the lowest 500 of that range; the system hands out the rest."
     elif [[ $WANT_HOSTNET -eq 1 ]]; then
       echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
@@ -1514,13 +1516,29 @@ else
 fi
 PODMAN_PID=$!
 if [[ $JOBNET_LOCKED -eq 1 ]]; then
-  for ((_w = 0; _w < 1200; _w++)); do
-    [[ -e "$JOB_DIR/net.starting" ]] && kill -0 "$PODMAN_PID" 2>/dev/null || break
-    sleep 0.1
+  # The hook removes net.starting once the routes are narrowed, and the command starts only after
+  # the hook. A container that is running while the marker is still there means the hook did not
+  # run (a podman that ignored --hooks-dir, say): its network would be pasta's copy of the node's
+  # routes, so it is stopped at once and not left to the end of this wait.
+  _nohook=0 _w=0
+  while [[ -e "$JOB_DIR/net.starting" ]] && kill -0 "$PODMAN_PID" 2>/dev/null; do
+    if (( _w % 10 == 9 )) && [[ -n "$(podman ps -q --filter status=running 2>/dev/null)" && -e "$JOB_DIR/net.starting" ]]; then
+      _nohook=1; break
+    fi
+    # After two minutes the port block is given up to the next sandbox on this node; the wait
+    # itself goes on (a slow start, such as an image still being pulled, is not a failure).
+    (( _w == 1200 )) && exec 9>&-
+    sleep 0.1; _w=$((_w + 1))
   done
   exec 9>&-
-  if [[ -e "$JOB_DIR/net.starting" && -s "$JOB_DIR/hook.log" ]]; then
-    sed 's/^/podman-run.sh: --job-nodes: /' "$JOB_DIR/hook.log" >&2
+  if [[ -e "$JOB_DIR/net.starting" ]]; then
+    # Still there: either the hook failed (podman has stopped and the hook's log says why), or
+    # the command ran, or is running, without it. Never carry on as if the network were narrowed.
+    [[ -s "$JOB_DIR/hook.log" ]] && sed 's/^/podman-run.sh: --job-nodes: /' "$JOB_DIR/hook.log" >&2
+    echo "podman-run.sh: --job-nodes: the network of the container was not narrowed to the job's nodes (the route hook did not complete); stopping" >&2
+    podman rm -f --time 0 --all >/dev/null 2>&1 || true
+    kill "$PODMAN_PID" 2>/dev/null || true
+    exit 1
   fi
 fi
 
