@@ -48,6 +48,8 @@
 #                          (OPENCODE_CONFIG/OPENCODE_CONFIG_DIR point at it; XDG_CONFIG_HOME is
 #                          left alone, so git/gh config still resolve) plus RW binds on its data dirs
 #                          (~/.local/share/opencode, ~/.local/state/opencode, ~/.cache/opencode)
+#   --dry-run             Do every check, start nothing, and print the bwrap command, the
+#                          host-side helpers and the environment a real run would use.
 #   --no-protect          Leave the files that tools run later writable (.git/hooks,
 #                          .git/config, .mcp.json, .claude/, .vscode and the like). By default
 #                          they are read-only where they exist in a read-write directory, and
@@ -151,6 +153,7 @@ ALLOW_HOSTS=()
 PASS_ENV=()
 WANT_CSUB=0
 PROTECT=1
+DRY_RUN=0
 WANT_GPU=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
@@ -179,6 +182,7 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --allow) need_arg "$@"; ALLOW_HOSTS+=("$2"); shift 2 ;;
     --no-protect) PROTECT=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --env)
       need_arg "$@"
       # A NAME, looked up in this shell's environment -- not NAME=value.
@@ -297,6 +301,7 @@ JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDE
 # or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
 mkdir "$JOB_DIR" || { echo "sandbox-run.sh: per-job state dir $JOB_DIR already exists; remove it if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
+RECORD_START="$(date +%Y-%m-%dT%H:%M:%S%z)"; : > "$JOB_DIR/.start"   # for the per-job record
 # Removed on every exit from here on: the cfg/ copies below include ~/.claude.json (account
 # details), so no exit between here and the full cleanup() further down may leave them behind.
 # cleanup() replaces this trap once there is a proxy or broker to stop as well.
@@ -768,12 +773,64 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c '^\[allowlist_proxy\] DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -cE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $4}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "sandbox-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $NF}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
+
+# ---- The per-job record -----------------------------------------------------------------------
+# What the sandboxed command reached, kept where it cannot touch it: every host the proxy allowed
+# or refused, with the time, and the csub jobs recorded while the sandbox ran. One small file per
+# run under ~/.agentic-sandbox/records/<date>/, written at exit, and only when there is something
+# to record (a run without --allow and --csub has nothing). $HOME is not bound into the sandbox,
+# so a later run cannot rewrite an earlier record. SANDBOX_RECORD=off turns it off.
+record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started (best effort)
+  local policy="$HOME/.config/csub/broker.toml" state w prev=""
+  for w in ${CSUB_BROKER:-}; do [[ "$prev" == --policy ]] && policy="$w"; prev="$w"; done
+  state="$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$policy" 2>/dev/null | head -1)"
+  state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
+  [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
+  find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200
+}
+write_record() {  # $1 = exit status of the command
+  [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
+  local plog="" jobs="" dir file
+  [[ -n "${PROXY_DIR:-}" && -s "$PROXY_DIR/proxy.log" ]] && grep -qE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$PROXY_DIR/proxy.log" 2>/dev/null && plog="$PROXY_DIR/proxy.log"
+  [[ ${WANT_CSUB:-0} -eq 1 ]] && jobs="$(record_csub_jobs)"
+  [[ -n "$plog" || -n "$jobs" ]] || return 0
+  dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 700 "$HOME/.agentic-sandbox" "$HOME/.agentic-sandbox/records" 2>/dev/null || true
+  file="$dir/${JOB_DIR##*/}.log"
+  {
+    echo "agentic-sandbox record (sandbox-run.sh)"
+    echo "started:   ${RECORD_START:-unknown}"
+    echo "ended:     $(date +%Y-%m-%dT%H:%M:%S%z)"
+    echo "job:       ${LSB_JOBID:-none}${LSB_JOBINDEX:+ index $LSB_JOBINDEX} on $(hostname -s) as $USER"
+    echo "directory: $PWD"
+    echo "command:   $(printf '%q ' "${CMD[@]}" | cut -c1-600)"
+    echo "exit:      $1"
+    echo "allowed hosts: ${ALLOW_HOSTS[*]:-none}"
+    echo
+    echo "## Network (every request the proxy saw)"
+    if [[ -n "$plog" ]]; then
+      grep -E '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog" | sed 's/^\[allowlist_proxy\] //; s/ (peer=[^)]*)$//' | head -5000
+      [[ "$(grep -cE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog")" -le 5000 ]] || echo "(more than 5000 lines; the rest is not kept)"
+    else
+      echo "none"
+    fi
+    if [[ ${WANT_CSUB:-0} -eq 1 ]]; then
+      echo
+      echo "## csub jobs recorded while this sandbox ran"
+      echo "(taken from csub's own state directory; refused requests are not recorded there, and"
+      echo " other sandboxes of yours running at the same time appear here too)"
+      if [[ -n "$jobs" ]]; then echo "$jobs"; else echo "none"; fi
+    fi
+  } > "$file" 2>/dev/null || true
+  return 0
+}
 # The proxy and the broker run outside the sandbox and must be stopped here. A job that ends
 # normally does not have its stragglers swept by LSF the way a `bkill`ed one does, so anything
 # left running would stay on the node.
@@ -790,6 +847,7 @@ cleanup() {
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ $rc -ne 0 ]] && summarize_proxy_denials
   declare -F report_new_config >/dev/null && report_new_config
+  write_record "$rc"
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -944,12 +1002,14 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "sandbox-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
-  CSUB_PID=$!
-  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
-  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  if [[ $DRY_RUN -eq 0 ]]; then
+    (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
+    CSUB_PID=$!
+    wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+    # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+    echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  fi
   # PATH: bwrap takes the LAST --setenv, so this one must carry the --claude/--opencode CLI
   # dirs ($PATH_PREPEND, set above) as well as the csub shim, or --csub would drop them.
   BWRAP_ARGS+=(
@@ -1076,6 +1136,26 @@ write_sandbox_readme
 # LSF job script usually has a few open beyond 0-2 (a redirected log, a lock file, bash's own
 # fd for a sourced script). Close them in a subshell right before exec'ing bwrap: 0-2 stay, and
 # the wrapper's own descriptors (the script on 255, say) are untouched in the parent.
+dry_run_print() {  # "$@" = everything after `bwrap`
+  local i n
+  echo "sandbox-run.sh: dry run. Nothing was started. A real run would do this:"
+  if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+    echo; echo "On the host, the allowlist proxy:"
+    printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo
+  fi
+  if [[ $WANT_CSUB -eq 1 ]]; then
+    echo; echo "On the host, the csub broker:"
+    echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
+  fi
+  echo; echo "The sandbox:"
+  printf '  bwrap'; printf ' %q' "$@"; echo
+  echo; echo "Environment of the command (handed to bwrap as --args 9; values passed with --env are not shown):"
+  for ((i = 0; i + 2 < ${#ENV_ARGS[@]}; i += 3)); do
+    n="${ENV_ARGS[i + 1]}"
+    if [[ " ${PASS_ENV[*]:-} " == *" $n "* ]]; then echo "  $n=<set, not shown>"; else echo "  $n=${ENV_ARGS[i + 2]}"; fi
+  done
+  echo; echo "Per-job state would be in $JOB_DIR (removed at exit)."
+}
 run_bwrap() {
   local fd p
   # Each path was made physical and checked when the arguments were read. Seconds have passed
@@ -1118,6 +1198,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
   # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
   # standard library only, and it runs on the host from a directory the agent may be able to write.
+  if [[ $DRY_RUN -eq 0 ]]; then
   python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
@@ -1125,6 +1206,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # proxy died (bad allowlist, python missing). A fixed `sleep 1` raced a slow interpreter
   # start on a busy node, and bwrap then failed with "Can't find source path".
   wait_for_proxy_socket "$PROXY_SOCK" "$PROXY_PID" || exit 1
+  fi
   BWRAP_ARGS+=(
     --ro-bind "$SCRIPT_DIR/relay.py" /opt/sandbox-relay.py
     --ro-bind "$PROXY_SOCK" /run/sandbox-proxy.sock
@@ -1142,11 +1224,13 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   # replace this script's own process image, which would skip the `trap cleanup EXIT` and leak
   # the host-side allowlist_proxy.py process. The subshell is a normal foreground child, so the
   # trap fires once it returns, and its exit code is propagated explicitly.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}"; exit 0; fi
   (run_bwrap "${BWRAP_ARGS[@]}" -- "${INNER_CMD[@]}")
   exit $?
 else
   # Same shape: the EXIT trap must run to delete the per-job config copies and the empty mask
   # file. Exit code is propagated.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "${BWRAP_ARGS[@]}" -- "${CMD[@]}"; exit 0; fi
   (run_bwrap "${BWRAP_ARGS[@]}" -- "${CMD[@]}")
   exit $?
 fi

@@ -68,6 +68,8 @@
 #                    Fails with "potentially insufficient UIDs or GIDs available in user
 #                    namespace" if your range isn't wide enough -- ask HPC for a wider one
 #                    (width > your real gid, not just "a range") if you hit this.
+#   --dry-run       Do every check, start nothing (no image pull, no container), and print the
+#                    podman command and the host-side helpers a real run would use.
 #   --no-protect    Leave the files that tools run later writable (.git/hooks, .git/config,
 #                    .mcp.json, .claude/, .vscode and the like). By default they are mounted
 #                    read-only where they exist under a --rw path, and ones the command
@@ -114,6 +116,7 @@ GPU=0
 SHM_SIZE=""
 WANT_CSUB=0
 PROTECT=1
+DRY_RUN=0
 PROTECT_VOLUMES=()
 KEEP_ID=0
 WANT_CLAUDE=0
@@ -187,6 +190,7 @@ while [[ $# -gt 0 ]]; do
     --keep-id) KEEP_ID=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; SCRATCH_ROOT="$(realpath -e -- "/scratch/$USER/work")"; VOLUMES+=("-v" "$SCRATCH_ROOT:$SCRATCH_ROOT:rw"); shift ;;
     --no-protect) PROTECT=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --claude) WANT_CLAUDE=1; shift ;;
     --opencode) WANT_OPENCODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -307,6 +311,7 @@ JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDE
 # or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
 mkdir "$JOB_DIR" || { echo "podman-run.sh: per-job state dir $JOB_DIR already exists; remove it (podman unshare rm -rf) if no job is using it" >&2; exit 1; }
 chmod 700 "$JOB_DIR"
+RECORD_START="$(date +%Y-%m-%dT%H:%M:%S%z)"; : > "$JOB_DIR/.start"   # for the per-job record
 JOB_STORAGE_DIR="$JOB_DIR/podman"
 # Removed on every exit from here on. The cfg/ copies below include ~/.claude.json (account
 # details), so an exit between here and the full cleanup() further down (a failed image pull,
@@ -517,7 +522,7 @@ REPAIR
 # (before CONTAINERS_STORAGE_CONF is exported) so the pull warms the node-local cache that
 # every sibling job reads through additionalimagestores. Skipped for a purely local image
 # (localhost/...), which has no registry to check against.
-if [[ "$IMAGE" != localhost/* ]]; then
+if [[ "$IMAGE" != localhost/* && $DRY_RUN -eq 0 ]]; then
   # stdout to stderr: `podman pull` prints the image ID on stdout, which would otherwise be the
   # first line of the sandboxed command's output.
   podman --events-backend=none pull "$IMAGE" >&2 || true
@@ -654,6 +659,22 @@ fi
 # Each --ro/--rw path was made physical and checked when the arguments were read. Minutes can pass
 # before the container starts (the image pull); recheck_paths looks once more, so that a
 # directory swapped for a symlink in between is not mounted under the name that was checked.
+dry_run_print() {  # $1 = a note about how the command is wrapped, or empty
+  echo "podman-run.sh: dry run. Nothing was started and no image was pulled. A real run would do this:"
+  if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
+    echo; echo "On the host, the allowlist proxy:"
+    printf '  python3 -I %q %q' "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK"; printf ' %q' "${ALLOW_HOSTS[@]}"; echo
+  fi
+  if [[ $WANT_CSUB -eq 1 ]]; then
+    echo; echo "On the host, the csub broker:"
+    echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
+  fi
+  echo; echo "The container:"
+  printf '  podman --events-backend=none run'; printf ' %q' "${PODMAN_ARGS[@]}" "$IMAGE"
+  [[ -n "$1" ]] && printf ' %s' "$1"
+  printf ' %q' "${CMD[@]}"; echo
+  echo; echo "Per-job state would be in $JOB_DIR (removed at exit)."
+}
 recheck_paths() {
   local p
   for p in "${RO_PATHS[@]:-}" "${RW_PATHS[@]:-}" "$SCRATCH_ROOT"; do
@@ -812,12 +833,64 @@ wait_for_proxy_socket() { wait_for_socket "allowlist proxy" "$1" "$2" "$PROXY_DI
 summarize_proxy_denials() {
   local log="$PROXY_DIR/proxy.log" n
   [[ -n "$PROXY_DIR" && -s "$log" ]] || return 0
-  n=$(grep -c '^\[allowlist_proxy\] DENY ' "$log" 2>/dev/null || true)
+  n=$(grep -cE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY ' "$log" 2>/dev/null || true)
   [[ "${n:-0}" -gt 0 ]] || return 0
-  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $4}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
+  echo "podman-run.sh: allowlist proxy denied $n request(s): $(grep -oE '^\[allowlist_proxy\] ([0-9T:-]+ )?DENY (CONNECT|HTTP) [^ ]+' "$log" | awk '{print $NF}' | sed 's/:.*//' | sort | uniq -c | sort -rn | head -8 | awk '{printf "%s%s (%s)", (NR>1?", ":""), $2, $1}')" >&2
   true
 }
 CSUB_PID=""
+
+# ---- The per-job record -----------------------------------------------------------------------
+# What the sandboxed command reached, kept where it cannot touch it: every host the proxy allowed
+# or refused, with the time, and the csub jobs recorded while the sandbox ran. One small file per
+# run under ~/.agentic-sandbox/records/<date>/, written at exit, and only when there is something
+# to record (a run without --allow and --csub has nothing). $HOME is not bound into the sandbox,
+# so a later run cannot rewrite an earlier record. SANDBOX_RECORD=off turns it off.
+record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started (best effort)
+  local policy="$HOME/.config/csub/broker.toml" state w prev=""
+  for w in ${CSUB_BROKER:-}; do [[ "$prev" == --policy ]] && policy="$w"; prev="$w"; done
+  state="$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$policy" 2>/dev/null | head -1)"
+  state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
+  [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
+  find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200
+}
+write_record() {  # $1 = exit status of the command
+  [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
+  local plog="" jobs="" dir file
+  [[ -n "${PROXY_DIR:-}" && -s "$PROXY_DIR/proxy.log" ]] && grep -qE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$PROXY_DIR/proxy.log" 2>/dev/null && plog="$PROXY_DIR/proxy.log"
+  [[ ${WANT_CSUB:-0} -eq 1 ]] && jobs="$(record_csub_jobs)"
+  [[ -n "$plog" || -n "$jobs" ]] || return 0
+  dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 700 "$HOME/.agentic-sandbox" "$HOME/.agentic-sandbox/records" 2>/dev/null || true
+  file="$dir/${JOB_DIR##*/}.log"
+  {
+    echo "agentic-sandbox record (podman-run.sh)"
+    echo "started:   ${RECORD_START:-unknown}"
+    echo "ended:     $(date +%Y-%m-%dT%H:%M:%S%z)"
+    echo "job:       ${LSB_JOBID:-none}${LSB_JOBINDEX:+ index $LSB_JOBINDEX} on $(hostname -s) as $USER"
+    echo "directory: $PWD"
+    echo "command:   $(printf '%q ' "${CMD[@]}" | cut -c1-600)"
+    echo "exit:      $1"
+    echo "allowed hosts: ${ALLOW_HOSTS[*]:-none}"
+    echo
+    echo "## Network (every request the proxy saw)"
+    if [[ -n "$plog" ]]; then
+      grep -E '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog" | sed 's/^\[allowlist_proxy\] //; s/ (peer=[^)]*)$//' | head -5000
+      [[ "$(grep -cE '^\[allowlist_proxy\] [0-9T:-]+ (ALLOW|DENY|BAD) ' "$plog")" -le 5000 ]] || echo "(more than 5000 lines; the rest is not kept)"
+    else
+      echo "none"
+    fi
+    if [[ ${WANT_CSUB:-0} -eq 1 ]]; then
+      echo
+      echo "## csub jobs recorded while this sandbox ran"
+      echo "(taken from csub's own state directory; refused requests are not recorded there, and"
+      echo " other sandboxes of yours running at the same time appear here too)"
+      if [[ -n "$jobs" ]]; then echo "$jobs"; else echo "none"; fi
+    fi
+  } > "$file" 2>/dev/null || true
+  return 0
+}
 cleanup() {
   local rc=$?   # the script's exit status on entry; see the denied-host summary below
   # bkill sends INT, then TERM, then KILL. The first one brings us here; without this the
@@ -835,6 +908,7 @@ cleanup() {
   # Only when the sandboxed command did not succeed (same reasoning as in sandbox-run.sh).
   [[ $rc -ne 0 ]] && summarize_proxy_denials
   declare -F report_new_config >/dev/null && report_new_config
+  write_record "$rc"
   # Wait for the broker to actually exit (csub's serve loop polls its stop flag every 0.5s), so
   # the wrapper never returns with a broker still alive -- an LSF job would otherwise linger,
   # and anything checking for leftovers right after us would see one.
@@ -1029,12 +1103,14 @@ if [[ $WANT_CSUB -eq 1 ]]; then
   else
     echo "podman-run.sh: --csub: CSUB_ENVELOPE=off -- requests are bounded by the policy only" >&2
   fi
-  (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
-  CSUB_PID=$!
-  wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
-  # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
   CSUB_PROBE_JSON="$CSUB_DIR/probe.json"
-  echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  if [[ $DRY_RUN -eq 0 ]]; then
+    (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"} --serve "$CSUB_SOCK") > "$CSUB_DIR/broker.log" 2>&1 &
+    CSUB_PID=$!
+    wait_for_socket "csub-broker" "$CSUB_SOCK" "$CSUB_PID" "$CSUB_DIR/broker.log" || exit 1
+    # One probe for the in-sandbox README's policy summary (same request the agent's `csub probe` makes).
+    echo '{"protocol":1,"op":"probe"}' | (cd "$CSUB_BROKER_CWD" && exec $CSUB_BROKER ${CSUB_ENV_ARGS[@]+"${CSUB_ENV_ARGS[@]}"}) > "$CSUB_PROBE_JSON" 2>/dev/null || true
+  fi
   # Only the csub package (and tomli, which it needs on a python without tomllib, i.e. the
   # image's 3.10) go into the container, under a directory of their own -- not the whole host
   # venv site-packages: that put a python-3.9 venv's pip, setuptools and friends ahead of the
@@ -1167,16 +1243,19 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
   PROXY_SOCK="$PROXY_DIR/proxy.sock"
   # -I: no working directory, no PYTHONPATH, no user site on the module path. The proxy uses the
   # standard library only, and it runs on the host from a directory the agent may be able to write.
+  if [[ $DRY_RUN -eq 0 ]]; then
   python3 -I "$SCRIPT_DIR/allowlist_proxy.py" "$PROXY_SOCK" "${ALLOW_HOSTS[@]}" \
     > "$PROXY_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   # Bounded, fail-closed wait, as in sandbox-run.sh (a fixed sleep raced the interpreter start).
   wait_for_proxy_socket "$PROXY_SOCK" "$PROXY_PID" || exit 1
+  fi
   PODMAN_ARGS+=(
     -v "$SCRIPT_DIR/relay.py:/opt/relay.py:ro"
     -v "$PROXY_SOCK:/run/proxy.sock:ro"
   )
   # The relay is waited for (up to 5s of connect attempts via bash's /dev/tcp), not slept on.
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print "(a small shell that starts the relay, sets the proxy variables and runs:)"; exit 0; fi
   recheck_paths
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" /bin/bash -c '
     python3 /opt/relay.py 127.0.0.1 '"$RELAY_PORT"' /run/proxy.sock &
@@ -1187,6 +1266,7 @@ if [[ ${#ALLOW_HOSTS[@]} -gt 0 ]]; then
     exec "$@"
   ' bash "${CMD[@]}" <&3 &
 else
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_print ""; exit 0; fi
   recheck_paths
   podman --events-backend=none run "${PODMAN_ARGS[@]}" "$IMAGE" "${CMD[@]}" <&3 &
 fi

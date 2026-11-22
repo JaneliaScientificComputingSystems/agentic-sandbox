@@ -34,6 +34,10 @@ trap cleanup_tests EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# The per-job record goes to ~/.agentic-sandbox/records. Off for the suite, so that a run does not
+# leave a file there for every --allow test; the section that tests the record turns it on.
+export SANDBOX_RECORD=off
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -630,7 +634,30 @@ s_31() {
   check "a --ro of your own beside the checkout stays read-only under the pin" "$OUT" "refdata-read-only"
 }
 
-ALL_SECTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+s_32() {
+  echo "=== 32. --dry-run starts nothing; the per-job record ==="
+  local OUT RD before after new
+  OUT=$(SANDBOX_TEST_WANTED=dryrun-secret-$$ "$SANDBOX_RUN" --dry-run --allow example.com --env SANDBOX_TEST_WANTED -- touch "$TEST_CWD/dry-run-ran" 2>&1)
+  check "--dry-run prints the bwrap command and the proxy, hides the --env value, and runs nothing" \
+    "$(echo "$OUT" | grep -c '^  bwrap .*--unshare-net'),$(echo "$OUT" | grep -c 'allowlist_proxy.py'),$(echo "$OUT" | grep -c 'SANDBOX_TEST_WANTED=<set, not shown>'),$(echo "$OUT" | grep -c "dryrun-secret-$$"),$([[ -e "$TEST_CWD/dry-run-ran" ]] && echo RAN || echo not-run)" "1,1,1,0,not-run"
+  check "--dry-run left no proxy and no per-job state" "$(proxies),$(state_dirs)" "$BASE_PROXIES,$BASE_STATE"
+  RD="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  before=$(ls "$RD" 2>/dev/null | sort)
+  SANDBOX_RECORD=on "$SANDBOX_RUN" -- true >/dev/null 2>&1
+  check "a run without --allow or --csub writes no record" "$(ls "$RD" 2>/dev/null | sort)" "$before"
+  if have_net; then
+    SANDBOX_RECORD=on "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s -o /dev/null -m 15 https://example.com/; curl -s -o /dev/null -m 8 https://denied.invalid/; exit 0' >/dev/null 2>&1
+    after=$(ls "$RD" 2>/dev/null | sort)
+    new=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
+    check "a run with --allow writes one record, outside the sandbox, with what was allowed and refused" \
+      "$(comm -13 <(echo "$before") <(echo "$after") | grep -c .),$(grep -cE '^[0-9T:-]+ ALLOW CONNECT example.com:443$' "$RD/$new" 2>/dev/null),$(grep -cE '^[0-9T:-]+ DENY CONNECT denied.invalid:443$' "$RD/$new" 2>/dev/null),$(grep -c '^exit:      0$' "$RD/$new" 2>/dev/null)" "1,1,1,1"
+    [[ -n "$new" ]] && rm -f "$RD/$new"
+  else
+    skip "the record of allowed and refused hosts needs the network"
+  fi
+}
+
+ALL_SECTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-bwrap.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

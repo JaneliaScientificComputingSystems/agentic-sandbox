@@ -203,6 +203,15 @@ repository is named once, as `.git`), and it is protected from the next start on
 top level of each read-write directory is covered, like the credential masks. `--no-protect` turns
 all of this off.
 
+**See what a run would do, and what it did.** `--dry-run` goes through every check and prints the
+`bwrap` or `podman` command, the proxy and broker it would start, and (for bwrap) the environment the
+command would get, without starting anything; values passed with `--env` are not shown. After a real
+run that used `--allow` or `--csub`, a record is in `~/.agentic-sandbox/records/<date>/<job>.log`:
+the command, its exit status, every host the proxy allowed or refused with the time, and the csub
+jobs recorded while the sandbox ran. `$HOME` is not bound into the sandbox, so the sandboxed process
+cannot change a record. `SANDBOX_RECORD=off` in the environment turns it off, and nothing removes
+old records.
+
 **Harness config is copied, not bound.** `--claude` gives the sandbox a per-job copy of
 `~/.claude.json`, `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with `CLAUDE_CONFIG_DIR`
 pointing at it; only `~/.claude/.credentials.json` is bound through, so logins and token refreshes
@@ -485,6 +494,7 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --env NAME      (sandbox-run.sh) copy host variable NAME into the sandbox (repeatable)
   --csub          Start a csub broker outside the sandbox and give the agent `csub` inside
   --scratch       Shorthand for --rw /scratch/$USER/work (created if missing)
+  --dry-run       Do every check, start nothing, and print the command a real run would use
   --no-protect    Leave .git/hooks, .git/config, .mcp.json, .claude/, .vscode and the like writable
                   (read-only by default where they exist in a read-write directory)
   --claude        Per-job copy of Claude Code's config, credentials file bound through, CLI on PATH

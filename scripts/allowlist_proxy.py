@@ -33,6 +33,7 @@ import ipaddress
 import re
 import socket
 import sys
+import time
 from typing import Optional, Tuple
 
 
@@ -60,7 +61,8 @@ def log(msg: str):
             print(f"[allowlist_proxy] log limit of {MAX_LOG_LINES} lines reached ({kind}); further ones are not logged",
                   file=sys.stderr, flush=True)
         return
-    print(f"[allowlist_proxy] {msg[:MAX_LOG_LINE]}", file=sys.stderr)
+    # The time first: the wrappers copy these lines into the per-job record.
+    print(f"[allowlist_proxy] {time.strftime('%Y-%m-%dT%H:%M:%S')} {msg[:MAX_LOG_LINE]}", file=sys.stderr)
 
 
 def short(value) -> str:

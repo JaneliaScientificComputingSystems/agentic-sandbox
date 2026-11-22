@@ -101,6 +101,13 @@ behind each change.
   ran at every start, and it stops the containers of that store.
 - **`examples/unattended-tuning`:** the evaluator passes the agent's `train.py` the images to
   predict without the labels.
+- **`--dry-run`**, in both wrappers: every check runs, nothing is started, and the `bwrap` or `podman`
+  command, the proxy, the broker and the command's environment are printed. Values passed with
+  `--env` are not shown.
+- **A record of each run** that used `--allow` or `--csub` is written to
+  `~/.agentic-sandbox/records/<date>/`, outside the sandbox: the command, its exit status, every
+  host the proxy allowed or refused with the time, and the csub jobs recorded meanwhile. The proxy's
+  log lines now carry the time. `SANDBOX_RECORD=off` turns the record off.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20

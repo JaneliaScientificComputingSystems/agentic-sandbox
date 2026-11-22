@@ -38,6 +38,10 @@ plant_modules() {  # $1 = directory
   done
 }
 
+# The per-job record goes to ~/.agentic-sandbox/records. Off for the suite, so that a run does not
+# leave a file there for every --allow test; the section that tests the record turns it on.
+export SANDBOX_RECORD=off
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -485,7 +489,24 @@ s_22() {
   check "the refusals left no per-job state" "$(state_dirs)" "$BASE_STATE"
 }
 
-ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22)
+s_23() {
+  echo "=== 23. --dry-run starts nothing; the per-job record ==="
+  local OUT RD before after new
+  OUT=$("$PODMAN_RUN" --dry-run --allow example.com --rw "$TR" -- touch "$TR/dry-run-ran" 2>&1)
+  check "--dry-run prints the podman command and the proxy, and runs nothing" \
+    "$(echo "$OUT" | grep -c '^  podman --events-backend=none run .*--network=none'),$(echo "$OUT" | grep -c 'allowlist_proxy.py'),$([[ -e "$TR/dry-run-ran" ]] && echo RAN || echo not-run)" "1,1,not-run"
+  check "--dry-run left no container and no per-job state" "$(conmons),$(state_dirs)" "0,$BASE_STATE"
+  RD="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
+  before=$(ls "$RD" 2>/dev/null | sort)
+  SANDBOX_RECORD=on "$PODMAN_RUN" --allow example.com -- bash -c 'curl -s -o /dev/null -m 15 https://example.com/; curl -s -o /dev/null -m 8 https://denied.invalid/; exit 0' >/dev/null 2>&1
+  after=$(ls "$RD" 2>/dev/null | sort)
+  new=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
+  check "a run with --allow writes one record, outside the container, with what was allowed and refused" \
+    "$(comm -13 <(echo "$before") <(echo "$after") | grep -c .),$(grep -cE '^[0-9T:-]+ ALLOW CONNECT example.com:443$' "$RD/$new" 2>/dev/null),$(grep -cE '^[0-9T:-]+ DENY CONNECT denied.invalid:443$' "$RD/$new" 2>/dev/null)" "1,1,1"
+  [[ -n "$new" ]] && rm -f "$RD/$new"
+}
+
+ALL_SECTIONS=(1 2 2b 2c 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23)
 if [[ -n "${ONLY:-}" ]]; then IFS=',' read -ra RUN <<< "$ONLY"; else RUN=("${ALL_SECTIONS[@]}"); fi
 for id in "${RUN[@]}"; do
   declare -F "s_$id" >/dev/null || { echo "test-podman.sh: no section '$id' (sections: ${ALL_SECTIONS[*]})" >&2; exit 2; }

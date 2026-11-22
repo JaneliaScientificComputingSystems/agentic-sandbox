@@ -24,6 +24,7 @@ PODMAN=0; [[ "$WRAPPER" == podman-run.sh ]] && PODMAN=1
 [[ -x "$W" ]] || { echo "no such wrapper: $W"; exit 2; }
 STATE="/scratch/$USER/.agentic-sandbox"
 HOLD=40   # seconds each element stays inside, so that the elements overlap
+export SANDBOX_RECORD=off   # no per-job record in ~/.agentic-sandbox/records for a test run
 
 if [[ "${1:-}" != check ]]; then
   # ---- one element
