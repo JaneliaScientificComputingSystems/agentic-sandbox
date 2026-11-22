@@ -208,8 +208,9 @@ command would get, without starting the sandbox, the proxy or the broker; values
 are not shown. After a real run in which the proxy saw a request or csub recorded a job, a record is in `~/.agentic-sandbox/records/<date>/<job>.log`:
 the command, its exit status, every host the proxy allowed or refused with the time, and the csub
 jobs recorded while the sandbox ran. `$HOME` is not bound into the sandbox unless you bind it yourself,
-so the sandboxed process cannot change a record. `SANDBOX_RECORD=off` in the environment turns it off, and nothing removes
-old records.
+so the sandboxed process cannot change a record. `SANDBOX_RECORD=off` in the environment turns it off. Records
+older than 30 days are removed when a new one is written; `SANDBOX_RECORD_DAYS` changes the number, and
+`0` keeps them all.
 
 **Harness config is copied, not bound.** `--claude` gives the sandbox a per-job copy of
 `~/.claude.json`, `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, with `CLAUDE_CONFIG_DIR`

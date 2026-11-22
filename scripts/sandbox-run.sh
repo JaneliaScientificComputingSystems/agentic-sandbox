@@ -808,6 +808,7 @@ CSUB_PID=""
 # run under ~/.agentic-sandbox/records/<date>/, written at exit, and only when there is something
 # to record (a run without --allow and --csub has nothing). $HOME is not bound into the sandbox,
 # so a later run cannot rewrite an earlier record. SANDBOX_RECORD=off turns it off.
+# Records older than 30 days are removed when a new one is written (SANDBOX_RECORD_DAYS; 0 keeps all).
 record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started (best effort)
   local policy="$HOME/.config/csub/broker.toml" state w prev=""
   for w in ${CSUB_BROKER:-}; do [[ "$prev" == --policy ]] && policy="$w"; prev="$w"; done
@@ -815,6 +816,18 @@ record_csub_jobs() {  # ids of the csub jobs recorded since this sandbox started
   state="${state:-$HOME/.csub}"; state="${state/#\~/$HOME}"
   [[ -d "$state/jobs" && -e "$JOB_DIR/.start" ]] || return 0
   { find "$state/jobs" -mindepth 1 -maxdepth 1 -newer "$JOB_DIR/.start" -printf '%f\n' 2>/dev/null | grep -E '^[0-9]' | sort -n | head -200; } || true   # no match is not a failure
+}
+prune_records() {  # day directories older than SANDBOX_RECORD_DAYS (default 30) go when a record is written
+  local keep="${SANDBOX_RECORD_DAYS:-30}" root="$HOME/.agentic-sandbox/records" cutoff d n
+  [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]] || return 0   # 0: keep everything
+  cutoff="$(date -d "$keep days ago" +%Y-%m-%d 2>/dev/null)" || return 0
+  [[ "$cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 0
+  for d in "$root"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+    n="${d##*/}"
+    # Only what this wrapper made: a real directory named for a day, and older than the cutoff.
+    if [[ -d "$d" && ! -L "$d" && "$n" < "$cutoff" ]]; then rm -rf -- "$d" 2>/dev/null; fi
+  done
+  return 0
 }
 write_record() {  # $1 = exit status of the command
   [[ "${SANDBOX_RECORD:-on}" != off && ${DRY_RUN:-0} -eq 0 && -n "${JOB_DIR:-}" ]] || return 0
@@ -825,6 +838,7 @@ write_record() {  # $1 = exit status of the command
   dir="$HOME/.agentic-sandbox/records/$(date +%Y-%m-%d)"
   mkdir -p "$dir" 2>/dev/null || return 0
   chmod 700 "$HOME/.agentic-sandbox" "$HOME/.agentic-sandbox/records" 2>/dev/null || true
+  prune_records
   file="$dir/${JOB_DIR##*/}.log"
   {
     echo "agentic-sandbox record (sandbox-run.sh)"

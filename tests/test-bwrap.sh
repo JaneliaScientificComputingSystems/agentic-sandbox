@@ -672,6 +672,17 @@ s_32() {
     check "a run with --allow writes one record, outside the sandbox, with what was allowed and refused" \
       "$(comm -13 <(echo "$before") <(echo "$after") | grep -c .),$(grep -cE '^[0-9T:-]+ ALLOW CONNECT example.com:443$' "$RD/$new" 2>/dev/null),$(grep -cE '^[0-9T:-]+ DENY CONNECT denied.invalid:443$' "$RD/$new" 2>/dev/null),$(grep -c '^exit:      0$' "$RD/$new" 2>/dev/null)" "1,1,1,1"
     [[ -n "$new" ]] && rm -f "$RD/$new"
+    TEST_MARK="$RD/.mark-$$"; : > "$TEST_MARK"
+    # Old day directories go when a record is written; anything else in records/ stays.
+    OLDR="$HOME/.agentic-sandbox/records/2001-01-01"; KEEPR="$HOME/.agentic-sandbox/records/not-a-day-$$"
+    mkdir -p "$OLDR" "$KEEPR" && : > "$OLDR/x.log"
+    SANDBOX_RECORD=on "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s -o /dev/null -m 15 https://example.com/; exit 0' >/dev/null 2>&1
+    check "writing a record removes day directories older than 30 days and nothing else" "$([[ -e "$OLDR" ]] && echo old-kept || echo old-gone),$([[ -d "$KEEPR" ]] && echo other-kept || echo other-gone)" "old-gone,other-kept"
+    mkdir -p "$OLDR" && : > "$OLDR/x.log"
+    SANDBOX_RECORD=on SANDBOX_RECORD_DAYS=0 "$SANDBOX_RUN" --allow example.com -- bash -c 'curl -s -o /dev/null -m 15 https://example.com/; exit 0' >/dev/null 2>&1
+    check "SANDBOX_RECORD_DAYS=0 keeps them" "$([[ -e "$OLDR" ]] && echo old-kept || echo old-gone)" "old-kept"
+    rm -rf "$OLDR" "$KEEPR"; find "$RD" -newer "$TEST_MARK" -name '*.log' -delete 2>/dev/null
+    rm -f "$TEST_MARK"
   else
     skip "the record of allowed and refused hosts needs the network"
   fi
