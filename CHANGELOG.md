@@ -123,6 +123,10 @@ behind each change.
 - **`podman-run.sh`** asks for a terminal only when both input and output are one. With the output
   sent to a file or a pipe from an interactive shell, it held carriage returns and error messages.
 - **`--claude`** starts when `~/.claude/CLAUDE.md` is read-only.
+- **`ssh-entry.sh --gpus N`** gives every command of a key line N GPUs. `--gpu` after the `--`
+  alone could not work: the job was submitted without a GPU request, which the GPU queues reject.
+- **Laptop instruction files:** the `scp` rule says the agent need not ask the user first, and that
+  the laptop may still ask for approval of the command.
 - **CI** runs `shellcheck` at warning level on every shell script.
 
 ## 2026-11-20
