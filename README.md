@@ -240,13 +240,35 @@ A sandboxed agent must not hold `bsub`: anything it submitted would run on the c
 sandbox. `--csub` closes that gap with [csub](https://github.com/saalfeldlab/csub), Stephan
 Saalfeld's policy-checked job broker, over the same socket bridge `--allow` uses:
 
-```
-compute node (your interactive job)                                   another compute node
-──────────────────────────────────────────────────────────────────     ───────────────────────────
-sandbox-run.sh / podman-run.sh --csub …                                 csub's job wrapper
-  ├─ csub-broker --serve <state dir>/csub/csub.sock   (OUTSIDE)  ──bsub──▶ ├─ csub-broker --serve …
-  └─ sandbox: agent runs `csub submit …` ─unix socket─▶ broker            └─ podman-run.sh … -- your command
-                                                                              └─ `csub submit …` again, if it wants
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 460, "htmlLabels": true, "padding": 12, "nodeSpacing": 40, "rankSpacing": 50}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart TB
+    you["You: ssh to a login node, then<br/>bsub -Is an interactive job"]
+
+    subgraph node["Compute node: your interactive job"]
+        wrapper["sandbox-run.sh (Bubblewrap) or podman-run.sh (container)<br/>--csub --allow HOST -- agent"]
+        subgraph sb["Sandbox"]
+            agent["opencode / Claude Code<br/>sees the project directory read-write and nothing else:<br/>no $HOME, no ~/.ssh, no bsub, no other network<br/>git hooks and tool settings in the project are read-only<br/>/run/sandbox/README.md tells it the rules"]
+        end
+        proxy["allowlist_proxy.py<br/>started by the wrapper, outside the sandbox"]
+        broker["csub-broker<br/>started by the wrapper, outside the sandbox, as you<br/>applies your csub policy"]
+        wrapper --> sb
+        agent -->|"https through<br/>a unix socket"| proxy
+        agent -->|"csub submit through<br/>/run/csub.sock"| broker
+    end
+
+    hosts["Only the hosts you listed with --allow<br/>e.g. litellm.int.janelia.org, api.anthropic.com, pypi.org"]
+
+    subgraph child["Another compute node: a job the agent submitted"]
+        cw["csub job wrapper"]
+        cs["sandbox-run.sh or podman-run.sh<br/>same project directory, same rules"]
+        cmd["your command, e.g. python train.py<br/>it can csub submit again"]
+        cw --> cs --> cmd
+    end
+
+    you --> wrapper
+    proxy -->|"CONNECT / HTTP"| hosts
+    broker -->|"bsub, within the policy's<br/>slots, GPUs and walltime"| cw
 ```
 
 - The wrapper starts `csub-broker --serve` outside the sandbox, as you, and stops it at exit; only its
@@ -304,11 +326,45 @@ script, so the key can do nothing else:
 command="env PATH=$HOME/.venvs/csub/bin:$PATH $HOME/agentic-sandbox/scripts/ssh-entry.sh --project /groups/lab/project --queue interactive --walltime 60 -- --csub",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,expiry-time="20271231" ssh-ed25519 AAAA... agent
 ```
 
-```
-laptop                               login node                       compute node
-───────────────────────────────      ─────────────────────────        ─────────────────────────────
-agent: ssh janelia-agent '<cmd>' ──▶ sshd runs ssh-entry.sh  ──bsub -I──▶ sandbox-run.sh … -- bash -c '<cmd>'
-                                     (the script and bsub only)           in the project directory
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 460, "htmlLabels": true, "padding": 12, "nodeSpacing": 40, "rankSpacing": 50}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart TB
+    subgraph mac["Your Mac"]
+        harness["Codex or Claude Code reads AGENTS.md / CLAUDE.md in the working directory<br/>and runs each test or script as<br/>ssh janelia-agent '&lt;command&gt;'<br/>with the agent's own key, never yours (IdentitiesOnly, no agent forwarding)"]
+    end
+
+    subgraph login["Login node"]
+        sshd["sshd: that key's authorized_keys line can run only<br/>ssh-entry.sh --project DIR --queue Q --walltime M -- --csub --allow HOST<br/>which submits one job per command: bsub -I, job name agent-ssh<br/>nothing else runs on the login node"]
+    end
+
+    subgraph node["Compute node: one LSF job per command"]
+        wrapper["sandbox-run.sh (Bubblewrap) in the project directory<br/>podman-run.sh (container) instead with --podman<br/>the options after -- in the key line are the sandbox every command gets"]
+        subgraph sb["Sandbox"]
+            cmd["bash -c '&lt;command&gt;'<br/>sees the project directory read-write and nothing else:<br/>no $HOME, no ~/.ssh, no bsub, no other network<br/>git hooks and tool settings in the project are read-only<br/>/run/sandbox/README.md tells it the rules"]
+        end
+        proxy["allowlist_proxy.py<br/>started by the wrapper, outside the sandbox"]
+        broker["csub-broker<br/>started by the wrapper, outside the sandbox, as you<br/>applies your csub policy"]
+        wrapper --> sb
+        cmd -->|"https through<br/>a unix socket"| proxy
+        cmd -->|"csub submit through<br/>/run/csub.sock"| broker
+    end
+
+    hosts["Only the hosts you listed with --allow<br/>e.g. litellm.int.janelia.org, api.anthropic.com, pypi.org"]
+
+    subgraph child["Another compute node: a job the agent submitted"]
+        cw["csub job wrapper"]
+        cs["sandbox-run.sh or podman-run.sh<br/>same project directory, same rules"]
+        job["e.g. python train.py<br/>it can csub submit again"]
+        cw --> cs --> job
+    end
+
+    back["stdout, stderr and the exit status go back over the same ssh connection; scp works too.<br/>Nothing carries over between commands except files in the project directory.<br/>bkill -J agent-ssh 0 stops the ssh jobs, bkill -g /csub/$USER 0 the jobs the agent submitted."]
+
+    harness -->|"the dedicated key"| sshd
+    sshd -->|"seconds to a minute to start"| wrapper
+    proxy -->|"CONNECT / HTTP"| hosts
+    broker -->|"bsub, within the policy's<br/>slots, GPUs and walltime"| cw
+    cmd --> back
 ```
 
 - **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
@@ -544,64 +600,37 @@ Five suites in `tests/`:
 
 ## Troubleshooting
 
+The wrappers' own messages (those that start with `sandbox-run.sh:`, `podman-run.sh:` or
+`ssh-entry.sh:`) say what to change. The entries below are errors that come from somewhere else.
+
 - **`Read-only file system`**: the path isn't inside a `--rw` bind. Add the specific path.
-- **`unable to allocate shared memory(shm)` / `No space left on device` from PyTorch DataLoader
-  workers** (podman): `/dev/shm` is too small. It is 8g with `--gpu` and podman's 64 MB without;
-  set it with `--shm-size 16g`. It is a cap, not a reservation, but what is written there counts
-  against the job's memory.
+- **`Device or resource busy` on `.git/config`, or `Read-only file system` on `.git/hooks`,
+  `.mcp.json`, `.vscode` or `.claude/`**: these are read-only inside on purpose ("Files that run
+  later"). Commits, branches, fetch, pull and `git clone` work; `git remote add` and branch tracking
+  do not. Change such a file outside the sandbox, or start with `--no-protect`.
 - **A request hangs, or `claude`/`opencode` retries with `Request timed out`**: the host isn't on your
   allowlist (the wrapper prints the denied ones). Claude Code needs `api.anthropic.com`, `claude.ai`,
-  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`. If a host you did allow is
-  in the denied list, its name resolves to a loopback or link-local address, which the proxy refuses.
+  `platform.claude.com`; opencode+Kimi needs `litellm.int.janelia.org`.
 - **`GuardrailRaisedException`/400 from `kimi-k3`**: the safeguard, not a bug. **opencode `Forbidden`**:
   no `-m litellm/kimi-k3`. **`Failed to execute statement`/`UnknownError`**: another `--opencode`
   sandbox of yours is running.
-- **`Failed to initialize NVML: GPU access blocked`**: pass `--gpu` (bwrap or podman).
-- **`potentially insufficient UIDs or GIDs`**: `--keep-id` with a too-narrow subuid range; ask HPC.
-- **`error: could not write config file .git/config: Device or resource busy`**, or **`Read-only file
-  system`** on `.git/hooks`, `.mcp.json`, `.vscode` or `.claude/`: these are read-only inside on purpose
-  ("Files that run later"). Commits, branches, fetch and pull work, and so does `git clone`; `git
-  remote add` and branch tracking do not (git may still print "set up to track" after the error). Change such a file outside the sandbox, or start
-  with `--no-protect` if the task is to edit them.
-- **`... the command created files that tools run or load outside the sandbox`** (at exit): the
-  command made a `.mcp.json`, `.vscode`, git hooks or similar where there was none. Look at them
-  before you use git, an editor or an agent in that directory.
-- **`crun: cannot stat ...libnvidia-nscq.so.<version>`** with `podman-run.sh --gpu`: the node's CDI
-  spec (`/etc/cdi/nvidia.yaml`) predates a driver upgrade. An administrator regenerates it with
-  `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`.
-- **`Author identity unknown`** from `git commit` inside: your global git configuration has no
-  `user.name` and `user.email`, so the wrapper had none to pass in. Set them outside
-  (`git config --global ...`), or pass `--env GIT_AUTHOR_NAME` and the other three variables.
 - **`exec: claude: not found` inside**: pass `--claude`; it binds the CLI and puts it on `PATH`.
-- **`--csub needs csub-broker on PATH`**: `export PATH=~/.venvs/csub/bin:$PATH` before starting.
+- **`Author identity unknown`** from `git commit` inside: set `user.name` and `user.email` in your
+  global git configuration outside; the wrapper passes them in.
+- **`Failed to initialize NVML: GPU access blocked`**: pass `--gpu` (bwrap or podman).
+- **`unable to allocate shared memory(shm)` / `No space left on device` from PyTorch DataLoader
+  workers** (podman): `/dev/shm` is 8g with `--gpu` and 64 MB without; raise it with `--shm-size 16g`.
+- **`crun: cannot stat ...libnvidia-nscq.so.<version>`** or **`potentially insufficient UIDs or
+  GIDs`** (podman): a node setting, not yours; tell HPC which node.
 - **`csub: broker_misconfigured: ... sandbox_scripts_dir ... missing`**: the policy points at a
-  checkout that moved; fix the path in `~/.config/csub/broker.toml`, or write the policy again with
-  `csub-policy.sh ... --replace` from the new checkout.
-- **`csub: policy_violation: mount ... home directory`**: `CSUB_MOUNTS` includes something under
-  `$HOME`; work from a directory under an allowed root. `csub --json probe` (`--json` before the
-  subcommand) shows the policy.
-- **`--csub: nothing to bound child jobs to`** (at start, in practice only from `podman-run.sh`, since
-  `sandbox-run.sh` always passes on its working directory): the sandbox has no mount outside `$HOME`
-  and `/scratch` and no `--allow` host, so the broker's envelope would be empty. Add the `--rw`/`--ro`
-  path or `--allow` host the child jobs may use, or `CSUB_ENVELOPE=off` for a policy-only broker.
-- **`--csub: ... contains a comma or a colon`**, or **`CSUB_MOUNTS entry ... is not a plain absolute
-  path`**: the list of mounts handed to csub separates entries with commas and colons and is compared
-  as text. Use a directory without those characters, and give `CSUB_MOUNTS` plain absolute paths.
-- **`--csub: CSUB_MOUNTS entry ... is not within this sandbox's mounts`** (`podman-run.sh` says
-  "this container's mounts"): a preset `CSUB_MOUNTS`
-  names a path the sandbox does not have, or asks rw where it is ro. Unset it, or add the path with
-  `--rw`/`--ro`.
-- **`csub: policy_violation: ... not allowed in the parent`** (from a child's submission): the child
-  job claimed a mount or host outside this sandbox's envelope. That is the envelope working; give the
-  top-level sandbox the mount or `--allow` host if the child really needs it.
+  checkout that moved; write it again with `csub-policy.sh ... --replace` from the new checkout.
+- **`csub: policy_violation: ...`**: the job asked for a mount, host, queue or size outside your
+  policy or outside what the top-level sandbox has. `csub --json probe` shows the policy; give the
+  top-level sandbox the `--rw`/`--ro` path or `--allow` host if the child job really needs it.
 - **`Permission denied (publickey)` through an `ssh-entry.sh` key**: the key line is wrong or past its
-  `expiry-time`, or `~/.ssh` on the cluster is not mode 700. **`project directory ... does not
-  exist`**: fix `--project` in the key line. **`project directory ... is your home directory, or inside
-  it, or above it`**: move the project outside `$HOME` and edit the key line. **`cannot enter <project>
-  on <node>`**: the directory is not visible on the compute nodes. **`scp: Received message too
-  long`** with `--podman`: the checkout behind the key line predates 2026-11-21; update it.
-- **The in-sandbox README says an image or host doesn't exist for you**: it is right; change the
-  policy or the `--allow` list, outside the sandbox.
+  `expiry-time`, or `~/.ssh` on the cluster is not mode 700.
+- **`scp: Received message too long`** with `--podman`: the checkout behind the key line predates
+  2026-11-21; update it.
 
 ## Known limitations
 - bwrap has no image (so no packaged CUDA toolkit). The proxy is HTTP-style only (no SOCKS5).
