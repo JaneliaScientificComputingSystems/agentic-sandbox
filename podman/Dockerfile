@@ -16,7 +16,7 @@ FROM nvcr.io/nvidia/cuda:13.5.0-base-ubuntu22.04
 # Dockerfile.pytorch).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates git rsync && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
