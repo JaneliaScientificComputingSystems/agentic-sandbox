@@ -3,6 +3,14 @@
 Newest first. Behaviour changes only; see `git log` for everything else, including the test results
 behind each change.
 
+## 2026-11-23
+
+- **Both podman images install Node.js 24 instead of 20.** Node 20 is end-of-life and gets no
+  fix for CVE-2026-111497, a fault in the Brotli decoder bundled with Node. The decoder runs on
+  Brotli-compressed HTTP responses, such as a page an agent fetches. The images now install the
+  current 24.x from NodeSource, 24.22.3 when this entry was written. The `agentic-sandbox-lite` and
+  `agentic-sandbox-gpu` images on ghcr.io pick this up the next time they are built.
+
 ## 2026-11-21
 
 ### Fixes from a review of the scripts
