@@ -10,6 +10,12 @@ behind each change.
   Brotli-compressed HTTP responses, such as a page an agent fetches. The images now install the
   current 24.x from NodeSource, 24.22.3 when this entry was written. The `agentic-sandbox-lite` and
   `agentic-sandbox-gpu` images on ghcr.io pick this up the next time they are built.
+- **Many `podman-run.sh` jobs of one account on one node no longer slow each other down.** Each
+  job checks every two seconds for a leftover podman helper process, and started one `ps` for every
+  such process of the account on the node. With 64 jobs running together on one node, each job
+  spent about 50 s of CPU on that check in a one-minute run, and its command started about 30 s
+  late. The check now reads `/proc` and starts no process: about 3 s of CPU per job in the same
+  run. What the check does is unchanged. `sandbox-run.sh` was not affected.
 
 ## 2026-11-21
 

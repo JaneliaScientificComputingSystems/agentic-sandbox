@@ -723,8 +723,16 @@ done
 # spawns a fresh one. Left alive, it's what held finished LSF jobs in RUN for minutes.
 kill_orphaned_catatonit_for_this_job() {
   [[ -n "${LSB_JOBID:-}" ]] || return 0
+  local pid stat
   for pid in $(pgrep -u "$USER" -x catatonit 2>/dev/null); do
-    [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "1" ]] || continue
+    # The parent's pid, read from /proc with no new process: this loop runs every two seconds in
+    # every job, over every catatonit of this account on the node. With `ps` for each one, 64
+    # jobs started together on one node spent about 40 s of CPU each on this check alone.
+    # /proc/<pid>/stat is "<pid> (catatonit) <state> <ppid> ...".
+    stat=""
+    { read -r stat < "/proc/$pid/stat"; } 2>/dev/null || continue
+    stat="${stat##*) }"; stat="${stat#* }"
+    [[ "${stat%% *}" == "1" ]] || continue
     if grep -aq "$JOB_STORAGE_DIR/" "/proc/$pid/environ" 2>/dev/null \
        || { grep -azq "^LSB_JOBID=$LSB_JOBID\$" "/proc/$pid/environ" 2>/dev/null \
             && grep -azq "^LSB_JOBINDEX=${LSB_JOBINDEX:-0}\$" "/proc/$pid/environ" 2>/dev/null; }; then
