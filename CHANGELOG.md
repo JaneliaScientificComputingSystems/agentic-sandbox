@@ -3,6 +3,16 @@
 Newest first. Behaviour changes only; see `git log` for everything else, including the test results
 behind each change.
 
+## 2026-11-25
+
+- **`--job-nodes`, `--peers` and `--listen` are removed** from both wrappers, with
+  `scripts/jobnet-hook.sh`. Every worker of a multi-node job now takes `--host-net`, the node's
+  own network. Through the relay behind `--job-nodes`, NCCL over TCP ran 7 to 60 times slower
+  than on the node's network.
+- **`--host-net` accepts `--ib`.** A job on an InfiniBand queue takes `--host-net --ib`, where it
+  took `--job-nodes --ib` before.
+- **`podman-run.sh --host-net` works with `--keep-id`** (the refusal belonged to `--job-nodes`).
+
 ## 2026-11-23
 
 - **Both podman images install Node.js 24 instead of 20.** Node 20 is end-of-life and gets no

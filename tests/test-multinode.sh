@@ -1,5 +1,5 @@
 #!/bin/bash
-# test-multinode.sh -- sandbox-run.sh --job-nodes / --peers / --listen / --host-net, across two nodes.
+# test-multinode.sh -- sandbox-run.sh --host-net, across two nodes.
 #
 # The job script of a two-node LSF job. Submit it from a directory that is on shared storage and
 # outside your home directory; it needs no GPU:
@@ -8,8 +8,8 @@
 #   bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o multinode-%J.out /path/to/tests/test-multinode.sh
 #
 # It starts one sandbox per node with blaunch, as a multi-node launcher does, and checks that the
-# two reach each other and nothing else. --ib is not covered: it needs InfiniBand nodes and a
-# program that uses them.
+# two reach each other while files, home directory and environment stay sandboxed. --ib is not
+# covered: it needs InfiniBand nodes and a program that uses them.
 #
 # The same checks run against podman-run.sh with SANDBOX_WRAPPER=podman-run.sh in the environment
 # of the bsub command (allow -W 30: every container start checks the image).
@@ -26,7 +26,6 @@ PROBE="$SCRIPT_DIR/multinode-probe.py"
 [[ -n "${LSB_DJOB_HOSTFILE:-}" ]] || { echo "run this as an LSF job (see the header)"; exit 2; }
 mapfile -t HOSTS < <(sort -u "$LSB_DJOB_HOSTFILE")
 [[ ${#HOSTS[@]} -ge 2 ]] || { echo "this job has one node; ask for two: -n 2 -R \"span[ptile=1]\""; exit 2; }
-command -v pasta >/dev/null || { echo "no pasta on $(hostname): --job-nodes cannot work here"; exit 2; }
 
 TR="$PWD/.test-multinode-$$"
 mkdir "$TR" || exit 2
@@ -48,9 +47,6 @@ refuses() {  # refuses "what" "expected text" wrapper-args...
   if [[ $rc -ne 0 && "$out" == *"$text"* ]]; then ok "refuses $what"; else bad "refuses $what (exit $rc: ${out:0:120})"; fi
 }
 left() { compgen -G "$STATE/$LSB_JOBID-*" | wc -l; }
-# pasta's forwarder ends when its namespace is gone, which can take a moment; the binary's process
-# name is pasta or pasta.avx2.
-pasta_left() { local i; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -u "$(id -u)" -f '(^|/)pasta' >/dev/null || return 0; sleep 0.5; done; pgrep -u "$(id -u)" -f '(^|/)pasta' || true; }
 
 ADDRS=()
 for h in "${HOSTS[@]}"; do ADDRS+=("$(getent ahostsv4 "$h" | awk 'NR==1{print $1}')"); done
@@ -62,7 +58,7 @@ echo "1. one sandbox per node"
 cat > node.sh <<EOF
 #!/bin/bash
 cd "$TR" || exit 1
-exec "$W" --job-nodes ${MNT[*]} -- python3 "$PROBE" "$TR" "\$1" "$ALL" "$OUTSIDER"
+exec "$W" --host-net ${MNT[*]} -- python3 "$PROBE" "$TR" "\$1" "$ALL"
 EOF
 chmod +x node.sh
 for i in "${!HOSTS[@]}"; do blaunch -z "${HOSTS[$i]}" "$TR/node.sh" "${ADDRS[$i]}" > "probe.$i.out" 2>&1 & done
@@ -72,152 +68,69 @@ n=${#HOSTS[@]}
 count() { grep -c "^$1 " probe.out || true; }
 [[ "$(count PEER_OUT_OK)" -eq $((n * (n - 1))) ]] && ok "every node connects to every other node" || bad "connections to the other nodes ($(count PEER_OUT_OK) of $((n * (n - 1))))"
 [[ "$(count PEER_IN_OK)" -eq $((n * (n - 1))) ]] && ok "every node accepts from every other node" || bad "connections from the other nodes ($(count PEER_IN_OK) of $((n * (n - 1))))"
-[[ "$(count OUTSIDER_BLOCKED)" -eq $((2 * n)) && "$(count OUTSIDER_BAD)" -eq 0 ]] && ok "a host outside the job and the internet are unreachable" || bad "outside hosts ($(count OUTSIDER_BLOCKED) blocked, $(count OUTSIDER_BAD) reached)"
-[[ "$(count DNS_BLOCKED)" -eq $n ]] && ok "no DNS" || bad "DNS"
-[[ "$(count HOSTS_OK)" -eq $n ]] && ok "/etc/hosts names the other nodes" || bad "/etc/hosts"
-[[ "$(count ROUTE_REFUSED)" -eq $n ]] && ok "the sandboxed process cannot add a route" || bad "route change"
+[[ "$(count NAME_OK)" -eq $n ]] && ok "every node's own name resolves to its address, as on the node" || bad "the node's own name"
+[[ "$(count HOME_HIDDEN)" -eq $n ]] && ok "the home directory stays hidden" || bad "the home directory is visible"
 [[ "$(count OWNER_OK)" -eq $n ]] && ok "files written inside belong to the user" || bad "file ownership"
 [[ $FAIL -eq 0 ]] || sed 's/^/      /' probe.out
 
 echo "2. exit status, stdin and the description for the agent"
-echo "from stdin" | "$W" --job-nodes --listen 40123 -- bash -c 'read -r x; [[ "$x" == "from stdin" ]] || exit 3; grep -q "Only the other nodes of this job" "$SANDBOX_README" || exit 4; grep -q "and on 40123" "$SANDBOX_README" || exit 5; exit 7' 2>/dev/null
+echo "from stdin" | "$W" --host-net -- bash -c 'read -r x; [[ "$x" == "from stdin" ]] || exit 3; grep -q "on the node.s own network" "$SANDBOX_README" || exit 4; exit 7' 2>/dev/null
 [[ $? -eq 7 ]] && ok "exit status, stdin and \$SANDBOX_README" || bad "exit status, stdin or \$SANDBOX_README"
 
-rcs=""; for _ in 1 2 3 4 5 6; do "$W" --job-nodes -- bash -c 'exit 7' </dev/null >/dev/null 2>&1; rcs+="$? "; done
+rcs=""; for _ in 1 2 3 4 5 6; do "$W" --host-net -- bash -c 'exit 7' </dev/null >/dev/null 2>&1; rcs+="$? "; done
 [[ "$rcs" == "7 7 7 7 7 7 " ]] && ok "exit status of a very short command, six times" || bad "exit status of a very short command: $rcs"
 
 echo "3. refusals"
-refuses "--allow with --job-nodes" "not with --allow" --job-nodes --allow pypi.org -- true
-refuses "--csub with --job-nodes" "not with --csub" --job-nodes --csub -- true
-refuses "--claude with --job-nodes" "not with --claude" --job-nodes --claude -- true
-refuses "--listen without --job-nodes" "needs --job-nodes" --listen 40123 -- true
-refuses "a bad --peers value" "--peers takes host names" --peers 'bad host' -- true
-refuses "an unknown peer" "cannot resolve" --peers nosuchhost.invalid -- true
-out="$(env -u LSB_MCPU_HOSTS "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *LSB_MCPU_HOSTS* ]] && ok "refuses --job-nodes without LSF's node list" || bad "refuses --job-nodes without LSF's node list"
-if [[ $PODMAN -eq 1 ]]; then
-  refuses "--keep-id with --job-nodes" "not with --keep-id" --job-nodes --keep-id -- true
-else
-  out="$(SANDBOX_NET_STAGE=inner "$W" --job-nodes -- true 2>&1)"; [[ $? -ne 0 && "$out" == *"not running in pasta's namespace"* ]] && ok "refuses a faked inner stage" || bad "refuses a faked inner stage"
-fi
-refuses "--host-net with --job-nodes" "not with --job-nodes" --host-net --job-nodes -- true
 refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
+refuses "--host-net with --csub" "not with --csub" --host-net --csub -- true
 refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
-refuses "--host-net with --ib" "not with --ib" --host-net --ib -- true
-refuses "--peers naming a host outside the job" "not a node of this LSF job" --peers "${LSB_SUB_HOST:-login1}" -- true
 refuses "--ib with --claude" "--ib: not with --claude" --ib --claude -- true
 refuses "--ib with --csub" "--ib: not with --csub" --ib --csub -- true
+# --host-net --ib is the pair for an InfiniBand queue: never refused as a combination. (On a node
+# without InfiniBand the only complaint is the missing device.)
+out="$("$W" --dry-run --host-net --ib -- true 2>&1)"; rc=$?
+if [[ -d /dev/infiniband ]]; then
+  [[ $rc -eq 0 && "$out" == *infiniband* ]] && ok "--host-net with --ib is accepted" || bad "--host-net with --ib (exit $rc: ${out:0:120})"
+else
+  [[ $rc -ne 0 && "$out" == *"has no /dev/infiniband"* && "$out" != *"not with"* ]] && ok "--host-net with --ib: only the missing device is reported" || bad "--host-net with --ib (exit $rc: ${out:0:120})"
+fi
 
-echo "4. the other two networks"
+echo "4. the network, with and without --host-net"
 "$W" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null" 2>/dev/null && bad "default sandbox: no network" || ok "default sandbox: no network"
 "$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
-# torchrun gives the other nodes the name this node's address reverse-resolves to.
-"$W" --host-net -- python3 -c 'import socket, sys; n = socket.getfqdn(); sys.exit(0 if "containers.internal" not in n and socket.gethostbyname(n) != "127.0.0.1" else 1)' 2>/dev/null && ok "--host-net: the node's own name resolves as on the node" || bad "--host-net: the node's name inside is not the node's"
 
-echo "5. two sandboxes on one node take different blocks of ports"
-for t in A B; do "$W" --peers "$(hostname)" ${MNT[@]+"${MNT[@]}"} -- bash -c "date +%s > $TR/start.$t; sleep 25; grep -o 'on ports [0-9]*-[0-9]*' \$SANDBOX_README" > "block.$t" 2>block.$t.err & done
-wait
-# Both must have been running at the same time: the second does not wait for the first to end.
-d=$(( $(cat start.A 2>/dev/null || echo 0) - $(cat start.B 2>/dev/null || echo 999) )); [[ ${d#-} -lt 20 ]] && ok "the two ran side by side (started ${d#-} s apart)" || bad "the second sandbox waited for the first (${d#-} s apart)"
-[[ $PODMAN -eq 1 ]] && : > block.A.err && : > block.B.err   # podman reports its image check on stderr
-[[ -s block.A && -s block.B && "$(cat block.A)" != "$(cat block.B)" && ! -s block.A.err && ! -s block.B.err ]] \
-  && ok "different blocks, no complaints from pasta ($(cat block.A | tr -d '\n'); $(cat block.B | tr -d '\n'))" || bad "port blocks: A='$(cat block.A)' B='$(cat block.B)' $(head -2 block.A.err block.B.err)"
-
-r="$(grep -o '[0-9]*-[0-9]*' block.A 2>/dev/null | head -1)"; [[ -n "$r" && $(( ${r#*-} - ${r%-*} )) -eq 1999 && ${r%-*} -ge 5000 ]] && ok "a block is 2000 ports, not below 5000 ($r)" || bad "block size: '$r'"
-
-echo "6. stopping"
-"$W" --job-nodes -- sleep 3221 2>/dev/null & P=$!
-sleep $START; kill -TERM $P; wait $P; rc=$?
+echo "5. stopping"
+# TERM to the wrapper's process group, which is what bkill and the walltime kill do.
+setsid "$W" --host-net -- sleep 3221 2>/dev/null & P=$!
+sleep $START; kill -TERM -- "-$P" 2>/dev/null; wait $P; rc=$?
 sleep 1
 [[ $rc -eq 143 && -z "$(pgrep -u "$(id -u)" -f '^sleep 3221' || true)" && "$(left)" -eq 0 ]] && ok "TERM: exit 143, nothing running, nothing left" || bad "TERM (exit $rc, state dirs $(left))"
-[[ -z "$(pasta_left)" ]] && ok "no pasta left running" || bad "pasta left running"
 if [[ $PODMAN -eq 0 ]]; then
   # podman-run.sh has no equivalent: a container outlives a wrapper killed with -9, with or
-  # without these flags, until LSF ends the job.
-  "$W" --job-nodes -- sleep 3222 2>/dev/null & P=$!
+  # without this flag, until LSF ends the job.
+  "$W" --host-net -- sleep 3222 2>/dev/null & P=$!
   sleep 5; kill -9 $P; wait $P 2>/dev/null; sleep 3
-  [[ -z "$(pgrep -u "$(id -u)" -f '^sleep 3222' || true)" && -z "$(pasta_left)" ]] && ok "kill -9 of the wrapper takes pasta and the sandbox with it" || bad "kill -9 left processes"
+  [[ -z "$(pgrep -u "$(id -u)" -f '^sleep 3222' || true)" ]] && ok "kill -9 of the wrapper takes the sandbox with it" || bad "kill -9 left processes"
   rm -rf "$STATE/$LSB_JOBID-"* 2>/dev/null   # a killed run cannot clean up after itself
 fi
 
-echo "7. --dry-run with the network options"
-# Prints what would run and starts nothing: no command, no pasta, no state directory, and no
-# port block held (a real sandbox started right after still gets one).
+echo "6. --dry-run with the network option"
+# Prints what would run and starts nothing: no command, no state directory.
 dry() {  # dry "what" "text the output must contain" "text it must not contain" wrapper-args...
   local what=$1 want=$2 not=$3 out rc; shift 3
   out="$("$W" --dry-run "$@" ${MNT[@]+"${MNT[@]}"} -- touch "$TR/dry.ran" 2>&1 </dev/null)"; rc=$?
-  if [[ $rc -eq 0 && "$out" == *"$want"* && ( -z "$not" || "$out" != *"$not"* ) && ! -e "$TR/dry.ran" \
-        && -z "$(pasta_left)" && "$(left)" -eq 0 ]]; then
+  if [[ $rc -eq 0 && "$out" == *"$want"* && ( -z "$not" || "$out" != *"$not"* ) && ! -e "$TR/dry.ran" && "$(left)" -eq 0 ]]; then
     ok "--dry-run $what"
   else
     bad "--dry-run $what (exit $rc, ran=$([[ -e "$TR/dry.ran" ]] && echo yes || echo no), state dirs $(left): ${out:0:160})"
   fi
 }
-dry "--job-nodes names pasta and the ports" "Ports open to the job's other nodes" "" --job-nodes --listen 40123
-dry "--peers" "the network relay (pasta)" "" --peers "$(hostname)"
 if [[ $PODMAN -eq 1 ]]; then
   dry "--host-net" "--network=host" "--network=none" --host-net
-  dry "without a network option" "--network=none" "pasta"
+  dry "without a network option" "--network=none" "--network=host"
 else
   dry "--host-net" "no helper is started" "--unshare-net" --host-net
-  dry "without a network option" "--unshare-net" "pasta"
-fi
-"$W" --job-nodes -- true </dev/null >/dev/null 2>&1 && ok "a sandbox starts right after the dry runs" || bad "a sandbox after the dry runs"
-
-echo "8. a socket bound to the interface does not get past the limit"
-# SO_BINDTODEVICE needs no privilege and skips a failed route lookup; pasta would then forward
-# the packet to any host. The sandbox here has no peer, so the job's other node is an outsider;
-# a listener there, outside any sandbox, must hear the control and nothing from inside.
-OTHER=""; for i in "${!HOSTS[@]}"; do [[ "${ADDRS[$i]}" != "$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" ]] && OTHER="${HOSTS[$i]}" && OTHERIP="${ADDRS[$i]}"; done
-cat > listen.py <<'EOF'
-import os, socket, sys, time
-out = sys.argv[2]
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-u.bind(("0.0.0.0", 61123)); u.settimeout(1)
-t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("0.0.0.0", 61124)); t.listen(5); t.settimeout(1)
-open(out, "w").close()
-end = time.time() + float(sys.argv[1])
-def note(line):
-    with open(out, "a") as f: f.write(line + "\n")
-while time.time() < end and not os.path.exists(out + ".stop"):
-    try:
-        d, a = u.recvfrom(100); note("UDP " + d.decode(errors="replace"))
-    except socket.timeout: pass
-    try:
-        c, a = t.accept(); c.settimeout(2)
-        try: d = c.recv(100).decode(errors="replace")
-        except OSError: d = ""
-        note("TCP " + (d or "no-data-from-" + a[0])); c.close()
-    except socket.timeout: pass
-EOF
-cat > send.py <<'EOF'
-import socket, sys
-target, tag = sys.argv[1], sys.argv[2]
-devs = [n for _, n in socket.if_nameindex() if n != "lo"]
-for dev in [None] + devs:
-    for kind in ("udp", "tcp"):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM); s.settimeout(4)
-        try:
-            if dev: s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
-            if kind == "udp": s.sendto(tag.encode(), (target, 61123))
-            else: s.connect((target, 61124)); s.sendall(tag.encode())
-        except OSError: pass
-open(sys.argv[3], "w").close()
-EOF
-if [[ -n "$OTHER" ]]; then
-  blaunch -z "$OTHER" python3 "$TR/listen.py" 300 "$TR/heard" >/dev/null 2>&1 &
-  LP=$!
-  for _ in $(seq 1 30); do [[ -e heard ]] && break; sleep 1; done
-  python3 send.py "$OTHERIP" control "$TR/ran.control"
-  "$W" --peers "$(hostname)" ${MNT[@]+"${MNT[@]}"} -- python3 "$TR/send.py" "$OTHERIP" inside "$TR/ran.inside" >/dev/null 2>&1
-  sleep 4; : > heard.stop; wait $LP 2>/dev/null
-  [[ "$(grep -c '^UDP control$\|^TCP control$' heard)" -ge 2 ]] && ok "the listener on the other node hears a sender outside the sandbox" || bad "control: the listener heard too little ($(tr '\n' ';' < heard))"
-  [[ -e ran.inside ]] && ok "the sender ran inside the sandbox" || bad "the sender did not run inside the sandbox"
-  # Everything the listener heard that is not the control: a datagram, or a connection with or
-  # without data.
-  LEAK="$(grep -v '^UDP control\|^TCP control' heard | tr '\n' ';')"
-  [[ -z "$LEAK" ]] && ok "nothing from inside the sandbox reaches it, bound to the interface or not" || bad "packets from inside reached a node that is not a peer: $LEAK"
-else
-  bad "no second node found for the bound-socket check"
+  dry "without a network option" "--unshare-net" "no helper is started"
 fi
 
 echo

@@ -35,28 +35,16 @@
 #                         read-only /sys/{devices,module}; needs nvidia-smi on the host.
 #   --scratch             Shorthand for --rw /scratch/$USER/work (created if missing).
 #                         Deliberately NOT all of /scratch/$USER -- see "Per-job state" below.
-#   --job-nodes           For one worker of a multi-node LSF job (started once per node, e.g. by
-#                         blaunch): a private network that reaches the OTHER NODES OF THIS JOB
-#                         and nothing else -- no other host, no internet, no DNS. The node list
-#                         comes from LSF ($LSB_MCPU_HOSTS). Needs pasta (the passt package) on
-#                         the node. Not with --allow, --csub, --claude or --opencode. See
+#   --host-net            For one worker of a multi-node LSF job (started once per node, e.g. by
+#                         blaunch): the node's own network, unrestricted. Files, credentials,
+#                         environment and processes are sandboxed as always; the network is
+#                         not. Not with --allow, --csub, --claude or --opencode. See
 #                         "Multi-node jobs" below.
-#   --peers HOST[,HOST]   Like --job-nodes, with the nodes named explicitly (outside LSF, tests).
-#                         Inside an LSF job every name must be a node of that job.
-#   --listen PORT         With --job-nodes: also accept connections from the job's nodes on PORT
-#                         (repeatable). For a port the launcher picked on the node, such as
-#                         torchrun's master port. Ports the sandboxed program opens itself need
-#                         no flag -- see "Multi-node jobs".
-#   --host-net            For one worker of a multi-node LSF job on a queue WITHOUT InfiniBand:
-#                         the node's own network, unrestricted. Files, credentials, environment
-#                         and processes are sandboxed as always; the network is not. Use it only
-#                         where --job-nodes is too slow, which is when the data itself travels
-#                         over TCP (NCCL on Ethernet). Not with --job-nodes, --ib, --allow, --csub,
-#                         --claude or --opencode. See "Multi-node jobs" below.
 #   --ib                  Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and,
 #                         read-only, the sysfs entries NCCL and libibverbs read. Verbs traffic
 #                         does not pass through the sandbox's network, so this opens the
 #                         InfiniBand fabric to the sandboxed process whatever else is closed.
+#                         With --host-net for a multi-node job on an InfiniBand queue.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
 #                          copy of ~/.claude.json, ~/.claude/settings.json and
 #                          ~/.claude/CLAUDE.md, with only ~/.claude/.credentials.json bound
@@ -100,33 +88,17 @@
 # /tmp inside the sandbox is a private tmpfs (TMPDIR points at it). When stdin is not a
 # terminal (Mode A/B, plain bsub) the sandbox also gets its own session (--new-session).
 #
-# Multi-node jobs (--job-nodes, --ib): one sandbox per node, started by the job's launcher, which
+# Multi-node jobs (--host-net, --ib): one sandbox per node, started by the job's launcher, which
 # stays outside. torchrun, NCCL and Ray need TCP between the job's nodes, which the default empty
-# network forbids. With --job-nodes the wrapper starts itself again under pasta, a user-space
-# network relay: pasta gives a new network namespace the node's own address, and connects it to
-# the node's network through ordinary sockets. Inside that namespace, before the sandbox starts,
-# every route is removed and one host route is added per other node of the job, so a connection
-# to anything else is refused at once ("connection refused"). The sandbox then runs in a nested
-# user namespace, which holds no capability over the network namespace: the sandboxed process
-# cannot add a route. /etc/hosts inside lists the job's nodes (there is no DNS).
-#   Ports: connections FROM the job's other nodes are accepted on a block of 2000 ports and on
-#   each --listen PORT. The block is 13000-14999 on a node whose own range for outgoing
-#   connections starts at 15000; each further sandbox of this kind on the node takes the next
-#   block down, to 5000, so five fit. $SANDBOX_README inside names the block. A listener that lets
-#   the system pick its port (bind to port 0: torchrun workers, NCCL, most of Ray) gets one
-#   from the top 1500 of the block, so it is reachable without any flag. A program that wants
-#   fixed ports must take them from the lower 500 (Ray: its node manager, object manager, agent
-#   and worker ports). A port in use on the node is skipped.
-#   Speed: only connections set up through TCP cross the relay. With --ib, NCCL's data goes
-#   over RDMA verbs directly (measured: no difference to an unsandboxed job on H200 nodes).
-#   Without InfiniBand the data itself crosses the relay, which is slower.
-#   Nothing is filtered on the node itself (no nftables); the limit is the routing table of a
-#   namespace the sandboxed process cannot change.
-#   --host-net is the fallback for queues without InfiniBand. There NCCL sends its data over
-#   TCP, through the relay, and a bandwidth test on two L4 nodes ran about 40 times slower
-#   (0.15 GB/s against 6 GB/s). --host-net leaves the network namespace alone instead: full
-#   speed, on the node's own network, unrestricted. Files, credentials, environment and
-#   processes are sandboxed as always.
+# network forbids. --host-net leaves the network namespace alone: the worker is on the node's own
+# network, at full speed, and nothing here limits where it connects or who connects to it. Files,
+# credentials, environment and processes are sandboxed as always. A worker holds no key, no
+# token and no job broker, so what it can send out is what it can read: the project directory
+# and the mounted inputs. On an InfiniBand queue add --ib: NCCL's data then goes over RDMA verbs
+# directly (measured: no difference to an unsandboxed job on H200 nodes).
+#   A private network limited to the job's nodes was tried (a user-space relay, pasta) and
+#   dropped: NCCL over TCP ran 7 to 60 times slower through it, and nothing may be loaded on the
+#   nodes to filter in the kernel.
 #
 # Config isolation (--claude/--opencode): the harness's *configuration* is where a
 # prompt-injected agent can persist: ~/.claude/settings.json hooks and ~/.claude.json MCP
@@ -209,11 +181,7 @@ PROTECT=1
 DRY_RUN=0
 WANT_GPU=0
 WANT_IB=0
-WANT_JOBNET=0     # --job-nodes / --peers
 WANT_HOSTNET=0    # --host-net
-PEER_LIST=""      # --peers HOST,HOST (empty: take the nodes from LSF)
-LISTEN_PORTS=()   # --listen PORT
-ORIG_ARGS=("$@")  # --job-nodes starts this script again, with the same arguments, under pasta
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 CLAUDE_HISTORY=""   # "", ro or rw: --claude-history[-rw]
@@ -260,16 +228,7 @@ while [[ $# -gt 0 ]]; do
     --csub) WANT_CSUB=1; shift ;;
     --gpu) WANT_GPU=1; shift ;;
     --ib) WANT_IB=1; shift ;;
-    --job-nodes) WANT_JOBNET=1; shift ;;
     --host-net) WANT_HOSTNET=1; shift ;;
-    --peers)
-      need_arg "$@"
-      [[ "$2" =~ ^[A-Za-z0-9._,-]+$ ]] || { echo "sandbox-run.sh: --peers takes host names separated by commas (got '$2')" >&2; exit 1; }
-      WANT_JOBNET=1; PEER_LIST="$2"; shift 2 ;;
-    --listen)
-      need_arg "$@"
-      [[ "$2" =~ ^[0-9]+$ && "$2" -ge 1024 && "$2" -le 65535 ]] || { echo "sandbox-run.sh: --listen takes a port from 1024 to 65535 (got '$2')" >&2; exit 1; }
-      LISTEN_PORTS+=("$2"); shift 2 ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
       WANT_CLAUDE=1
@@ -319,20 +278,11 @@ if [[ -n "$CLAUDE_HISTORY" && $WANT_CLAUDE -eq 0 ]]; then
   echo "sandbox-run.sh: --claude-history needs --claude (the history is bound into the per-job Claude config)" >&2; exit 1
 fi
 
-# --job-nodes (see "Multi-node jobs" in the header). Two stages of this same script:
-#   outer  works out the job's other nodes and starts pasta, which runs the script again
-#   inner  runs as root of pasta's user+network namespace: narrows the routes, then carries on
-#          to the normal sandbox, which gets a nested user namespace instead of --unshare-net
-# Both run before anything is created, so a refusal here leaves nothing behind.
-jobnet_die() { echo "sandbox-run.sh: --job-nodes: $*" >&2; exit 1; }
-JOBNET_INNER=0
-JOBNET_DRY=0      # --dry-run with --job-nodes: the outer stage's values, and pasta is not started
-JOBNET_PASTA=()   # the pasta command of the outer stage (for --dry-run)
+# --host-net and --ib (see "Multi-node jobs" in the header): for the workers of a multi-node job.
+# Checked before anything is created, so a refusal here leaves nothing behind.
 if [[ $WANT_HOSTNET -eq 1 ]]; then
   # One flag must not be enough to run an agent itself, or its job broker, with an open network.
   _why=""
-  [[ $WANT_JOBNET -eq 1 ]] && _why="--job-nodes or --peers (choose one of the two networks)"
-  [[ $WANT_IB -eq 1 ]] && _why="--ib: a job on InfiniBand takes --job-nodes --ib, which is as fast and keeps the network limited"
   [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
@@ -346,194 +296,6 @@ if [[ $WANT_IB -eq 1 ]]; then
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }
   [[ -d /dev/infiniband ]] || { echo "sandbox-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1; }
-fi
-if [[ $WANT_JOBNET -eq 0 && ${#LISTEN_PORTS[@]} -gt 0 ]]; then
-  echo "sandbox-run.sh: --listen needs --job-nodes (or --peers)" >&2; exit 1
-fi
-if [[ $WANT_JOBNET -eq 1 ]]; then
-  # The agent itself stays in the ordinary single-node sandbox; this mode is for its workers.
-  [[ $WANT_CLAUDE -eq 0 && $WANT_OPENCODE -eq 0 ]] || jobnet_die "not with --claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
-  # The allowlist proxy and the csub broker would start inside the narrowed network.
-  [[ ${#ALLOW_HOSTS[@]} -eq 0 ]] || jobnet_die "not with --allow: a worker reaches the job's nodes only"
-  [[ $WANT_CSUB -eq 0 ]] || jobnet_die "not with --csub"
-  IP_BIN="$(command -v ip || echo /usr/sbin/ip)"
-  if [[ "${SANDBOX_NET_STAGE:-}" != inner ]]; then
-    # ---- outer stage
-    command -v pasta >/dev/null || jobnet_die "needs pasta (the passt package) on $(hostname)"
-    # `|| true`: an unknown name must reach the message below, not end the script under `set -e`.
-    _myip="$(getent ahostsv4 "$(hostname)" | awk 'NR==1{print $1}')" || true
-    [[ "$_myip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve this node's own address ($(hostname))"
-    _hif="$("$IP_BIN" -o -4 addr show | awk -v ip="$_myip" '{split($4, a, "/"); if (a[1] == ip && !f) {print $2; f = 1}}')"
-    [[ -n "$_hif" ]] || jobnet_die "no network interface holds $_myip"
-    _names=() _jobaddrs=""
-    if [[ -n "$PEER_LIST" ]]; then
-      IFS=, read -ra _names <<< "$PEER_LIST"
-      # Inside an LSF job --peers may only narrow the job's own nodes, so that a launcher or a
-      # typing mistake cannot open a path to another host by naming it. The list comes from
-      # LSB_MCPU_HOSTS in the environment: it guards whoever starts the wrapper against a mistake,
-      # not against themselves. The sandboxed process never starts the wrapper outside the sandbox.
-      if [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
-        read -ra _mc <<< "$LSB_MCPU_HOSTS"
-        for ((i = 0; i < ${#_mc[@]}; i += 2)); do
-          _jobaddrs+=" $(getent ahostsv4 "${_mc[i]}" | awk 'NR==1{print $1}' || true)"
-        done
-      fi
-    elif [[ -n "${LSB_MCPU_HOSTS:-}" ]]; then
-      # "host1 slots1 host2 slots2 ..." -- LSF sets it in every task of the job
-      read -ra _mc <<< "$LSB_MCPU_HOSTS"
-      for ((i = 0; i < ${#_mc[@]}; i += 2)); do _names+=("${_mc[i]}"); done
-    else
-      jobnet_die "not inside an LSF job (LSB_MCPU_HOSTS is not set); name the nodes with --peers HOST,HOST"
-    fi
-    _peers="" _hosts="$_myip $(getent hosts "$_myip" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
-    for n in "${_names[@]}"; do
-      [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || jobnet_die "not a host name: $n"
-      a="$(getent ahostsv4 "$n" | awk 'NR==1{print $1}')" || true
-      [[ "$a" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || jobnet_die "cannot resolve $n"
-      [[ -z "$_jobaddrs" || " $_jobaddrs " == *" $a "* ]] || jobnet_die "--peers $n: not a node of this LSF job ($LSB_MCPU_HOSTS)"
-      [[ "$a" == "$_myip" || " $_peers " == *" $a "* ]] && continue
-      _peers+="${_peers:+ }$a"
-      _hosts+="$a $(getent hosts "$a" 2>/dev/null | awk '{for (i = 2; i <= NF; i++) printf "%s ", $i}' || true)"$'\n'
-    done
-    _markdir="/scratch/$USER/.agentic-sandbox"
-    mkdir -p "$_markdir" 2>/dev/null || { _markdir="${TMPDIR:-/tmp}/agentic-sandbox-$(id -u)"; mkdir -p "$_markdir"; }
-    chmod 700 "$_markdir"
-    for _try in 1 2 3; do
-      # One sandbox at a time on this node chooses its block and lets pasta bind it: two that
-      # look at the same instant would each get part of the same block. Held until the inner
-      # stage has started (or pasta has given up), never across the sandboxed command.
-      # (Not in a dry run, which binds no port.)
-      if [[ $DRY_RUN -eq 0 ]]; then
-        exec {_lockfd}> "$_markdir/net.lock"
-        flock "$_lockfd"
-      fi
-      # Ports other nodes may connect to: a block of 2000 below the node's own range for outgoing
-      # connections, so that nothing on the node hands one out by chance. Ports already listening
-      # on the node are left out (pasta would report each one it cannot bind). A block that is
-      # mostly taken belongs to another sandbox on this node, so the next block down is tried.
-      read -r _elo _ < /proc/sys/net/ipv4/ip_local_port_range
-      _top=14999; [[ "$_elo" -le "$_top" ]] && _top=$((_elo - 1))
-      _listening="$(ss -Htln 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | sort -un || true)"
-      _lo="" _hi="" _busy=""
-      for ((_h = _top; _h - 1999 >= 5000; _h -= 2000)); do
-        _b="$(awk -v lo=$((_h - 1999)) -v hi="$_h" '$1 >= lo && $1 <= hi' <<< "$_listening")"
-        if [[ "$(grep -c . <<< "$_b" || true)" -lt 1000 ]]; then _lo=$((_h - 1999)); _hi=$_h; _busy="$_b"; break; fi
-      done
-      [[ -n "$_lo" ]] || jobnet_die "no free block of 2000 ports between 5000 and $_top on $(hostname): sandboxes with --job-nodes or --peers hold them all, possibly other users' (five fit on a node). Submit again, or to nodes the job has to itself."
-      # Excludes only: pasta then forwards the rest best effort.
-      _spec="~1-$((_lo - 1)),~$((_hi + 1))-65535"
-      for port in $_busy; do _spec+=",~$port"; done
-      _fwd=(-t "$_myip/$_spec")
-      for port in "${LISTEN_PORTS[@]:-}"; do
-        [[ -n "$port" ]] || continue
-        [[ "$port" -ge "$_lo" && "$port" -le "$_hi" ]] || _fwd+=(-t "$_myip/$port")
-      done
-      # A killed parent takes its child with it, at both levels: this shell -> pasta -> inner stage.
-      _pre=(); command -v setpriv >/dev/null && _pre=(setpriv --pdeathsig KILL)
-      JOBNET_PASTA=(${_pre[@]+"${_pre[@]}"} pasta --config-net -4 -q -i "$_hif" -I "$_hif" "${_fwd[@]}"
-                    -u none -T none -U none --no-map-gw --
-                    ${_pre[@]+"${_pre[@]}"} "$SCRIPT_DIR/$(basename "$(readlink -f "${BASH_SOURCE[0]}")")" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"})
-      if [[ $DRY_RUN -eq 1 ]]; then
-        # A dry run starts nothing: no pasta, no second run of this script. What the inner stage
-        # would be given is set here (not exported), the routes are left alone, and the script
-        # carries on to build and print the bwrap command of the inner stage. dry_run_print names
-        # the pasta command.
-        SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip" SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts"
-        SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$"
-        JOBNET_DRY=1
-        break
-      fi
-      SANDBOX_NET_STAGE=inner SANDBOX_NET_PEERS="$_peers" SANDBOX_NET_MYIP="$_myip"
-      SANDBOX_NET_IF="$_hif" SANDBOX_NET_HOSTS="$_hosts" SANDBOX_NET_HOSTNAME="$(hostname)"
-      SANDBOX_NET_UID="$(id -u)" SANDBOX_NET_GID="$(id -g)" SANDBOX_NET_PORTS="$_lo $_hi" SANDBOX_NET_PID="$$" SANDBOX_NET_MARK="$_markdir/net-$$.starting"
-      export SANDBOX_NET_STAGE SANDBOX_NET_PEERS SANDBOX_NET_MYIP SANDBOX_NET_IF SANDBOX_NET_HOSTS SANDBOX_NET_HOSTNAME \
-             SANDBOX_NET_UID SANDBOX_NET_GID SANDBOX_NET_PORTS SANDBOX_NET_PID SANDBOX_NET_MARK
-      : > "$SANDBOX_NET_MARK"
-      # pasta is stopped on every way out of this stage. (It normally ends with the inner stage,
-      # and _pp is emptied once it has been waited for.)
-      _pp="" _sig=""
-      trap '[[ -n "$_pp" ]] && kill "$_pp" 2>/dev/null || true' EXIT
-      # A signal sent to this pid alone (a launcher stopping one worker) is passed to everything
-      # below pasta: the inner stage, bwrap and the sandboxed command. The inner stage alone would
-      # not do: bash runs a trap only when its foreground command returns, so it would sit on the
-      # signal until the sandboxed command ended by itself. (bkill and walltime kills signal every
-      # process of the job anyway.) Set before pasta starts: a signal that arrives while the inner
-      # stage is still coming up is remembered and passed on once it is there.
-      _tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null || true); do echo "$c"; _tree "$c"; done; }
-      _fwd_sig() { local k=""; _sig="$1"; [[ -n "$_pp" ]] && k="$(_tree "$_pp")"; [[ -n "$k" ]] && kill -"$1" $k 2>/dev/null; true; }
-      trap '_fwd_sig TERM' TERM; trap '_fwd_sig INT' INT; trap '_fwd_sig USR2' USR2
-      # In the background, so that the traps below run at once; `<&0` keeps the caller's stdin.
-      "${JOBNET_PASTA[@]}" <&0 {_lockfd}>&- &
-      _pp=$!
-      for ((_w = 0; _w < 300; _w++)); do
-        [[ -e "$SANDBOX_NET_MARK" ]] && kill -0 "$_pp" 2>/dev/null || break
-        sleep 0.1
-      done
-      exec {_lockfd}>&-
-      # A signal from the start-up window: pass it on now that the inner stage exists, or stop
-      # pasta if it has nothing below it.
-      if [[ -n "$_sig" ]]; then
-        if [[ -n "$(_tree "$_pp")" ]]; then _fwd_sig "$_sig"; else kill "$_pp" 2>/dev/null || true; fi
-      fi
-      _rc=0
-      while :; do
-        wait "$_pp" && _rc=0 || _rc=$?
-        kill -0 "$_pp" 2>/dev/null || break   # still there: `wait` was interrupted by a trap
-      done
-      # The inner stage removes the marker when it starts. Still there: pasta gave up before that,
-      # which is what happens when another sandbox on this node took the same block of ports in
-      # the same instant. Look again and retry; any other failure repeats and is reported as is.
-      _pp=""   # waited for: nothing left for the EXIT trap to stop
-      # Stopped by a signal, at whatever point: that is the end, not a reason to try again.
-      if [[ -n "$_sig" ]]; then
-        rm -f "$SANDBOX_NET_MARK"
-        case "$_sig" in TERM) exit 143 ;; INT) exit 130 ;; *) exit 140 ;; esac
-      fi
-      [[ -e "$SANDBOX_NET_MARK" ]] || exit "$_rc"
-      rm -f "$SANDBOX_NET_MARK"
-      [[ $_try -lt 3 ]] || exit "$_rc"
-      sleep "$((_try)).$((RANDOM % 10))"
-    done
-  fi
-  # ---- inner stage. SANDBOX_NET_STAGE is only an environment variable, so prove where we are
-  # before touching a routing table: root of a user namespace that maps to the calling user.
-  # (As plain root on the node, the flush below would hit the node's own routes.)
-  if [[ $JOBNET_DRY -eq 0 ]]; then
-    read -r _in _out _cnt < /proc/self/uid_map
-    [[ "$(id -u)" == 0 && "$_in" == 0 && "$_cnt" == 1 && "$_out" != 0 && "$_out" == "${SANDBOX_NET_UID:-}" ]] \
-      || jobnet_die "internal: the inner stage is not running in pasta's namespace"
-    [[ "${SANDBOX_NET_GID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_PID:-}" =~ ^[0-9]+$ && "${SANDBOX_NET_IF:-}" =~ ^[A-Za-z0-9._-]{1,15}$ \
-       && "${SANDBOX_NET_PORTS:-}" =~ ^[0-9]+\ [0-9]+$ && "${SANDBOX_NET_PEERS-x}" =~ ^[0-9.\ ]*$ ]] \
-      || jobnet_die "internal: bad settings from the outer stage"
-    "$IP_BIN" -4 route flush dev "$SANDBOX_NET_IF" || jobnet_die "could not clear the routes"
-    _n=0
-    for a in $SANDBOX_NET_PEERS; do
-      "$IP_BIN" -4 route add "$a/32" dev "$SANDBOX_NET_IF" || jobnet_die "could not add the route to $a"
-      _n=$((_n + 1))
-    done
-    # Every other address is made local to this namespace. Without it a socket bound to the
-    # interface (SO_BINDTODEVICE needs no privilege) skips the failed route lookup, the kernel
-    # treats the destination as on-link, and pasta forwards the packet: shown on the cluster on
-    # 21 November 2026, a datagram reached a node that was not a peer. With this route the lookup
-    # succeeds and the packet stays inside.
-    # `src`: without it a UDP socket connected to an outside address reports that address as its own,
-    # and software that finds "my address" that way (Ray, Dask) would advertise it.
-    "$IP_BIN" -4 route add local default dev "$SANDBOX_NET_IF" src "$SANDBOX_NET_MYIP" || jobnet_die "could not add the catch-all local route"
-    # Exactly one route per other node in the main table, and that one in the local table: fail
-    # closed on anything unexpected.
-    _rt="$("$IP_BIN" -4 route show)"
-    [[ "$(grep -c . <<< "$_rt" || true)" == "$_n" && -z "$(grep -E 'default|/' <<< "$_rt" || true)" \
-       && "$("$IP_BIN" -4 route show table local | grep -c "^local default dev $SANDBOX_NET_IF " || true)" == 1 ]] \
-      || jobnet_die "the routing table is not what was set: $(tr '\n' ';' <<< "$_rt")"
-    # Listeners that let the system pick a port get one from the top 1500 of the forwarded range.
-    echo "$(( ${SANDBOX_NET_PORTS#* } - 1499 )) ${SANDBOX_NET_PORTS#* }" > /proc/sys/net/ipv4/ip_local_port_range \
-      || jobnet_die "could not set the port range"
-    # pasta names its namespace pasta-<host>; software that looks itself up needs the real name.
-    hostname "$SANDBOX_NET_HOSTNAME" 2>/dev/null || true
-  fi
-  JOBNET_INNER=1
-  JOBNET_PID="$SANDBOX_NET_PID"
-  [[ "${SANDBOX_NET_MARK:-}" == */net-"$SANDBOX_NET_PID".starting ]] && rm -f "$SANDBOX_NET_MARK"
 fi
 
 # --gpu: resolve the job's GPUs to device nodes now, before anything is created, so the common
@@ -596,9 +358,7 @@ if ! mkdir -p "$SANDBOX_STATE_PARENT" 2>/dev/null; then
   mkdir -p "$SANDBOX_STATE_PARENT"
 fi
 chmod 700 "$SANDBOX_STATE_PARENT"
-# --job-nodes: the inner stage is pid 1 of pasta's pid namespace, every time, so it takes the outer
-# stage's pid (which is pasta's) -- two workers on one node would otherwise claim the same directory.
-JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-${JOBNET_PID:-$$}"
+JOB_DIR="$SANDBOX_STATE_PARENT/${LSB_JOBID:-manual}${LSB_JOBINDEX:+-$LSB_JOBINDEX}-$$"
 # Plain mkdir: the tag is unique by construction, so an existing dir is debris from a reused pid
 # or a bug, and reusing it would mix two jobs' state. Fail loudly instead.
 mkdir "$JOB_DIR" || { echo "sandbox-run.sh: per-job state dir $JOB_DIR already exists; remove it if no job is using it" >&2; exit 1; }
@@ -689,15 +449,7 @@ BWRAP_ARGS=(
   --proc /proc --dev /dev --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
-if [[ $JOBNET_INNER -eq 1 ]]; then
-  # The network namespace is the one pasta serves, already narrowed above. The nested user
-  # namespace is what makes that final: inside it, uid 0 of the outer namespace is the user
-  # again, with no capability over the network namespace. (/etc/hosts for the job's nodes is
-  # bound with the other multi-node binds, in the sorted list below.)
-  BWRAP_ARGS+=(--unshare-user --uid "$SANDBOX_NET_UID" --gid "$SANDBOX_NET_GID")
-elif [[ $WANT_HOSTNET -eq 0 ]]; then
-  BWRAP_ARGS+=(--unshare-net)
-fi
+[[ $WANT_HOSTNET -eq 1 ]] || BWRAP_ARGS+=(--unshare-net)
 # After --dev /dev (mounts apply in order): the GPU device nodes, and the job's device numbering.
 if [[ ${#GPU_BINDS[@]} -gt 0 ]]; then
   BWRAP_ARGS+=("${GPU_BINDS[@]}")
@@ -760,10 +512,10 @@ fi
 # order the flags came in. Same path twice: $PWD, then --ro, then --rw, so the last of those wins.
 _bind_lines=""
 _seq=0
-add_bind() {  # $1 = bwrap flag, $2 = path, $3 = source if it is not the path itself
+add_bind() {  # $1 = bwrap flag, $2 = path
   local d="${2//[^\/]/}"
   _seq=$((_seq + 1))
-  _bind_lines+="${#d}"$'\t'"$_seq"$'\t'"$1"$'\t'"$2"$'\t'"${3:-$2}"$'\n'
+  _bind_lines+="${#d}"$'\t'"$_seq"$'\t'"$1"$'\t'"$2"$'\n'
 }
 add_bind --bind "$PWD"
 for p in "${RO_BINDS[@]:-}"; do [[ -n "$p" ]] && add_bind --ro-bind "$p"; done
@@ -822,7 +574,7 @@ fi
 #   <device>/subsystem into /sys/bus/pci. Without them InfiniBand comes up, NCCL logs "network
 #   path ... is not a PCI device", and the job dies with "Could not find NET with id 0" (verified
 #   live, NCCL 2.27.3 on H200 nodes).
-if [[ $WANT_IB -eq 1 || $WANT_HOSTNET -eq 1 || $JOBNET_INNER -eq 1 ]]; then
+if [[ $WANT_IB -eq 1 || $WANT_HOSTNET -eq 1 ]]; then
   [[ $WANT_GPU -eq 1 ]] || add_bind --ro-bind /sys/devices     # --gpu has bound it already
   for d in /sys/class/net /sys/bus/pci /sys/class/pci_bus; do
     [[ -e "$d" ]] && add_bind --ro-bind "$d"
@@ -834,12 +586,6 @@ if [[ $WANT_IB -eq 1 ]]; then
   for d in /sys/class/infiniband /sys/class/infiniband_verbs; do
     [[ -e "$d" ]] && add_bind --ro-bind "$d"
   done
-fi
-# --job-nodes: /etc/hosts names the job's nodes (there is no DNS inside).
-if [[ $JOBNET_INNER -eq 1 ]]; then
-  JOBNET_HOSTS="$JOB_DIR/hosts"
-  { echo "127.0.0.1 localhost"; printf '%s' "$SANDBOX_NET_HOSTS"; } > "$JOBNET_HOSTS"
-  add_bind --ro-bind /etc/hosts "$JOBNET_HOSTS"
 fi
 
 # This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
@@ -952,7 +698,7 @@ if [[ $PROTECT -eq 1 ]]; then
   fi
 fi
 
-while IFS=$'\t' read -r _ _ _flag _path _src; do
+while IFS=$'\t' read -r _ _ _flag _path; do
   [[ -n "$_path" ]] || continue
   if [[ "$_flag" == --ro-bind-try && -L "$_path" ]]; then
     # bwrap: "Can't mount on symlink destination" -- recreate the link inside instead, and bind
@@ -960,7 +706,7 @@ while IFS=$'\t' read -r _ _ _flag _path _src; do
     _t="$(realpath -e -- "$_path" 2>/dev/null)" || continue
     BWRAP_ARGS+=(--ro-bind-try "$_t" "$_t" --symlink "$_t" "$_path")
   else
-    BWRAP_ARGS+=("$_flag" "${_src:-$_path}" "$_path")
+    BWRAP_ARGS+=("$_flag" "$_path" "$_path")
   fi
 done < <(printf '%s' "$_bind_lines" | sort -t$'\t' -k1,1n -k2,2n)
 
@@ -1425,13 +1171,6 @@ write_sandbox_readme() {
       echo "- Only these hosts are reachable, over HTTP(S) through a proxy already configured in http_proxy/https_proxy:"
       for h in "${ALLOW_HOSTS[@]}"; do echo "  - $h (and its subdomains)"; done
       echo "- Everything else (other hosts, raw TCP, ssh, package registries not listed) fails. Do not retry or look for a route; ask the user."
-    elif [[ $JOBNET_INNER -eq 1 ]]; then
-      echo "- This is one worker of a multi-node job. Only the other nodes of this job are reachable:"
-      for a in $SANDBOX_NET_PEERS; do echo "  - $a"; done
-      [[ -n "$SANDBOX_NET_PEERS" ]] || echo "  - (none: this job has one node)"
-      echo "- This node's address is $SANDBOX_NET_MYIP, on interface $SANDBOX_NET_IF. Use addresses, or the names in /etc/hosts; there is no DNS."
-      echo "- Everything else (other hosts, the internet, package registries) is refused at once ('connection refused'). Do not retry or look for a route."
-      echo "- Other nodes can connect to this one on ports ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and on ${LISTEN_PORTS[*]}}. A listener that lets the system pick its port (port 0) gets a reachable one. A fixed port must be in the lowest 500 of that range; the system hands out the rest."
     elif [[ $WANT_HOSTNET -eq 1 ]]; then
       echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
       echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."
@@ -1526,12 +1265,6 @@ dry_run_print() {  # "$@" = everything after `bwrap`
   if [[ $WANT_CSUB -eq 1 ]]; then
     echo; echo "On the host, the csub broker:"
     echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
-  fi
-  if [[ $JOBNET_DRY -eq 1 ]]; then
-    echo; echo "On the host, the network relay (pasta), which runs this script again in a network namespace of its own:"
-    printf ' '; printf ' %q' "${JOBNET_PASTA[@]}"; echo
-    echo "In that namespace, before the sandbox starts: every route is removed and one host route is added per other node of the job (${SANDBOX_NET_PEERS:-none})."
-    echo "Ports open to the job's other nodes: ${SANDBOX_NET_PORTS% *}-${SANDBOX_NET_PORTS#* }${LISTEN_PORTS[*]:+ and ${LISTEN_PORTS[*]}}."
   fi
   [[ $WANT_HOSTNET -eq 1 ]] && { echo; echo "The network: the node's own (--host-net); no helper is started."; }
   echo; echo "The sandbox:"

@@ -506,87 +506,58 @@ what the node has installed, which varies, or on a venv you build (see "Dependen
   queue. Check `bqueues` before choosing one: a busy queue can hold a job for hours while `gpu_short`
   (60-minute limit, for short test jobs) dispatches at once.
 
-## Multi-node jobs (`--job-nodes`, `--host-net`, `--ib`)
+## Multi-node jobs (`--host-net`, `--ib`)
 
 Both wrappers take the same flags. The agent itself stays in the ordinary single-node sandbox. These
 flags are for the workers of a multi-node job that the agent, or a person, starts: one sandbox per
 node, started by the job's launcher (with `blaunch`), which stays outside.
 
 `torchrun`, NCCL and Ray need TCP between the job's nodes, which the default empty network forbids.
-There are two ways to give a worker that, and the queue decides which:
+`--host-net` gives a worker the node's own network. On a queue with InfiniBand, add `--ib`.
 
-| | `--job-nodes` | `--host-net` |
-| --- | --- | --- |
-| Network | a private one that reaches **the other nodes of this job only** | the node's own, unrestricted |
-| Other hosts, the internet, DNS | unreachable | reachable |
-| For | queues with InfiniBand (H100, H200, B300), with `--ib` | queues without it (L4, A100, RTX 6000) |
-| Speed | NCCL's data goes over InfiniBand directly: no loss measured | the node's own speed |
-| Files, credentials, environment | sandboxed as always | sandboxed as always |
+| | A worker with `--host-net` |
+| --- | --- |
+| Network | the node's own, unrestricted: other hosts, the internet and DNS are reachable, and other hosts can connect to the worker's ports |
+| Speed | the node's own |
+| Files, home directory, credentials, environment, processes | sandboxed as always |
+| Keys, tokens, job broker | none: `--host-net` refuses `--claude`, `--opencode`, `--csub` and `--allow` |
 
 ```bash
-# on each node, started by the launcher (torchrun over InfiniBand)
-sandbox-run.sh --gpu --ib --job-nodes --listen "$MASTER_PORT" --ro /groups/lab/venv -- ./worker.sh ...
+# on each node, started by the launcher (torchrun over InfiniBand: H100, H200, B300)
+sandbox-run.sh --gpu --host-net --ib --ro /groups/lab/venv -- ./worker.sh ...
 
-# the same job on an Ethernet queue
+# the same job on an Ethernet queue (L4, A100, RTX 6000)
 sandbox-run.sh --gpu --host-net --ro /groups/lab/venv -- ./worker.sh ...
 
 # with a container image instead (the image brings PyTorch and, for --ib, libibverbs)
-podman-run.sh --image "$IMAGE" --gpu --ib --job-nodes --listen "$MASTER_PORT" --rw /groups/lab/project -- /groups/lab/project/worker.sh ...
+podman-run.sh --image "$IMAGE" --gpu --host-net --ib --rw /groups/lab/project -- /groups/lab/project/worker.sh ...
 ```
 
-- **Where the node list comes from.** LSF: `--job-nodes` reads `$LSB_MCPU_HOSTS`, which LSF sets in
-  every task of the job. Nobody types it. `--peers HOST,HOST` names the nodes by hand, outside LSF;
-  inside an LSF job it accepts only nodes of that job.
-- **How `--job-nodes` limits the network.** The wrapper starts itself again under `pasta`, a
-  user-space relay (the `passt` package, which rootless podman also uses). The sandbox gets a
-  network namespace that carries the node's own address, with one route to each other node of the
-  job and no others, inside a nested user namespace, so the sandboxed process cannot add a route.
-  Nothing is filtered on the node: no nftables, no root.
-- **The same under podman.** podman starts `pasta` itself, with this wrapper's options. A hook
-  (`scripts/jobnet-hook.sh`) runs on the node after the network is set up and before the
-  container's command starts, and replaces the routes inside with one per node of the job. The
-  command runs without the capability to change them. `--job-nodes` refuses `--keep-id`, where
-  podman sets the network up too late for the hook. podman passes no host environment in, so the
-  worker script sets what it needs itself.
-- **Pull the image on every node first.** Each node keeps its own image store, and the 26 GB
-  image takes about two minutes to pull. When one node has it and another does not, the first
-  worker gives up waiting for the second (`torchrun`: `RendezvousTimeoutError`). A launcher
-  should run `podman pull` on every node with `blaunch` and wait, then start the workers.
-- **Ports.** Other nodes of the job can connect to a block of 2000 ports (13000-14999 on our
-  nodes). Each further sandbox of this kind on the same node takes the next block down, to
-  5000, so five fit on a node; a sixth is refused. A listener that lets the system pick its
-  port, which is what `torchrun` workers, NCCL and most of Ray do, gets one from the top 1500 of
-  the block and needs no flag. A port the launcher picked on the node needs `--listen PORT`
-  (`torchrun`'s master port). A program that wants fixed ports must take them from the lowest
-  500 of the block: for Ray, pass `--node-manager-port`, `--object-manager-port`, the agent
-  ports and `--min/--max-worker-port` inside it, and `--node-ip-address`. The block is named in
-  `$SANDBOX_README` inside the sandbox.
-- **Why `--host-net` exists.** Without InfiniBand, NCCL sends its data over TCP, through the
-  relay. A bandwidth test on two L4 nodes ran about 40 times slower that way (0.15 GB/s against
-  6 GB/s). `--host-net` gives full speed and no network limit. What the worker can send out is
-  what it can read: the project directory and the mounted inputs, no keys or tokens.
+- **What the network limit is.** There is none for a worker. What a worker can send out is what it
+  can read: the project directory and the mounted inputs. It holds no keys or tokens, and it
+  cannot submit jobs.
+- **Why not a network limited to the job's nodes.** That was built with `pasta`, a user-space
+  relay, and removed. NCCL over TCP ran 7 to 60 times slower through it (0.12 GB/s against 2.4 to
+  3.3 on two A100 nodes, 0.09 against 5.5 on two L4 nodes), and a filter in the node's kernel
+  would mean loading something on the nodes.
 - **`--ib`** binds `/dev/infiniband` and the sysfs entries NCCL reads. RDMA traffic does not pass
   through the sandbox's network, so `--ib` opens the InfiniBand fabric to the sandboxed process.
   Under podman the image must bring the user-space side (`libibverbs` and the mlx5 provider);
   `agentic-sandbox-gpu` does.
-- **"Connection reset by peer" in the first seconds is expected.** `pasta` accepts a connection
-  from another node before anything inside the sandbox listens on that port, and then drops it.
-  Without a sandbox the same attempt is refused. Programs that retry carry on: PyTorch logs a
-  warning with a stack trace for each attempt and then connects. It happens when a worker on
-  one node starts a moment before the process it connects to on another.
-- **Refused together.** `--job-nodes` and `--host-net` each refuse `--allow`, `--csub`, `--claude`
-  and `--opencode`, so one flag cannot give an agent, or its job broker, a wider network. `--ib`
-  refuses `--csub`, `--claude` and `--opencode` for the same reason. `--host-net` refuses `--ib`:
-  a job on InfiniBand takes `--job-nodes --ib` and keeps its network limited.
-- **Connections in** are accepted from the job's nodes only. What another host sends to those
-  ports does not reach the sandboxed program.
-- **What it tells the agent.** `$SANDBOX_README` lists the reachable nodes, this node's address
-  and the ports, or says that the network is the node's own.
+- **Under podman** `--host-net` is `--network=host`, with the node's own `/etc/hosts` inside.
+  podman passes no host environment in, so the worker script sets what it needs itself.
+- **Pull the image on every node first.** Each node keeps its own image store, and the 26 GB
+  image takes about two minutes to pull. When one node has it and another does not, the first
+  worker gives up waiting for the second (`torchrun`: `RendezvousTimeoutError`). A launcher
+  should run `podman pull` on every node with `blaunch` and wait, then start the workers.
+- **Refused together.** `--host-net` refuses `--allow`, `--csub`, `--claude` and `--opencode`, so
+  one flag cannot give an agent, or its job broker, an open network. `--ib` refuses `--csub`,
+  `--claude` and `--opencode` for the same reason.
+- **What it tells the agent.** `$SANDBOX_README` says that the network is the node's own and
+  that it is for the job's nodes only.
 
-Measured: two H200 nodes, 16 GPUs,
-482 GB/s sustained inside `--job-nodes --ib` against 483 GB/s unsandboxed, with either wrapper;
-four H100 nodes, 32 GPUs, 378 (Bubblewrap) and 379 GB/s (podman) against 378 unsandboxed; two L4
-nodes, 6.3 GB/s inside `--host-net` against 6.4 to 6.7 GB/s unsandboxed.
+Measured with a bandwidth test across all GPUs of two nodes, inside `--host-net`: 6.3 GB/s on
+L4 against 6.4 to 6.7 GB/s unsandboxed, and 2.4 to 3.4 GB/s on A100, with either wrapper.
 
 ## What it does and does not protect against
 
@@ -594,7 +565,8 @@ Assuming the agent is fully adversarial, it **is** stopped from:
 
 - Reading or writing anything outside the bound paths, including `$HOME` and other users' data.
 - Reading credential files directly under bound paths (bwrap).
-- Reaching any host not on the allowlist.
+- Reaching any host not on the allowlist (the workers of a multi-node job, started with
+  `--host-net`, are on the node's own network: see "Multi-node jobs").
 - Reading secrets from your environment (bwrap clears it; podman forwards none).
 - Changing your *user-level* Claude Code or opencode configuration (it works on copies).
 - Submitting cluster jobs except through a policy-checked broker, and then only sandboxed ones.
@@ -649,12 +621,9 @@ podman-run.sh  [options] -- <command...>          # podman: a container image
   --opencode      Per-job copy of ~/.config/opencode, data dirs bound rw, CLI on PATH
   --gpu           bind the job's allocated GPU(s) (bwrap: device nodes + read-only /sys/{devices,module}; podman:
                   --device nvidia.com/gpu=all); an error in a job without a GPU
-  --job-nodes     one worker of a multi-node job: a private network that reaches the
-                  job's other nodes only (from LSF); --peers HOST,HOST names them by hand
-  --listen PORT   (with --job-nodes) also accept the job's nodes on PORT (repeatable)
-  --host-net      one worker of a multi-node job on a queue without InfiniBand:
-                  the node's own network, unrestricted
-  --ib            bind the InfiniBand (RDMA verbs) devices
+  --host-net      one worker of a multi-node job: the node's own network, unrestricted
+  --ib            bind the InfiniBand (RDMA verbs) devices (with --host-net on an
+                  InfiniBand queue)
   --shm-size SIZE (podman-run.sh) size of /dev/shm (512m, 8g); default 8g with --gpu, else 64 MB
   --keep-id       (podman-run.sh) run as your real uid/gid instead of container-root
   --image NAME    (podman-run.sh) any OCI image; default agentic-sandbox-lite
@@ -678,7 +647,7 @@ Six suites in `tests/`:
 | `test-podman.sh` | `podman-run.sh` | from a GPU job |
 | `test-proxy.py` | the allowlist proxy | anywhere (`python3 tests/test-proxy.py`); also on every push (GitHub Actions) |
 | `test-csub-policy.sh` | `csub-policy.sh` | anywhere (`bash tests/test-csub-policy.sh`); also on every push. It uses a stand-in for csub's sample policy, so it covers the edits and the refusals, not csub's reading of the result |
-| `test-multinode.sh` | `--job-nodes`, `--peers`, `--listen`, `--host-net` | as the job script of a two-node LSF job, from a shared directory: `bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o out tests/test-multinode.sh`. No GPU needed; `--ib` is not covered. With `SANDBOX_WRAPPER=podman-run.sh` in the environment of the `bsub` command (and `-W 30`) the same checks run against `podman-run.sh` |
+| `test-multinode.sh` | `--host-net` | as the job script of a two-node LSF job, from a shared directory: `bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o out tests/test-multinode.sh`. No GPU needed; `--ib` is not covered. With `SANDBOX_WRAPPER=podman-run.sh` in the environment of the `bsub` command (and `-W 30`) the same checks run against `podman-run.sh` |
 | `test-array.sh` | many elements of one LSF array job on one node, each in its own sandbox | as the elements of an array job plus a check job, all on one node (the commands are in its header). No GPU needed. With `SANDBOX_WRAPPER=podman-run.sh` for podman |
 
 `ssh-entry.sh` has no suite: it needs sshd, a key line and LSF together, and has been tested by hand.
@@ -755,9 +724,9 @@ that come from somewhere else.
   not affected.
 - `sandbox-run.sh` refuses to run from `$HOME` or a directory above it (the working directory is
   bound read-write). Run it from a project directory.
-- Multi-node workers: `podman-run.sh --job-nodes` does not work with `--keep-id`. `--job-nodes` is
-  too slow where the data travels over TCP (use `--host-net` there). Tested on whole nodes: two
-  H200, four H100, two L4; not on more than four nodes, on B300, A100 or RTX 6000, or with other
-  jobs sharing the node. `podman-run.sh --host-net` on an Ethernet queue is not measured yet. csub has no multi-node job type, so an agent cannot yet submit one.
+- Multi-node workers are on the node's own network, not limited (see "Multi-node jobs"). Tested
+  on whole nodes: two L4 and two A100. `--host-net --ib` is not yet run on InfiniBand nodes
+  (H100, H200, B300), and nothing is run on RTX 6000, on more than two nodes, or with other jobs
+  sharing the node. csub has no multi-node job type, so an agent cannot yet submit one.
 - Not tested: a fresh `claude auth login` combined with the one-shot or loop modes.
 

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Runs inside one sandbox of tests/test-multinode.sh, once per node.
 
-usage: multinode-probe.py OUTDIR MY_ADDR ADDR[,ADDR...] OUTSIDER_ADDR
+usage: multinode-probe.py OUTDIR MY_ADDR ADDR[,ADDR...]
 
 Listens on a port the system picks, publishes it in OUTDIR, connects to every other node's
-listener, accepts their connections, and then tries what must fail: a host outside the job,
-the internet, a DNS lookup, a route change. Prints one MARKER line per check.
+listener, accepts their connections, and checks the node's own name and that the home
+directory is hidden. Prints one MARKER line per check.
 """
 import os
 import socket
-import subprocess
 import sys
 import time
 
-out, me, addrs, outsider = sys.argv[1], sys.argv[2], sys.argv[3].split(","), sys.argv[4]
+out, me, addrs = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
 host = socket.gethostname().split(".")[0]
 
 
@@ -55,35 +54,13 @@ for _ in others:
     except Exception as e:  # noqa: BLE001
         say("PEER_IN_BAD", e)
 
-for target, tport in ((outsider, 22), ("1.1.1.1", 443)):
-    try:
-        socket.create_connection((target, tport), timeout=5).close()
-        say("OUTSIDER_BAD", target, "connects")
-    except OSError as e:
-        say("OUTSIDER_BLOCKED", target, e.strerror or e)
-
+# The node's own name must resolve to the node's address: torchrun hands that name to the other
+# nodes as the master's.
 try:
-    socket.getaddrinfo("example.org", 80)
-    say("DNS_BAD", "a lookup worked")
-except OSError:
-    say("DNS_BLOCKED")
+    name = socket.getfqdn()
+    say("NAME_OK" if "containers.internal" not in name and socket.gethostbyname(name) == me else "NAME_BAD", name)
+except OSError as e:
+    say("NAME_BAD", e)
 
-try:
-    say("HOSTS_OK" if socket.gethostbyaddr(others[0])[0] else "HOSTS_BAD")
-except Exception as e:  # noqa: BLE001
-    say("HOSTS_BAD", e)
-
-try:
-    r = subprocess.run(["/usr/sbin/ip", "route", "add", "1.1.1.1/32", "dev", "lo"], capture_output=True)
-    say("ROUTE_REFUSED" if r.returncode != 0 else "ROUTE_BAD")
-except FileNotFoundError:
-    # An image without iproute2. The kernel checks the permission before it looks at the request,
-    # so an empty "add route" request tells the same: EPERM without the right, EINVAL with it.
-    import errno
-    import fcntl
-
-    try:
-        fcntl.ioctl(socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0x890B, bytes(120))  # SIOCADDRT
-        say("ROUTE_BAD", "accepted")
-    except OSError as e:
-        say("ROUTE_REFUSED" if e.errno == errno.EPERM else "ROUTE_BAD", e.strerror)
+home = os.path.expanduser("~")
+say("HOME_HIDDEN" if not os.path.exists(os.path.join(home, ".ssh")) else "HOME_VISIBLE")
