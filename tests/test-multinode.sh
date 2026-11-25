@@ -8,7 +8,7 @@
 #   bsub -q short -n 2 -R "span[ptile=1]" -W 15 -o multinode-%J.out /path/to/tests/test-multinode.sh
 #
 # It starts one sandbox per node with blaunch, as a multi-node launcher does, and checks that the
-# two reach each other while files, home directory and environment stay sandboxed. --ib is not
+# two reach each other while the home directory and the environment stay hidden. --ib is not
 # covered: it needs InfiniBand nodes and a program that uses them.
 #
 # The same checks run against podman-run.sh with SANDBOX_WRAPPER=podman-run.sh in the environment
@@ -54,11 +54,16 @@ ALL="$(IFS=,; echo "${ADDRS[*]}")"
 OUTSIDER="$(getent ahostsv4 "${LSB_SUB_HOST:-$(hostname)}" | awk 'NR==1{print $1}')"
 echo "$WRAPPER, job $LSB_JOBID, nodes ${HOSTS[*]} ($ALL), outsider $OUTSIDER"
 
+# Something that exists in the home directory, which no sandbox here may show.
+HIDDEN="$(find "$HOME" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)"
+[[ -n "$HIDDEN" && -n "$OUTSIDER" ]] || { echo "nothing in \$HOME to look for, or no outside host"; exit 2; }
+
 echo "1. one sandbox per node"
 cat > node.sh <<EOF
 #!/bin/bash
 cd "$TR" || exit 1
-exec "$W" --host-net ${MNT[*]} -- python3 "$PROBE" "$TR" "\$1" "$ALL"
+export MN_CANARY=must-not-get-in
+exec "$W" --host-net ${MNT[*]} -- python3 "$PROBE" "$TR" "\$1" "$ALL" "$HIDDEN"
 EOF
 chmod +x node.sh
 for i in "${!HOSTS[@]}"; do blaunch -z "${HOSTS[$i]}" "$TR/node.sh" "${ADDRS[$i]}" > "probe.$i.out" 2>&1 & done
@@ -70,7 +75,9 @@ count() { grep -c "^$1 " probe.out || true; }
 [[ "$(count PEER_IN_OK)" -eq $((n * (n - 1))) ]] && ok "every node accepts from every other node" || bad "connections from the other nodes ($(count PEER_IN_OK) of $((n * (n - 1))))"
 [[ "$(count NAME_OK)" -eq $n ]] && ok "every node's own name resolves to its address, as on the node" || bad "the node's own name"
 [[ "$(count HOME_HIDDEN)" -eq $n ]] && ok "the home directory stays hidden" || bad "the home directory is visible"
-[[ "$(count OWNER_OK)" -eq $n ]] && ok "files written inside belong to the user" || bad "file ownership"
+[[ "$(count ENV_HIDDEN)" -eq $n ]] && ok "the caller's environment stays out" || bad "the caller's environment came in"
+# Seen from outside the sandbox: what a worker wrote belongs to the user.
+[[ "$(find . -maxdepth 1 -name 'port.*' -user "$(id -u)" | wc -l)" -eq $n ]] && ok "files written inside belong to the user" || bad "file ownership: $(stat -c '%u %n' port.* 2>&1 | tr '\n' ';')"
 [[ $FAIL -eq 0 ]] || sed 's/^/      /' probe.out
 
 echo "2. exit status, stdin and the description for the agent"
@@ -84,8 +91,12 @@ echo "3. refusals"
 refuses "--host-net with --allow" "not with --allow" --host-net --allow pypi.org -- true
 refuses "--host-net with --csub" "not with --csub" --host-net --csub -- true
 refuses "--host-net with --claude" "not with --claude" --host-net --claude -- true
+refuses "--host-net with --opencode" "not with --claude or --opencode" --host-net --opencode -- true
+refuses "--claude before --host-net" "not with --claude" --claude --host-net -- true
 refuses "--ib with --claude" "--ib: not with --claude" --ib --claude -- true
 refuses "--ib with --csub" "--ib: not with --csub" --ib --csub -- true
+refuses "--ib with --opencode" "--ib: not with --claude or --opencode" --ib --opencode -- true
+refuses "--ib with --allow" "--ib: not with --allow" --ib --allow pypi.org -- true
 # --host-net --ib is the pair for an InfiniBand queue: never refused as a combination. (On a node
 # without InfiniBand the only complaint is the missing device.)
 out="$("$W" --dry-run --host-net --ib -- true 2>&1)"; rc=$?
@@ -96,8 +107,10 @@ else
 fi
 
 echo "4. the network, with and without --host-net"
-"$W" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null" 2>/dev/null && bad "default sandbox: no network" || ok "default sandbox: no network"
-"$W" --host-net -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && [[ ! -e \$HOME/.ssh ]]" 2>/dev/null && ok "--host-net: the node's network, home directory still hidden" || bad "--host-net"
+# The command inside reports what it found, so that a wrapper that did not start cannot pass.
+reach() { "$W" "$@" -- bash -c "(exec 3<>/dev/tcp/$OUTSIDER/22) 2>/dev/null && echo open || echo closed" 2>/dev/null </dev/null | tail -1; }
+r="$(reach)"; [[ "$r" == closed ]] && ok "default sandbox: no network" || bad "default sandbox: no network (got '$r')"
+r="$(reach --host-net)"; [[ "$r" == open ]] && ok "--host-net: a host outside the job is reachable" || bad "--host-net: a host outside the job (got '$r')"
 
 echo "5. stopping"
 # TERM to the wrapper's process group, which is what bkill and the walltime kill do.

@@ -27,7 +27,7 @@ it explains.
 | On your laptop, with the work on the cluster | `scripts/ssh-entry.sh` behind a dedicated ssh key | [An agent on your laptop](#an-agent-on-your-laptop-the-work-on-the-cluster-ssh-entrysh) |
 
 **In short:** the agent sees only the directories you bind in (the one you start from is read-write),
-reaches only hosts you `--allow`, sees none of your shell environment, and works on a throwaway copy of
+reaches only hosts you `--allow` (the workers of a [multi-node job](#multi-node-jobs---host-net---ib) are the exception), sees none of your shell environment, and works on a throwaway copy of
 its own config. What it writes into a read-write directory outlasts the job; see [what it does and does
 not protect against](#what-it-does-and-does-not-protect-against).
 
@@ -509,18 +509,19 @@ what the node has installed, which varies, or on a venv you build (see "Dependen
 ## Multi-node jobs (`--host-net`, `--ib`)
 
 Both wrappers take the same flags. The agent itself stays in the ordinary single-node sandbox. These
-flags are for the workers of a multi-node job that the agent, or a person, starts: one sandbox per
-node, started by the job's launcher (with `blaunch`), which stays outside.
+flags are for the workers of a multi-node job: one sandbox per node, started by the job's launcher
+(with `blaunch`), which stays outside. Today a person submits such a job. An agent will be able
+to once csub has a multi-node job type.
 
 `torchrun`, NCCL and Ray need TCP between the job's nodes, which the default empty network forbids.
 `--host-net` gives a worker the node's own network. On a queue with InfiniBand, add `--ib`.
 
 | | A worker with `--host-net` |
 | --- | --- |
-| Network | the node's own, unrestricted: other hosts, the internet and DNS are reachable, and other hosts can connect to the worker's ports |
+| Network | the node's own, unrestricted: whatever the node reaches, the worker reaches (other hosts, the internet, DNS, services on the node itself), and other hosts can connect to the worker's ports |
 | Speed | the node's own |
 | Files, home directory, credentials, environment, processes | sandboxed as always |
-| Keys, tokens, job broker | none: `--host-net` refuses `--claude`, `--opencode`, `--csub` and `--allow` |
+| Keys, tokens, job broker | none from the wrapper: `--host-net` refuses `--claude`, `--opencode`, `--csub` and `--allow`. What you pass with `--env` or mount is there |
 
 ```bash
 # on each node, started by the launcher (torchrun over InfiniBand: H100, H200, B300)
@@ -534,11 +535,21 @@ podman-run.sh --image "$IMAGE" --gpu --host-net --ib --rw /groups/lab/project --
 ```
 
 - **What the network limit is.** There is none for a worker. What a worker can send out is what it
-  can read: the project directory and the mounted inputs. It holds no keys or tokens, and it
-  cannot submit jobs.
+  can read: the project directory, the mounted inputs, and any variable you pass with `--env`.
+  The wrapper gives it no keys or tokens and no job broker, so pass none and mount none that
+  the job does not need.
+- **The launcher** is the job script. It runs outside the sandbox, as you, so it must not be
+  something an agent wrote unread. For each node it starts a small script with
+  `blaunch -z HOST`, and that script changes to the project directory and runs the wrapper.
+  LSF sets `CUDA_VISIBLE_DEVICES` in each such task, which is what `--gpu` reads. Both wrappers
+  start the command with an empty environment: what a worker needs (the rendezvous address,
+  the node's rank) goes in as arguments, with `--env` (`sandbox-run.sh`), or is set in the
+  worker script. The `torchrun` and Ray launchers in
+  [gpu-cluster-recipes](https://github.com/JaneliaScientificComputingSystems/gpu-cluster-recipes)
+  do this with `--sandbox=bwrap|podman`.
 - **Why not a network limited to the job's nodes.** That was built with `pasta`, a user-space
-  relay, and removed. NCCL over TCP ran 7 to 60 times slower through it (0.12 GB/s against 2.4 to
-  3.3 on two A100 nodes, 0.09 against 5.5 on two L4 nodes), and a filter in the node's kernel
+  relay, and removed. NCCL over TCP ran 20 to 60 times slower through it (0.12 GB/s against 2.4 to
+  3.4 on two A100 nodes, 0.09 against 5.5 on two L4 nodes), and a filter in the node's kernel
   would mean loading something on the nodes.
 - **`--ib`** binds `/dev/infiniband` and the sysfs entries NCCL reads. RDMA traffic does not pass
   through the sandbox's network, so `--ib` opens the InfiniBand fabric to the sandboxed process.
@@ -550,15 +561,16 @@ podman-run.sh --image "$IMAGE" --gpu --host-net --ib --rw /groups/lab/project --
   image takes about two minutes to pull. When one node has it and another does not, the first
   worker gives up waiting for the second (`torchrun`: `RendezvousTimeoutError`). A launcher
   should run `podman pull` on every node with `blaunch` and wait, then start the workers.
-- **Refused together.** `--host-net` refuses `--allow`, `--csub`, `--claude` and `--opencode`, so
-  one flag cannot give an agent, or its job broker, an open network. `--ib` refuses `--csub`,
-  `--claude` and `--opencode` for the same reason.
-- **What it tells the agent.** `$SANDBOX_README` says that the network is the node's own and
-  that it is for the job's nodes only.
+- **Refused together.** `--host-net` and `--ib` each refuse `--allow`, `--csub`, `--claude` and
+  `--opencode`: the wrapper's own agent set-up and job broker never run on an open network or
+  with the InfiniBand devices. The flags are for a job's workers: do not run an agent in
+  such a sandbox, and do not put them in an `ssh-entry.sh` key line.
+- **What it tells the program inside.** `$SANDBOX_README` says that the network is the node's
+  own and not limited, and asks that it be used for the job's nodes only.
 
-Measured with a bandwidth test across all GPUs of two nodes, inside `--host-net`: 6.3 GB/s on
-L4 against 6.4 to 6.7 GB/s unsandboxed, 2.4 to 3.4 GB/s on A100 and 7.7 to 8.0 GB/s on RTX 6000,
-with either wrapper. On two H200 nodes with `--host-net --ib`, NCCL used InfiniBand on all
+Measured with a bandwidth test across all GPUs of two nodes, inside `--host-net`: 5.5 to 6.3 GB/s
+on L4 against 6.4 to 6.7 GB/s unsandboxed, 2.4 to 3.4 GB/s on A100 and 7.7 to 8.0 GB/s on RTX
+6000, with either wrapper. On two H200 nodes with `--host-net --ib`, NCCL used InfiniBand on all
 eight ports and no socket transport, with either wrapper.
 
 ## What it does and does not protect against
@@ -590,8 +602,9 @@ It is **not** stopped from:
 - **Making syscalls the kernel allows an unprivileged user** (bwrap installs no seccomp filter).
 - **Reading the node's hardware inventory with `sandbox-run.sh --gpu`**: `/sys/devices` and
   `/sys/module` are visible read-only (PCI topology, NICs and MACs, DMI strings). Without `--gpu`
-  there is no `/sys` at all. (The multi-node flags bind `/sys/devices` and the network and PCI
-  entries as well.)
+  there is no `/sys` at all. (The multi-node flags show more: `sandbox-run.sh` binds
+  `/sys/devices` and the network and PCI entries, and `podman-run.sh --host-net` has the node's
+  whole `/sys`, read-only.)
 - Your own mistakes in Mode C: a human is present and the sandbox limits damage but doesn't review.
 
 ## Running under LSF

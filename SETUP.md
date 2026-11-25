@@ -65,7 +65,8 @@ image is about 2 GB; the PyTorch one 26 GB). If you'd rather trade that for a du
 point `graphroot`/`runroot` at a path under `$HOME`.
 
 No `podman login` or `podman pull` is needed: the images are public and `podman-run.sh` checks
-for a newer one on every run.
+for a newer one on every run. (A multi-node launcher pulls on every node first; see "Multi-node
+jobs" in the README.)
 
 ## 4. Claude Code
 

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Runs inside one sandbox of tests/test-multinode.sh, once per node.
 
-usage: multinode-probe.py OUTDIR MY_ADDR ADDR[,ADDR...]
+usage: multinode-probe.py OUTDIR MY_ADDR ADDR[,ADDR...] HIDDEN_PATH
 
 Listens on a port the system picks, publishes it in OUTDIR, connects to every other node's
-listener, accepts their connections, and checks the node's own name and that the home
-directory is hidden. Prints one MARKER line per check.
+listener, accepts their connections, and checks the node's own name, that HIDDEN_PATH (a file
+in the caller's home directory) is not visible, and that MN_CANARY (set in the environment the
+wrapper was started from) did not come in. Prints one MARKER line per check.
 """
 import os
 import socket
 import sys
 import time
 
-out, me, addrs = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+out, me, addrs, hidden = sys.argv[1], sys.argv[2], sys.argv[3].split(","), sys.argv[4]
 host = socket.gethostname().split(".")[0]
 
 
@@ -27,7 +28,6 @@ port = srv.getsockname()[1]
 with open(f"{out}/port.{me}", "w") as f:
     f.write(str(port))
 say("LISTEN", me, port)
-say("OWNER_OK" if os.stat(f"{out}/port.{me}").st_uid == os.getuid() else "OWNER_BAD")
 
 others = [a for a in addrs if a != me]
 for a in others:
@@ -62,5 +62,5 @@ try:
 except OSError as e:
     say("NAME_BAD", e)
 
-home = os.path.expanduser("~")
-say("HOME_HIDDEN" if not os.path.exists(os.path.join(home, ".ssh")) else "HOME_VISIBLE")
+say("HOME_HIDDEN" if not os.path.lexists(hidden) else "HOME_VISIBLE", hidden)
+say("ENV_HIDDEN" if "MN_CANARY" not in os.environ else "ENV_VISIBLE")

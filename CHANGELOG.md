@@ -11,8 +11,8 @@ behind each change.
 - **`--ib`** (both wrappers): binds the InfiniBand devices and the sysfs entries NCCL reads.
   With `--host-net` for a multi-node job on an InfiniBand queue. Under podman it relies on
   `libibverbs` and the mlx5 provider in the image.
-- Both are for a job's workers, not for the agent: each refuses `--claude`, `--opencode` and
-  `--csub`, and `--host-net` refuses `--allow`. Nothing changes for existing uses.
+- Both are for a job's workers, not for the agent: each refuses `--claude`, `--opencode`,
+  `--csub` and `--allow`. Nothing changes for existing uses.
 - **`tests/test-multinode.sh`** (new) tests `--host-net` as a two-node LSF job, for either
   wrapper.
 

@@ -13,7 +13,8 @@
 #   --allow HOST         Allowed egress domain (repeatable). Starts the allowlist
 #                         proxy + in-sandbox relay automatically; sets
 #                         http_proxy/https_proxy inside the sandboxed command.
-#                         Omit entirely for a fully network-less sandbox.
+#                         Omit entirely for a fully network-less sandbox (--host-net, for
+#                         the workers of a multi-node job, is the one other network).
 #   --env NAME            Pass host environment variable NAME into the sandbox (repeatable).
 #                         The host environment is NOT inherited by default -- see below.
 #   --csub                Let the sandboxed agent submit LSF jobs through csub
@@ -44,7 +45,8 @@
 #                         read-only, the sysfs entries NCCL and libibverbs read. Verbs traffic
 #                         does not pass through the sandbox's network, so this opens the
 #                         InfiniBand fabric to the sandboxed process whatever else is closed.
-#                         With --host-net for a multi-node job on an InfiniBand queue.
+#                         With --host-net for a multi-node job on an InfiniBand queue. Not
+#                         with --allow, --csub, --claude or --opencode.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
 #                          copy of ~/.claude.json, ~/.claude/settings.json and
 #                          ~/.claude/CLAUDE.md, with only ~/.claude/.credentials.json bound
@@ -92,12 +94,12 @@
 # stays outside. torchrun, NCCL and Ray need TCP between the job's nodes, which the default empty
 # network forbids. --host-net leaves the network namespace alone: the worker is on the node's own
 # network, at full speed, and nothing here limits where it connects or who connects to it. Files,
-# credentials, environment and processes are sandboxed as always. A worker holds no key, no
-# token and no job broker, so what it can send out is what it can read: the project directory
-# and the mounted inputs. On an InfiniBand queue add --ib: NCCL's data then goes over RDMA verbs
-# directly (measured: no difference to an unsandboxed job on H200 nodes).
+# credentials, environment and processes are sandboxed as always. The wrapper gives a worker no
+# key, no token and no job broker, so what it can send out is what it can read: the project
+# directory, the mounted inputs and what you pass with --env. On an InfiniBand queue add --ib:
+# NCCL's data then goes over RDMA verbs directly.
 #   A private network limited to the job's nodes was tried (a user-space relay, pasta) and
-#   dropped: NCCL over TCP ran 7 to 60 times slower through it, and nothing may be loaded on the
+#   dropped: NCCL over TCP ran 20 to 60 times slower through it, and nothing may be loaded on the
 #   nodes to filter in the kernel.
 #
 # Config isolation (--claude/--opencode): the harness's *configuration* is where a
@@ -292,6 +294,7 @@ fi
 if [[ $WANT_IB -eq 1 ]]; then
   # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
   _why=""
+  [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow"
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }

@@ -20,7 +20,8 @@
 #   --rw PATH       Read-write bind (repeatable): -v PATH:PATH:rw
 #   --allow HOST    Allowed egress domain (repeatable). Starts the allowlist proxy + relay
 #                   automatically, same mechanism as sandbox-run.sh. Omit for --network=none
-#                   with no exceptions.
+#                   with no exceptions (--host-net, for the workers of a multi-node job, is
+#                   the one other network).
 #   --csub          Let the sandboxed agent submit LSF jobs through csub: starts
 #                    `csub-broker --serve` OUTSIDE the container, mounts its socket at
 #                    /run/csub.sock and the csub client read-only, sets CSUB_TRANSPORT/
@@ -72,11 +73,13 @@
 #                    blaunch): the node's own network (--network=host), unrestricted. Not
 #                    with --allow, --csub, --claude or --opencode. See "Multi-node jobs" below.
 #   --ib            Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and the
-#                    sysfs entries libibverbs reads. The IMAGE must bring the user-space side
+#                    sysfs entries libibverbs reads (with --host-net the node's whole /sys is
+#                    visible, read-only). The IMAGE must bring the user-space side
 #                    (libibverbs and the mlx5 provider: rdma-core / ibverbs-providers). Verbs
 #                    traffic does not pass through the container's network, so this opens the
 #                    InfiniBand fabric to the container whatever else is closed. With
-#                    --host-net for a multi-node job on an InfiniBand queue.
+#                    --host-net for a multi-node job on an InfiniBand queue. Not with
+#                    --allow, --csub, --claude or --opencode.
 #   --dry-run       Do every check, start no container, proxy or broker and pull no image, and
 #                    print the podman command and the host-side helpers a real run would use.
 #                    The checks themselves ask podman about its stores.
@@ -312,6 +315,7 @@ fi
 if [[ $WANT_IB -eq 1 ]]; then
   # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
   _why=""
+  [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow"
   [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
   [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
   [[ -z "$_why" ]] || { echo "podman-run.sh: --ib: not with $_why" >&2; exit 1; }
