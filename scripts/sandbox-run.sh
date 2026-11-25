@@ -35,6 +35,16 @@
 #                         read-only /sys/{devices,module}; needs nvidia-smi on the host.
 #   --scratch             Shorthand for --rw /scratch/$USER/work (created if missing).
 #                         Deliberately NOT all of /scratch/$USER -- see "Per-job state" below.
+#   --host-net            For one worker of a multi-node LSF job (started once per node, e.g. by
+#                         blaunch): the node's own network, unrestricted. Files, credentials,
+#                         environment and processes are sandboxed as always; the network is
+#                         not. Not with --allow, --csub, --claude or --opencode. See
+#                         "Multi-node jobs" below.
+#   --ib                  Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and,
+#                         read-only, the sysfs entries NCCL and libibverbs read. Verbs traffic
+#                         does not pass through the sandbox's network, so this opens the
+#                         InfiniBand fabric to the sandboxed process whatever else is closed.
+#                         With --host-net for a multi-node job on an InfiniBand queue.
 #   --claude               Run Claude Code with a per-job config directory: a throwaway
 #                          copy of ~/.claude.json, ~/.claude/settings.json and
 #                          ~/.claude/CLAUDE.md, with only ~/.claude/.credentials.json bound
@@ -77,6 +87,18 @@
 # readable by the sandboxed agent even though the credential FILES are masked.
 # /tmp inside the sandbox is a private tmpfs (TMPDIR points at it). When stdin is not a
 # terminal (Mode A/B, plain bsub) the sandbox also gets its own session (--new-session).
+#
+# Multi-node jobs (--host-net, --ib): one sandbox per node, started by the job's launcher, which
+# stays outside. torchrun, NCCL and Ray need TCP between the job's nodes, which the default empty
+# network forbids. --host-net leaves the network namespace alone: the worker is on the node's own
+# network, at full speed, and nothing here limits where it connects or who connects to it. Files,
+# credentials, environment and processes are sandboxed as always. A worker holds no key, no
+# token and no job broker, so what it can send out is what it can read: the project directory
+# and the mounted inputs. On an InfiniBand queue add --ib: NCCL's data then goes over RDMA verbs
+# directly (measured: no difference to an unsandboxed job on H200 nodes).
+#   A private network limited to the job's nodes was tried (a user-space relay, pasta) and
+#   dropped: NCCL over TCP ran 7 to 60 times slower through it, and nothing may be loaded on the
+#   nodes to filter in the kernel.
 #
 # Config isolation (--claude/--opencode): the harness's *configuration* is where a
 # prompt-injected agent can persist: ~/.claude/settings.json hooks and ~/.claude.json MCP
@@ -158,6 +180,8 @@ WANT_CSUB=0
 PROTECT=1
 DRY_RUN=0
 WANT_GPU=0
+WANT_IB=0
+WANT_HOSTNET=0    # --host-net
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 CLAUDE_HISTORY=""   # "", ro or rw: --claude-history[-rw]
@@ -203,6 +227,8 @@ while [[ $# -gt 0 ]]; do
       PASS_ENV+=("$2"); shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --gpu) WANT_GPU=1; shift ;;
+    --ib) WANT_IB=1; shift ;;
+    --host-net) WANT_HOSTNET=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; RW_BINDS+=("$(realpath "/scratch/$USER/work")"); shift ;;
     --claude)
       WANT_CLAUDE=1
@@ -250,6 +276,26 @@ if [[ ${#CMD[@]} -eq 0 ]]; then
 fi
 if [[ -n "$CLAUDE_HISTORY" && $WANT_CLAUDE -eq 0 ]]; then
   echo "sandbox-run.sh: --claude-history needs --claude (the history is bound into the per-job Claude config)" >&2; exit 1
+fi
+
+# --host-net and --ib (see "Multi-node jobs" in the header): for the workers of a multi-node job.
+# Checked before anything is created, so a refusal here leaves nothing behind.
+if [[ $WANT_HOSTNET -eq 1 ]]; then
+  # One flag must not be enough to run an agent itself, or its job broker, with an open network.
+  _why=""
+  [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "sandbox-run.sh: --host-net: not with $_why" >&2; exit 1; }
+  echo "sandbox-run.sh: --host-net: this sandbox shares the node's network; nothing limits where it connects" >&2
+fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
+  _why=""
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "sandbox-run.sh: --ib: not with $_why" >&2; exit 1; }
+  [[ -d /dev/infiniband ]] || { echo "sandbox-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1; }
 fi
 
 # --gpu: resolve the job's GPUs to device nodes now, before anything is created, so the common
@@ -399,9 +445,11 @@ BWRAP_ARGS=(
   # --unshare-pid is also what cleans up: when bwrap's process 1 exits, the kernel kills
   # everything left in the namespace. Without it the in-sandbox relay (relay.py) outlived the
   # command and stayed on the node after the job.
-  --proc /proc --dev /dev --unshare-net --unshare-pid --unshare-ipc --unshare-uts
+  # The network: --unshare-net is added just below, except for a multi-node worker.
+  --proc /proc --dev /dev --unshare-pid --unshare-ipc --unshare-uts
   --die-with-parent
 )
+[[ $WANT_HOSTNET -eq 1 ]] || BWRAP_ARGS+=(--unshare-net)
 # After --dev /dev (mounts apply in order): the GPU device nodes, and the job's device numbering.
 if [[ ${#GPU_BINDS[@]} -gt 0 ]]; then
   BWRAP_ARGS+=("${GPU_BINDS[@]}")
@@ -515,6 +563,29 @@ if [[ -n "${PYTHONPATH:-}" ]]; then
   done
   if [[ -n "$_pp" ]]; then export PYTHONPATH="$_pp"; else unset PYTHONPATH; fi
   unset _pp _ppe _e
+fi
+
+# Multi-node workers: the sysfs entries NCCL and libibverbs read, all read-only. Through add_bind
+# like everything else here, so that a --ro or --rw of yours above one of them (/sys, /etc) cannot
+# cover it, and a deeper one of yours keeps its own mode.
+#   /sys/class/net: NCCL sizes its socket transport from the interface's speed. Without it a
+#   bandwidth test over Ethernet ran about 27% slower inside the sandbox than outside.
+#   /sys/bus/pci, /sys/class/pci_bus: NCCL decides that a NIC is a PCI device by following
+#   <device>/subsystem into /sys/bus/pci. Without them InfiniBand comes up, NCCL logs "network
+#   path ... is not a PCI device", and the job dies with "Could not find NET with id 0" (verified
+#   live, NCCL 2.27.3 on H200 nodes).
+if [[ $WANT_IB -eq 1 || $WANT_HOSTNET -eq 1 ]]; then
+  [[ $WANT_GPU -eq 1 ]] || add_bind --ro-bind /sys/devices     # --gpu has bound it already
+  for d in /sys/class/net /sys/bus/pci /sys/class/pci_bus; do
+    [[ -e "$d" ]] && add_bind --ro-bind "$d"
+  done
+fi
+# --ib: the verbs devices and their class entries.
+if [[ $WANT_IB -eq 1 ]]; then
+  add_bind --dev-bind /dev/infiniband
+  for d in /sys/class/infiniband /sys/class/infiniband_verbs; do
+    [[ -e "$d" ]] && add_bind --ro-bind "$d"
+  done
 fi
 
 # This wrapper, allowlist_proxy.py and relay.py run on the HOST (or are the trusted half of
@@ -1100,8 +1171,14 @@ write_sandbox_readme() {
       echo "- Only these hosts are reachable, over HTTP(S) through a proxy already configured in http_proxy/https_proxy:"
       for h in "${ALLOW_HOSTS[@]}"; do echo "  - $h (and its subdomains)"; done
       echo "- Everything else (other hosts, raw TCP, ssh, package registries not listed) fails. Do not retry or look for a route; ask the user."
+    elif [[ $WANT_HOSTNET -eq 1 ]]; then
+      echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
+      echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."
     else
       echo "- No network at all. Every connection attempt fails by design."
+    fi
+    if [[ $WANT_IB -eq 1 ]]; then
+      echo "- InfiniBand (RDMA verbs) devices are available in /dev/infiniband."
     fi
     echo
     echo "## Environment"
@@ -1189,6 +1266,7 @@ dry_run_print() {  # "$@" = everything after `bwrap`
     echo; echo "On the host, the csub broker:"
     echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
   fi
+  [[ $WANT_HOSTNET -eq 1 ]] && { echo; echo "The network: the node's own (--host-net); no helper is started."; }
   echo; echo "The sandbox:"
   printf '  bwrap'; printf ' %q' "$@"; echo
   echo; echo "Environment of the command (handed to bwrap as --args 9; values passed with --env are not shown):"

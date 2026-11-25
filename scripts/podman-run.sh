@@ -68,6 +68,15 @@
 #                    Fails with "potentially insufficient UIDs or GIDs available in user
 #                    namespace" if your range isn't wide enough -- ask HPC for a wider one
 #                    (width > your real gid, not just "a range") if you hit this.
+#   --host-net      For one worker of a multi-node LSF job (started once per node, e.g. by
+#                    blaunch): the node's own network (--network=host), unrestricted. Not
+#                    with --allow, --csub, --claude or --opencode. See "Multi-node jobs" below.
+#   --ib            Expose the node's InfiniBand (RDMA verbs) devices: /dev/infiniband and the
+#                    sysfs entries libibverbs reads. The IMAGE must bring the user-space side
+#                    (libibverbs and the mlx5 provider: rdma-core / ibverbs-providers). Verbs
+#                    traffic does not pass through the container's network, so this opens the
+#                    InfiniBand fabric to the container whatever else is closed. With
+#                    --host-net for a multi-node job on an InfiniBand queue.
 #   --dry-run       Do every check, start no container, proxy or broker and pull no image, and
 #                    print the podman command and the host-side helpers a real run would use.
 #                    The checks themselves ask podman about its stores.
@@ -76,6 +85,9 @@
 #                    read-only where they exist under a --rw path, and ones the command
 #                    creates are reported at exit.
 #   -h, --help      Show help
+#
+# Multi-node jobs: the same two flags as sandbox-run.sh, with the same meaning (see its header).
+# --host-net is podman's --network=host; --ib passes /dev/infiniband in.
 #
 # As with sandbox-run.sh, $HOME is NOT bound by default -- use --rw/--ro on the subdirectory
 # of it that you need. UNLIKE sandbox-run.sh, there is no credential-path masking
@@ -124,6 +136,8 @@ KEEP_ID=0
 WANT_CLAUDE=0
 WANT_OPENCODE=0
 ENV_ARGS=()
+WANT_IB=0
+WANT_HOSTNET=0    # --host-net
 
 # Everything from line 2 down to the blank comment line before `set -euo pipefail`.
 usage() { sed -n "2,$(( $(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | cut -d: -f1) - 1 ))p" "${BASH_SOURCE[0]}"; }
@@ -190,6 +204,8 @@ while [[ $# -gt 0 ]]; do
       SHM_SIZE="$2"; shift 2 ;;
     --csub) WANT_CSUB=1; shift ;;
     --keep-id) KEEP_ID=1; shift ;;
+    --ib) WANT_IB=1; shift ;;
+    --host-net) WANT_HOSTNET=1; shift ;;
     --scratch) mkdir -p "/scratch/$USER/work"; SCRATCH_ROOT="$(realpath -e -- "/scratch/$USER/work")"; VOLUMES+=("-v" "$SCRATCH_ROOT:$SCRATCH_ROOT:rw"); shift ;;
     --no-protect) PROTECT=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -280,6 +296,28 @@ if [[ $GPU -eq 1 && -n "${LSB_JOBID:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]]; th
   echo "podman-run.sh: --gpu inside LSF job $LSB_JOBID, but CUDA_VISIBLE_DEVICES is empty --" \
        "the job has no GPU allocated (submit with -gpu \"num=1\" on a GPU queue)" >&2
   exit 1
+fi
+
+# Multi-node workers (see "Multi-node jobs" in the header). Everything here runs before anything
+# is created, so a refusal leaves nothing behind.
+if [[ $WANT_HOSTNET -eq 1 ]]; then
+  # One flag must not be enough to run an agent itself, or its job broker, with an open network.
+  _why=""
+  [[ ${#ALLOW_HOSTS[@]} -gt 0 ]] && _why="--allow (the network is already open)"
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "podman-run.sh: --host-net: not with $_why" >&2; exit 1; }
+  echo "podman-run.sh: --host-net: this container shares the node's network; nothing limits where it connects" >&2
+fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # --ib opens the InfiniBand fabric, which nothing here limits. For a job's workers only.
+  _why=""
+  [[ $WANT_CSUB -eq 1 ]] && _why="--csub"
+  [[ $WANT_CLAUDE -eq 1 || $WANT_OPENCODE -eq 1 ]] && _why="--claude or --opencode: run the agent in the ordinary sandbox and let it start multi-node work as a job"
+  [[ -z "$_why" ]] || { echo "podman-run.sh: --ib: not with $_why" >&2; exit 1; }
+fi
+if [[ $WANT_IB -eq 1 && ! -d /dev/infiniband ]]; then
+  echo "podman-run.sh: --ib: this node has no /dev/infiniband" >&2; exit 1
 fi
 
 # --claude/--opencode: the harness CONFIG is copied into a per-job directory. Claude's copy is
@@ -637,7 +675,40 @@ kill_orphaned_catatonit_for_this_job() {
 # run, rm) does the same for podman's container create/start/died events.
 # --http-proxy=false: podman otherwise copies the host's http_proxy/https_proxy/no_proxy into the
 # container, credentials in the URL included, and nothing else of the host environment goes in.
-PODMAN_ARGS=(--rm --network=none --log-driver=none --http-proxy=false)
+# (With --host-net as well: a worker talks to the job's nodes directly, and the node's proxy
+# settings are not its business.)
+PODMAN_ARGS=(--rm --log-driver=none --http-proxy=false)
+# The mounts of a multi-node worker go into VOLUMES like every other mount, once per destination
+# (podman refuses the same destination twice, and orders mounts by destination depth itself).
+net_mount() {  # $1 = source, $2 = destination; read-only
+  if user_named "$2"; then
+    echo "podman-run.sh: $2 is mounted by this wrapper for a multi-node worker; leave it out of --ro/--rw" >&2
+    exit 1
+  fi
+  [[ -z "${EXTRA_DEST[$2]:-}" ]] || return 0
+  EXTRA_DEST[$2]=1
+  VOLUMES+=("-v" "$1:$2:ro")
+}
+if [[ $WANT_HOSTNET -eq 1 ]]; then
+  # The node's network namespace. podman then binds the node's /sys read-only, which is where
+  # NCCL reads the network card's details (without them it runs about a quarter slower).
+  # The node's own /etc/hosts, too: podman otherwise adds "host.containers.internal" for the
+  # node's address, the node's name then reverse-resolves to that, and torchrun hands that name
+  # to the other nodes as the master's, where it means themselves.
+  PODMAN_ARGS+=(--network=host --no-hosts)
+  net_mount /etc/hosts /etc/hosts
+else
+  PODMAN_ARGS+=(--network=none)
+fi
+if [[ $WANT_IB -eq 1 ]]; then
+  # The verbs device nodes. With a network namespace of its own the container gets a fresh
+  # sysfs, which lists the adapters (/sys/class/infiniband) but not their uverbs entries, so
+  # that one directory comes from the node. (--host-net already has the node's whole /sys.)
+  PODMAN_ARGS+=(--device /dev/infiniband)
+  if [[ $WANT_HOSTNET -eq 0 && -d /sys/class/infiniband_verbs ]]; then
+    net_mount /sys/class/infiniband_verbs /sys/class/infiniband_verbs
+  fi
+fi
 # Without -i, podman leaves stdin closed -- an interactive shell/TUI inside hits EOF and
 # exits immediately (looks like the container "won't stay open", but it ran fine and exited
 # on its own). Only add -t when a real terminal is attached; podman errors on -t under a
@@ -681,6 +752,7 @@ dry_run_print() {  # $1 = a note about how the command is wrapped, or empty
     echo; echo "On the host, the csub broker:"
     echo "  $CSUB_BROKER ${CSUB_ENV_ARGS[*]:-} --serve $CSUB_SOCK"
   fi
+  [[ $WANT_HOSTNET -eq 1 ]] && { echo; echo "The network: the node's own (--host-net); no helper is started."; }
   echo; echo "The container:"
   printf '  podman --events-backend=none run'; printf ' %q' "${PODMAN_ARGS[@]}" "$IMAGE"
   [[ -n "$1" ]] && printf ' %s' "$1"
@@ -1195,8 +1267,14 @@ write_sandbox_readme() {
       echo "- Only these hosts are reachable, over HTTP(S) through a proxy already configured in http_proxy/https_proxy:"
       for h in "${ALLOW_HOSTS[@]}"; do echo "  - $h (and its subdomains)"; done
       echo "- Everything else (other hosts, raw TCP, ssh, package registries not listed) fails. Do not retry or look for a route; ask the user."
+    elif [[ $WANT_HOSTNET -eq 1 ]]; then
+      echo "- This is one worker of a multi-node job, on the node's own network. Connections are not limited by this sandbox."
+      echo "- Use the network for the job's own nodes only. Do not download or upload anything from here."
     else
       echo "- No network at all. Every connection attempt fails by design."
+    fi
+    if [[ $WANT_IB -eq 1 ]]; then
+      echo "- InfiniBand (RDMA verbs) devices are available in /dev/infiniband."
     fi
     echo
     echo "## Environment"

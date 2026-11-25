@@ -3,6 +3,16 @@
 Newest first. Behaviour changes only; see `git log` for everything else, including the test results
 behind each change.
 
+## 2026-11-25
+
+- **`--job-nodes`, `--peers` and `--listen` are removed** from both wrappers, with
+  `scripts/jobnet-hook.sh`. Every worker of a multi-node job now takes `--host-net`, the node's
+  own network. Through the relay behind `--job-nodes`, NCCL over TCP ran 7 to 60 times slower
+  than on the node's network.
+- **`--host-net` accepts `--ib`.** A job on an InfiniBand queue takes `--host-net --ib`, where it
+  took `--job-nodes --ib` before.
+- **`podman-run.sh --host-net` works with `--keep-id`** (the refusal belonged to `--job-nodes`).
+
 ## 2026-11-23
 
 - **Both podman images install Node.js 24 instead of 20.** Node 20 is end-of-life and gets no
@@ -160,6 +170,38 @@ behind each change.
   at a time). A sibling job removed a pid file between this script's test for it and its read.
 - **`tests/test-array.sh`** (new): many elements of one LSF array job on one node, each in its
   own sandbox, for either wrapper. Arrays needed no other change.
+- **`--job-nodes` / `--peers`: the port block is 2000 ports, not 5000**, in both wrappers:
+  13000-14999 on our nodes, and five such sandboxes fit on a node where two did. Ports the
+  system picks come from the top 1500 of the block (it was 1000). The lowest 500 of the block,
+  which `$SANDBOX_README` names, are left for a program's fixed ports; the earlier fixed range
+  10000-13999 no longer applies (the Ray launcher in `gpu-cluster-recipes` was changed to match).
+- **`podman-run.sh --host-net` fix:** the node's own `/etc/hosts` is used inside. With podman's
+  file the node's name resolved to `host.containers.internal`, which `torchrun` passed to the
+  other nodes as the master's address, and a two-node Ethernet job hung until it timed out.
+
+## 2026-11-19
+
+- **`sandbox-run.sh --job-nodes`** (with `--peers`, `--listen`): one sandbox per node
+  of a multi-node LSF job, with a private network that reaches the job's other nodes and nothing
+  else. The node list comes from LSF. Needs `pasta` (the `passt` package) on the nodes.
+- **`sandbox-run.sh --host-net`**: the same role on queues without InfiniBand, where the relay
+  behind `--job-nodes` is too slow for the data: the node's own network, unrestricted.
+- **`sandbox-run.sh --ib`**: binds the InfiniBand devices and the sysfs entries NCCL reads.
+- All three are for a job's workers, not for the agent: each refuses `--claude` and `--opencode`,
+  and the two network flags refuse `--allow` and `--csub`. Nothing changes for existing uses.
+- **`podman-run.sh`** takes the same flags (`--job-nodes`, `--peers`, `--listen`,
+  `--host-net`, `--ib`) with the same meaning. `--job-nodes` is refused with `--keep-id`. `--ib`
+  relies on `libibverbs` and the mlx5 provider in the image. New file:
+  `scripts/jobnet-hook.sh`, which `podman-run.sh` looks for in its own directory.
+- **`tests/test-multinode.sh`** tests them as a two-node LSF job, for either wrapper.
+- **`podman-run.sh` fix:** a command that ended within about a second could make the wrapper
+  return 1 instead of the command's own exit status.
+- **`--ib`** refuses `--csub`, `--claude` and `--opencode` in both wrappers, and `--host-net`
+  refuses `--ib`. Inside an LSF job `--peers` accepts only nodes of that job.
+- **Images rebuilt.** Both now contain OpenAI's Codex CLI and current Claude Code and opencode.
+  `agentic-sandbox-gpu` adds Ray 2.60 (Train and Data), `tiktoken`, `scikit-image` and
+  `pycocotools`, and stays on NVIDIA's PyTorch 26.07 base: 26.11 was built and measured 4 to 8%
+  slower on the cross-node benchmark. `agentic-sandbox-lite` moves to CUDA 13.5.0.
 
 ## 2026-11-16
 
