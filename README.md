@@ -557,7 +557,9 @@ podman-run.sh --image "$IMAGE" --gpu --host-net --ib --rw /groups/lab/project --
   that it is for the job's nodes only.
 
 Measured with a bandwidth test across all GPUs of two nodes, inside `--host-net`: 6.3 GB/s on
-L4 against 6.4 to 6.7 GB/s unsandboxed, and 2.4 to 3.4 GB/s on A100, with either wrapper.
+L4 against 6.4 to 6.7 GB/s unsandboxed, 2.4 to 3.4 GB/s on A100 and 7.7 to 8.0 GB/s on RTX 6000,
+with either wrapper. On two H200 nodes with `--host-net --ib`, NCCL used InfiniBand on all
+eight ports and no socket transport, with either wrapper.
 
 ## What it does and does not protect against
 
@@ -725,8 +727,8 @@ that come from somewhere else.
 - `sandbox-run.sh` refuses to run from `$HOME` or a directory above it (the working directory is
   bound read-write). Run it from a project directory.
 - Multi-node workers are on the node's own network, not limited (see "Multi-node jobs"). Tested
-  on whole nodes: two L4 and two A100. `--host-net --ib` is not yet run on InfiniBand nodes
-  (H100, H200, B300), and nothing is run on RTX 6000, on more than two nodes, or with other jobs
-  sharing the node. csub has no multi-node job type, so an agent cannot yet submit one.
+  on whole nodes, two at a time, with either wrapper: L4, A100, RTX 6000, and H200 with
+  `--host-net --ib`. Not run: H100 and B300, more than two nodes, or other jobs sharing the
+  node. csub has no multi-node job type, so an agent cannot yet submit one.
 - Not tested: a fresh `claude auth login` combined with the one-shot or loop modes.
 
