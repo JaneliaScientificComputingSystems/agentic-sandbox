@@ -242,36 +242,12 @@ A sandboxed agent must not hold `bsub`: anything it submitted would run on the c
 sandbox. `--csub` closes that gap with [csub](https://github.com/saalfeldlab/csub), Stephan
 Saalfeld's policy-checked job broker, over the same socket bridge `--allow` uses:
 
-```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 460, "htmlLabels": true, "padding": 12, "nodeSpacing": 40, "rankSpacing": 50}, "themeVariables": {"fontSize": "15px"}}}%%
-flowchart TB
-    you["You: ssh to a login node, then<br/>bsub -Is an interactive job"]
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/csub-flow-dark.svg">
+  <img alt="Diagram: you start an interactive job on a compute node; the wrapper starts the sandbox, the allowlist proxy and the csub broker; the agent in the sandbox reaches only the allowed hosts through the proxy and submits jobs through the broker; each submitted job runs in its own sandbox on another compute node." src="docs/diagrams/csub-flow-light.svg">
+</picture>
 
-    subgraph node["Compute node: your interactive job"]
-        wrapper["sandbox-run.sh (Bubblewrap) or podman-run.sh (container)<br/>--csub --allow HOST -- agent"]
-        subgraph sb["Sandbox"]
-            agent["opencode / Claude Code<br/>sees the project directory read-write and nothing else:<br/>no $HOME, no ~/.ssh, no bsub, no other network<br/>git hooks and tool settings in the project are read-only<br/>/run/sandbox/README.md tells it the rules"]
-        end
-        proxy["allowlist_proxy.py<br/>started by the wrapper, outside the sandbox"]
-        broker["csub-broker<br/>started by the wrapper, outside the sandbox, as you<br/>applies your csub policy"]
-        wrapper --> sb
-        agent -->|"https through<br/>a unix socket"| proxy
-        agent -->|"csub submit through<br/>/run/csub.sock"| broker
-    end
-
-    hosts["Only the hosts you listed with --allow<br/>e.g. litellm.int.janelia.org, api.anthropic.com, pypi.org"]
-
-    subgraph child["Another compute node: a job the agent submitted"]
-        cw["csub job wrapper"]
-        cs["sandbox-run.sh or podman-run.sh<br/>same project directory, same rules"]
-        cmd["your command, e.g. python train.py<br/>it can csub submit again"]
-        cw --> cs --> cmd
-    end
-
-    you --> wrapper
-    proxy -->|"CONNECT / HTTP"| hosts
-    broker -->|"bsub, within the policy's<br/>slots, GPUs and walltime"| cw
-```
+<sub>Diagram source: [`docs/diagrams/csub-flow.mmd`](docs/diagrams/csub-flow.mmd); `docs/diagrams/render.sh` redraws it.</sub>
 
 - The wrapper starts `csub-broker --serve` outside the sandbox, as you, and stops it at exit; only its
   socket crosses the boundary, at `/run/csub.sock`.
@@ -328,46 +304,12 @@ script, so the key can do nothing else:
 command="env PATH=$HOME/.venvs/csub/bin:$PATH $HOME/agentic-sandbox/scripts/ssh-entry.sh --project /groups/lab/project --queue interactive --walltime 60 -- --csub",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,expiry-time="20271231" ssh-ed25519 AAAA... agent
 ```
 
-```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 460, "htmlLabels": true, "padding": 12, "nodeSpacing": 40, "rankSpacing": 50}, "themeVariables": {"fontSize": "15px"}}}%%
-flowchart TB
-    subgraph mac["Your laptop"]
-        harness["Codex or Claude Code reads AGENTS.md / CLAUDE.md in the working directory<br/>and runs each test or script as<br/>ssh janelia-agent '&lt;command&gt;'<br/>with the agent's own key, never yours (IdentitiesOnly, no ssh-agent)"]
-    end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/laptop-flow-dark.svg">
+  <img alt="Diagram: the agent on your laptop runs each command over ssh with its own key; the login node's sshd can only run ssh-entry.sh, which submits one LSF job per command; on the compute node the wrapper runs the command in a sandbox with the allowlist proxy and the csub broker outside it; jobs the agent submits run in their own sandbox on another compute node." src="docs/diagrams/laptop-flow-light.svg">
+</picture>
 
-    subgraph login["Login node"]
-        sshd["sshd: that key's authorized_keys line can run only<br/>ssh-entry.sh --project DIR --queue Q --walltime M -- --csub --allow HOST<br/>which submits one job per command: bsub -I, job name agent-ssh<br/>nothing else runs on the login node"]
-    end
-
-    subgraph node["Compute node: one LSF job per command"]
-        wrapper["sandbox-run.sh (Bubblewrap) in the project directory<br/>podman-run.sh (container) instead with --podman<br/>the options after -- in the key line are the sandbox every command gets"]
-        subgraph sb["Sandbox"]
-            cmd["bash -c '&lt;command&gt;'<br/>sees the project directory read-write and nothing else:<br/>no $HOME, no ~/.ssh, no bsub, no other network<br/>git hooks and tool settings in the project are read-only<br/>/run/sandbox/README.md tells it the rules"]
-        end
-        proxy["allowlist_proxy.py<br/>started by the wrapper, outside the sandbox"]
-        broker["csub-broker<br/>started by the wrapper, outside the sandbox, as you<br/>applies your csub policy"]
-        wrapper --> sb
-        cmd -->|"https through<br/>a unix socket"| proxy
-        cmd -->|"csub submit through<br/>/run/csub.sock"| broker
-    end
-
-    hosts["Only the hosts you listed with --allow<br/>e.g. litellm.int.janelia.org, api.anthropic.com, pypi.org"]
-
-    subgraph child["Another compute node: a job the agent submitted"]
-        cw["csub job wrapper"]
-        cs["sandbox-run.sh or podman-run.sh<br/>same project directory, same rules"]
-        job["e.g. python train.py<br/>it can csub submit again"]
-        cw --> cs --> job
-    end
-
-    back["stdout, stderr and the exit status go back over the same ssh connection; scp works too.<br/>Nothing carries over between commands except files in the project directory.<br/>bkill -J agent-ssh 0 stops the ssh jobs. The command for the jobs the agent submitted is under 'To stop it' below."]
-
-    harness -->|"the dedicated key"| sshd
-    sshd -->|"seconds to a minute to start"| wrapper
-    proxy -->|"CONNECT / HTTP"| hosts
-    broker -->|"bsub, within the policy's<br/>slots, GPUs and walltime"| cw
-    cmd --> back
-```
+<sub>Diagram source: [`docs/diagrams/laptop-flow.mmd`](docs/diagrams/laptop-flow.mmd); `docs/diagrams/render.sh` redraws it.</sub>
 
 - **Each `ssh janelia-agent '<command>'` is one LSF job** (`bsub -I`, job name `agent-ssh`) whose command is
   `sandbox-run.sh` started in the project directory. stdin, stdout, stderr and the exit status are

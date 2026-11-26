@@ -1,0 +1,28 @@
+%%{init: {"htmlLabels": false, "flowchart": {"wrappingWidth": 460, "htmlLabels": false, "padding": 12, "nodeSpacing": 40, "rankSpacing": 50}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart TB
+    you["You: ssh to a login node, then<br/>bsub -Is an interactive job"]
+
+    subgraph node["Compute node: your interactive job"]
+        wrapper["sandbox-run.sh (Bubblewrap) or podman-run.sh (container)<br/>--csub --allow HOST -- agent"]
+        subgraph sb["Sandbox"]
+            agent["opencode / Claude Code<br/>sees the project directory read-write and nothing else:<br/>no $HOME, no ~/.ssh, no bsub, no other network<br/>git hooks and tool settings in the project are read-only<br/>/run/sandbox/README.md tells it the rules"]
+        end
+        proxy["allowlist_proxy.py<br/>started by the wrapper, outside the sandbox"]
+        broker["csub-broker<br/>started by the wrapper, outside the sandbox, as you<br/>applies your csub policy"]
+        wrapper --> sb
+        agent -->|"https through<br/>a unix socket"| proxy
+        agent -->|"csub submit through<br/>/run/csub.sock"| broker
+    end
+
+    hosts["Only the hosts you listed with --allow<br/>e.g. litellm.int.janelia.org, api.anthropic.com, pypi.org"]
+
+    subgraph child["Another compute node: a job the agent submitted"]
+        cw["csub job wrapper"]
+        cs["sandbox-run.sh or podman-run.sh<br/>same project directory, same rules"]
+        cmd["your command, e.g. python train.py<br/>it can csub submit again"]
+        cw --> cs --> cmd
+    end
+
+    you --> wrapper
+    proxy -->|"CONNECT / HTTP"| hosts
+    broker -->|"bsub, within the policy's<br/>slots, GPUs and walltime"| cw
